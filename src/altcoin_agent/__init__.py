@@ -5,6 +5,32 @@ from altcoin_agent.ai_engine import (
     EngineError,
     SocialPost,
 )
+from altcoin_agent.fuser import (
+    DEFAULT_RULE_WEIGHTS,
+    Direction,
+    FusedSignal,
+    FuserConfig,
+    ScoreFuser,
+)
+from altcoin_agent.risk import (
+    AccountState,
+    CCXTExecutor,
+    DynamicLeverageConfig,
+    ExchangeAdapter,
+    GateDecision,
+    OrderIntent,
+    OrphanPosition,
+    Position,
+    PositionSizer,
+    Reconciler,
+    ReconcilerReport,
+    RiskGate,
+    RiskGateConfig,
+    SizingResult,
+    TrailingState,
+    TrailingStopFSM,
+    compute_dynamic_leverage,
+)
 from altcoin_agent.screener import (
     FundingAnomalyDetector,
     FundingSnapshot,
@@ -15,6 +41,7 @@ from altcoin_agent.screener import (
     OISurgeDetector,
     Screener,
     SignalEvent,
+    SignalKind,
     VolumeSpikeDetector,
 )
 
@@ -22,6 +49,7 @@ __all__ = [
     # screener
     "Screener",
     "SignalEvent",
+    "SignalKind",
     "Kline",
     "FundingSnapshot",
     "OISnapshot",
@@ -35,4 +63,28 @@ __all__ = [
     "AIVerdict",
     "SocialPost",
     "EngineError",
+    # fuser
+    "ScoreFuser",
+    "FusedSignal",
+    "FuserConfig",
+    "Direction",
+    "DEFAULT_RULE_WEIGHTS",
+    # risk + execution
+    "AccountState",
+    "Position",
+    "OrderIntent",
+    "RiskGate",
+    "RiskGateConfig",
+    "GateDecision",
+    "PositionSizer",
+    "SizingResult",
+    "DynamicLeverageConfig",
+    "compute_dynamic_leverage",
+    "TrailingStopFSM",
+    "TrailingState",
+    "Reconciler",
+    "ReconcilerReport",
+    "OrphanPosition",
+    "CCXTExecutor",
+    "ExchangeAdapter",
 ]

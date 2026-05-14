@@ -84,6 +84,11 @@ class AIVerdict(BaseModel):
     def _strip(cls, v: str) -> str:
         return v.strip()
 
+    @property
+    def confidence(self) -> float:
+        """Confidence in 0..1 range (derived from confidence_score)."""
+        return self.confidence_score / 100.0
+
 
 class EngineError(RuntimeError):
     """Raised for non-recoverable engine errors (no API key, budget exhausted)."""
@@ -131,6 +136,13 @@ Hard rules:
   - If unsure, output intent=neutral and confidence_score <= 40.
   - If KOL accounts are obviously low-follower or post-only-after-pump,
     set kol_intent="exit_liquidity" and lower confidence_score by at least 20.
+  - SYBIL / ASTROTURF DEFENSE (SR-4): if multiple posts come from low-follower
+    accounts (< 1000 followers) AND the texts are highly homogeneous
+    (repeated emoji/hashtag combos, no specific thesis, just price calls,
+    look like coordinated bot spam), treat them as sybil/astroturf. In that
+    case lower confidence_score by an ADDITIONAL 30 and bias
+    kol_intent toward "exit_liquidity" (the purpose of bot spam is to lure
+    retail bag-holders, which IS exit liquidity by definition).
   - DO NOT output markdown, code fences, or any text outside the JSON.
 """
 
