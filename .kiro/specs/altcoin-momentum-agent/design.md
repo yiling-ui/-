@@ -384,6 +384,82 @@ policy_weights_file: config/policy_weights.yaml
 
 ---
 
+---
+
+## 5.5 致命盲区防御规则（Survival Rules）
+
+> 这 4 条规则是从真实"被割韭菜"经验中抽出的防御层，**优先级高于策略本身**。
+> 任何与本节冲突的策略代码都必须让步。
+
+### SR-1 — 极端延迟滑点保护（Slippage Abort）
+
+**位置**：执行链路 — Risk Gate → Executor 之间。
+**问题**：Task A 在 1m K 线上侦测到入场信号 → 进入 Task C fuser → DeepSeek 异步裁决 → Risk Gate → 下单。这条链路最坏可能耗时 4–8s。山寨币 1s 拉 5% 是常态，等到下单时入场价已经在山顶。
+
+**实现要求（Task D）**：
+- 信号载荷必须携带 `trigger_price`（Task A 触发瞬间的中价）和 `trigger_ts`。
+- Executor 下单前必须重新拉一次 ticker（或读 Screener 最新缓存价）作为 `current_price`。
+- 计算 `slippage = |current - trigger| / trigger`。
+- **动态阈值**（默认）：`max_slippage = base_slippage / sqrt(leverage / 5)`，base=3%。即 5x 杠杆时阈值 3%、10x 时 ~2.1%、15x 时 ~1.7%。
+- **超阈值时的处置**：
+  - 多头追涨：放弃入场（`abort`），打 `risk.alert.slippage_abort` 指标。
+  - 空头追跌：同上，因为山寨币短时反弹常见。
+  - 不允许"市价改限价挂回调单"自动执行——回调常常不来，挂着的限价单会变成系统裸露的 delta exposure。
+- 若用户希望保留"回调挂单"行为，必须显式开启配置 `execution.slippage.fallback_to_limit=true`，并默认关闭。
+
+### SR-2 — 状态对齐与交易所硬止损（State Sync & Hard Stop）
+
+**位置**：Executor 启动钩子 + 每次开仓后立即执行。
+**问题**：(a) 进程重启后内存丢失，但交易所还有持仓，造成"孤儿仓位"无人管理；(b) 仅靠 Python 内存里的"软止损"在进程崩溃时形同虚设。
+
+**实现要求（Task D）**：
+- **启动 reconciler**：进程启动后第一个 tick **必须**：
+  1. `fetch_positions()` 拉所有持仓；
+  2. 与本地状态对比，发现孤儿仓位（本地无记录、交易所有持仓）→ 进入 `ORPHAN` 状态；
+  3. **默认动作**：立即为孤儿仓位挂保本止损单（不平仓，由用户决定后续）；
+  4. 同时撤掉所有"挂着但本地无记录"的待成交单。
+- **每次开仓后**：成交确认 → **立刻**调 `create_order(type="STOP_MARKET", reduceOnly=true, ...)` 在交易所挂硬止损。
+- **失败处置 (fail-closed)**：硬止损挂单失败 → **立即市价平仓本笔头寸**，不留裸 delta；打告警；冷却该 symbol 4h。
+- 软止损（Python 端 trailing FSM）只能**收紧**硬止损（每次上移调用 `cancel + replace`），永远不能成为唯一止损。
+
+### SR-3 — 假量防诱多（Wash Trading Filter） _未来迭代标记_
+
+**位置**：Task A 迭代（`T-A-07`），并在 fuser 中作为额外乘数。
+**问题**：庄家通过自己的多个账户对倒可以伪造任意成交量，让 VolumeSpike 检测器尖叫但实际无真实买盘。
+
+**未来实现要求**：
+- Screener 订阅 trades 流时已经有 `tradeId`，统计每分钟 **唯一交易笔数** `trade_count_per_min`。
+- 真实爆拉的判定：`trade_count_per_min` 的 z-score 必须与 `volume` 的 z-score **同步爆**（差 ≤ 1σ）；只有 volume 飙、trade_count 平 = 高度可疑的对倒。
+- 进一步过滤：**单笔均额** `avg_trade_size = volume / trade_count` 在异常时段反常下沉（散户进场而非大单接力）才算健康爆拉；如果 avg_trade_size 反而暴涨且 trade_count 低 → 强烈怀疑大单对敲。
+- 接入 fuser：当怀疑分 ≥ 0.7 时，对该 symbol 的所有 rule_score 应用 0.5 乘子，并把 `is_high_priority` 阈值提到 95。
+- 现阶段（Task D 之前）：在 `screener.py` 留 `WashTradingFilter` 占位接口；fuser 的 `_score_rules` 通过依赖注入接受可选的 filter，无 filter 时维持当前行为。
+
+### SR-4 — 水军过滤机制（防女巫攻击） _部分立刻启用_
+
+**位置**：Task B AI prompt（立刻）+ Task B/C 迭代（`T-B-07`、`T-C-06`，未来）。
+**问题**：项目方雇佣机器人小号在币安广场刷屏，制造"全网 FOMO"假象。这正是 KOL 出货 vs 真实喊单的高难度区分场景。
+
+**立刻启用（本次 Task D 周期内）**：
+- DeepSeek 的 system prompt 增加一段：
+  > 当多条 post 来自低粉丝（< 1000）账户、且文本高度同质化（重复表情、无具体观点、仅 hashtag + 价格预测）时，将这些视为水军（sybil 风格）。**降低 confidence_score 至少 30 分**，并在 `kol_intent` 倾向 `exit_liquidity`（因为水军刷屏的目的就是诱多接盘）。
+- prompt 里给一两条 few-shot 示例，提高模型对模式的识别。
+
+**未来迭代**：
+- 特征侧过滤（`T-B-07`）：`SimilarityCluster` — 对短时窗内的 posts 做 MinHash/SimHash，相似度 > 0.85 视为同源，按 cluster 整体降权。
+- 账号画像（`T-C-06`）：拉取作者历史发帖密度、首发账号年龄、粉丝增速；新建/低质账号大批同时发推 = 高度可疑。
+- 接入 fuser：当 `sybil_density >= 0.6` 时，强制 `kol_intent` 回落到 `exit_liquidity` 软封顶逻辑。
+
+### 防御规则交叉表
+
+| 规则 | Hot path 阻塞？ | Task | 默认行为 |
+|---|---|---|---|
+| SR-1 滑点 Abort | 是（必须同步） | D（本任务） | 超阈值放弃入场 |
+| SR-2 状态对齐+硬止损 | 启动一次 + 每次开仓 | D（本任务） | 孤儿挂保本、硬止损失败必平仓 |
+| SR-3 假量过滤 | 否（旁路） | A 迭代 | 占位接口已留 |
+| SR-4 水军过滤（Prompt 部分） | 否 | B 立刻 + B/C 迭代 | Prompt 已加防御段 |
+
+---
+
 ## 6. 失败模式与降级
 
 | 故障 | 行为 |
