@@ -208,6 +208,48 @@ class CCXTExchangeAdapter:
             })
         return out
 
+    async def fetch_ticker_price(self, symbol: str) -> float:
+        """Best-effort live price for the dynamic-slippage check (SR-1).
+
+        Bug #2 fix: ``RiskGate`` previously received the ``trigger_price``
+        as both the trigger AND the ``current_price``, so the slippage
+        comparison was always identity-zero. We now query the venue for a
+        fresh mark/last price and let the gate compare against it.
+
+        Preference order: ``last`` -> ``markPrice`` -> ``info.markPrice``
+        -> ``close``. ``ccxt`` populates ``last`` on every venue we ship.
+
+        Raises ``RuntimeError`` if no usable price is available -- the
+        caller is expected to fail-closed (skip the order) rather than
+        fall back silently to the stale trigger.
+        """
+        if not hasattr(self.client, "fetch_ticker"):
+            raise RuntimeError(
+                f"{self.exchange_name} client has no fetch_ticker",
+            )
+        t = await self.client.fetch_ticker(symbol)  # type: ignore[attr-defined]
+        if not isinstance(t, dict):
+            raise RuntimeError(f"unexpected ticker shape for {symbol}: {t!r}")
+        for key in ("last", "markPrice"):
+            v = t.get(key)
+            if v is not None:
+                price = float(v)
+                if price > 0:
+                    return price
+        info = t.get("info")
+        if isinstance(info, dict):
+            v = info.get("markPrice")
+            if v is not None:
+                price = float(v)
+                if price > 0:
+                    return price
+        v = t.get("close")
+        if v is not None:
+            price = float(v)
+            if price > 0:
+                return price
+        raise RuntimeError(f"no usable price in ticker for {symbol}: {t!r}")
+
     async def fetch_open_orders(self) -> list[dict[str, Any]]:
         raw = await self.client.fetch_open_orders()
         out: list[dict[str, Any]] = []
