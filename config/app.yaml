@@ -22,3 +22,21 @@ initial_equity_usdt: 10000
 # with dry_run: false in V1.0 because the live exchange adapter is not
 # yet wired into main.py.
 dry_run: true
+
+# ----- LLM + self-evolution knobs (optional) -----
+# Per-symbol cooldown between DeepSeek consults. Higher = fewer tokens spent.
+# Set to 0 only when running a backtest sweep.
+llm_consult_cooldown_sec: 300
+
+# Max events queued for LLM consultation before the screener_sink starts
+# dropping new arrivals. The drop is intentional: rule scoring continues
+# unaffected, only the LLM verdict is missing.
+llm_queue_max: 256
+
+# Delay between an order opening and its post-mortem learning sweep. 1h is
+# long enough for typical 15-60min altcoin moves to fully play out.
+post_mortem_delay_sec: 3600
+
+# Path to the learned-rules JSON. When unset, follows the DYNAMIC_RULES_JSON
+# env var, then falls back to <repo>/.kiro/steering/dynamic_rules.json.
+# dynamic_rules_path: /app/.kiro/steering/dynamic_rules.json
