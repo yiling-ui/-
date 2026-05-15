@@ -886,3 +886,205 @@ async def test_position_watcher_run_loop_terminates_on_stop_event() -> None:
     await asyncio.sleep(0.05)
     stop.set()
     await asyncio.wait_for(task, timeout=1.0)
+
+
+
+# --------------------------------------------------------------------- #
+# AccountState.maybe_roll_over_day (Bug #3)
+#
+# Without rollover, the daily-drawdown breaker latches one-way: a couple
+# of small losing days peg the running sum past 6%, and every subsequent
+# signal is rejected forever. Same for the 3-strike rule.
+#
+# These tests pin down:
+#   * idempotent on the same trading day,
+#   * resets the right counters on day flip,
+#   * preserves consecutive_losses (per-symbol streaks span days),
+#   * preserves manual halts (operator must explicitly clear them),
+#   * the gate stops rejecting once a rollover happens,
+#   * non-default ``rollover_anchor_utc_hour`` honours custom day starts.
+# --------------------------------------------------------------------- #
+
+# 2026-05-15 00:00:00 UTC, in milliseconds.
+_DAY1_MS = 1_778_803_200_000          # day-1 00:30 UTC
+_DAY2_MS = 1_778_803_200_000 + 86_400_000  # +24h: day 2
+
+
+def _ms_at(year: int, month: int, day: int, hour: int = 12) -> int:
+    """Build a UTC ms timestamp deterministically (no time module DST risk)."""
+    import datetime as dt
+    return int(dt.datetime(year, month, day, hour, tzinfo=dt.timezone.utc).timestamp() * 1000)
+
+
+def test_rollover_first_call_stamps_without_resetting() -> None:
+    """First call after construction is the boot stamp — counters mustn't
+    move (everything was just initialised)."""
+    a = AccountState(
+        equity_usdt=10_000.0, starting_equity_today_usdt=10_000.0,
+        realized_pnl_today_usdt=-50.0, daily_stoploss_hits=1,
+    )
+    rolled = a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15))
+    assert not rolled
+    assert a.last_rollover_date_utc == "2026-05-15"
+    # Untouched.
+    assert a.realized_pnl_today_usdt == pytest.approx(-50.0)
+    assert a.daily_stoploss_hits == 1
+    assert a.starting_equity_today_usdt == pytest.approx(10_000.0)
+
+
+def test_rollover_idempotent_within_same_utc_day() -> None:
+    a = AccountState()
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15, 0))
+    a.realized_pnl_today_usdt = -100
+    a.daily_stoploss_hits = 2
+    # Calls later on the same day are no-ops.
+    for h in (1, 6, 12, 18, 23):
+        rolled = a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15, h))
+        assert not rolled
+    assert a.realized_pnl_today_usdt == pytest.approx(-100)
+    assert a.daily_stoploss_hits == 2
+
+
+def test_rollover_resets_daily_counters_on_day_flip() -> None:
+    """After a losing day, the next-day rollover must:
+      * snap starting_equity_today_usdt to current equity,
+      * zero realized_pnl_today_usdt,
+      * zero daily_stoploss_hits.
+    """
+    a = AccountState(equity_usdt=10_000.0, starting_equity_today_usdt=10_000.0)
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15))   # boot stamp
+
+    # Lose money during day 1.
+    a.realized_pnl_today_usdt = -650.0
+    a.equity_usdt = 9_350.0
+    a.daily_stoploss_hits = 3
+
+    # Day flips.
+    rolled = a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16, 0))
+    assert rolled
+    assert a.last_rollover_date_utc == "2026-05-16"
+    assert a.starting_equity_today_usdt == pytest.approx(9_350.0)
+    assert a.realized_pnl_today_usdt == pytest.approx(0.0)
+    assert a.daily_stoploss_hits == 0
+    # ``equity_usdt`` itself is the running balance; rollover must not
+    # change it.
+    assert a.equity_usdt == pytest.approx(9_350.0)
+    # And daily_drawdown_pct now reads 0 again (off the new anchor).
+    assert a.daily_drawdown_pct == pytest.approx(0.0)
+
+
+def test_rollover_preserves_consecutive_losses_and_cooldowns() -> None:
+    """consecutive_losses is a per-symbol streak, not a daily quota — it
+    must survive the day flip. Same for symbol cooldowns (the wall-clock
+    deadline reaches its natural expiry on its own)."""
+    a = AccountState()
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15))
+
+    a.consecutive_losses["RAVEUSDT"] = 2
+    a.cooldown_until_ts_ms["RAVEUSDT"] = _ms_at(2026, 5, 16, 4)
+
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16))
+    assert a.consecutive_losses["RAVEUSDT"] == 2
+    assert a.cooldown_until_ts_ms["RAVEUSDT"] == _ms_at(2026, 5, 16, 4)
+
+
+def test_rollover_preserves_manual_global_halt() -> None:
+    """An operator-set hard halt must NOT auto-clear at midnight — it's a
+    deliberate intervention. Restarting trading requires explicit ops."""
+    a = AccountState()
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15))
+    a.halt("manual: investigation in progress")
+
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16))
+    assert a.global_trading_halted is True
+    assert a.halt_reason == "manual: investigation in progress"
+
+
+def test_rollover_unlatches_daily_drawdown_breaker() -> None:
+    """End-to-end gate behaviour: after a losing day trips the daily-DD
+    breaker, a rollover must let signals through again on the next day.
+    Pre-fix, the breaker was a one-way latch."""
+    a = _account()
+    a.equity_usdt = 9_300.0          # already lost $700 = 7%
+    a.realized_pnl_today_usdt = -700
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15))  # boot stamp
+    # Force the boot stamp to actually have a *previous* day so the next
+    # call is a real rollover.
+    a.last_rollover_date_utc = "2026-05-15"
+
+    gate = RiskGate(PositionSizer(), RiskGateConfig(daily_drawdown_limit=0.06))
+    blocked = gate.evaluate(
+        signal=_signal(), account=a, current_price=1.0,
+        top5_depth_usdt=400_000, realized_vol_pct=0.05, initial_stop=0.95,
+    )
+    assert not blocked.approved
+    assert "daily_drawdown" in blocked.reason
+
+    # Day flips. starting_equity_today_usdt re-anchors to the new $9,300
+    # equity and PnL/DD start fresh at zero.
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16))
+    approved = gate.evaluate(
+        signal=_signal(), account=a, current_price=1.0,
+        top5_depth_usdt=400_000, realized_vol_pct=0.05, initial_stop=0.95,
+    )
+    assert approved.approved
+
+
+def test_rollover_unlatches_three_strike_breaker() -> None:
+    """Three stops in a day -> halt. Day flips -> back to clean slate."""
+    a = _account()
+    a.daily_stoploss_hits = 3
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15))
+    a.last_rollover_date_utc = "2026-05-15"
+
+    gate = RiskGate(PositionSizer(), RiskGateConfig(daily_stoploss_hits_max=3))
+    d = gate.evaluate(
+        signal=_signal(), account=a, current_price=1.0,
+        top5_depth_usdt=400_000, realized_vol_pct=0.05, initial_stop=0.95,
+    )
+    assert not d.approved and "stoploss_hits" in d.reason
+
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16))
+    d2 = gate.evaluate(
+        signal=_signal(), account=a, current_price=1.0,
+        top5_depth_usdt=400_000, realized_vol_pct=0.05, initial_stop=0.95,
+    )
+    assert d2.approved
+
+
+def test_rollover_anchor_at_8utc_shifts_day_boundary() -> None:
+    """With anchor=8, a "trading day" runs 08:00 UTC -> 08:00 UTC. So
+    07:59 UTC and 08:00 UTC must straddle a flip; 08:01 UTC and 23:59
+    UTC of the same anchor day must NOT."""
+    a = AccountState(rollover_anchor_utc_hour=8)
+    # Boot at 08:30 UTC on day 1.
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15, 8))
+    boot_day = a.last_rollover_date_utc
+    a.realized_pnl_today_usdt = -50
+
+    # Same anchor day: 23:59 UTC on May 15.
+    rolled_late = a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15, 23))
+    assert not rolled_late
+    assert a.realized_pnl_today_usdt == pytest.approx(-50)
+
+    # Same anchor day: 07:59 UTC on May 16 — still inside day 1.
+    rolled_early = a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16, 7))
+    assert not rolled_early
+    assert a.realized_pnl_today_usdt == pytest.approx(-50)
+    assert a.last_rollover_date_utc == boot_day
+
+    # 08:00 UTC on May 16 — anchor crosses, day flips.
+    rolled = a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16, 8))
+    assert rolled
+    assert a.last_rollover_date_utc != boot_day
+    assert a.realized_pnl_today_usdt == pytest.approx(0.0)
+
+
+def test_rollover_with_zero_starting_equity_still_safe() -> None:
+    """A degenerate starting_equity (e.g., empty paper-trade boot) must
+    not cause divide-by-zero in daily_drawdown_pct after a rollover."""
+    a = AccountState(equity_usdt=0.0, starting_equity_today_usdt=0.0)
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 15))
+    a.last_rollover_date_utc = "2026-05-15"
+    a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16))
+    assert a.daily_drawdown_pct == 0.0
