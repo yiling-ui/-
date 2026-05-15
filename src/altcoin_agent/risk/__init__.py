@@ -16,6 +16,8 @@ Public surface:
         TrailingState,
         Reconciler,
         ReconcilerReport,
+        PositionWatcher,
+        CloseCallback,
         CCXTExecutor,
         ExecutionError,
     )
@@ -29,6 +31,7 @@ from altcoin_agent.risk.executor import (
     ExecutionError,
 )
 from altcoin_agent.risk.gate import RiskDecision, RiskGate, RiskGateConfig
+from altcoin_agent.risk.position_watcher import CloseCallback, PositionWatcher
 from altcoin_agent.risk.reconciler import Reconciler, ReconcilerReport
 from altcoin_agent.risk.sizing import DynamicLeverageConfig, PositionSizer
 from altcoin_agent.risk.state import AccountState, Position, Side
@@ -39,11 +42,13 @@ __all__ = [
     "ATRCalculator",
     "CCXTExchangeAdapter",
     "CCXTExecutor",
+    "CloseCallback",
     "DynamicLeverageConfig",
     "ExchangeAdapter",
     "ExecutionError",
     "Position",
     "PositionSizer",
+    "PositionWatcher",
     "Reconciler",
     "ReconcilerReport",
     "RiskDecision",
