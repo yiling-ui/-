@@ -1,17 +1,19 @@
 [project]
 name = "altcoin-momentum-agent"
-version = "0.1.0"
+version = "1.0.0"
 description = "Multimodal AI trading agent for early altcoin pump/dump detection"
 requires-python = ">=3.10"
 authors = [{ name = "yiling-ui" }]
 dependencies = [
     "ccxt>=4.4.0",
     "httpx>=0.27.0",
+    "aiohttp>=3.9.0",
     "pydantic>=2.6",
     "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
+socks = ["aiohttp_socks>=0.8"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -19,6 +21,9 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+
+[project.scripts]
+altcoin-agent = "altcoin_agent.main:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -37,4 +42,4 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
-ignore = ["E501"]
+ignore = ["E501", "ASYNC230", "ASYNC240"]

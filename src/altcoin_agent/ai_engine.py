@@ -84,6 +84,16 @@ class AIVerdict(BaseModel):
     def _strip(cls, v: str) -> str:
         return v.strip()
 
+    @property
+    def confidence(self) -> float:
+        """Convenience: confidence as a 0..1 float (= confidence_score / 100).
+
+        Downstream consumers (e.g. fuser.py KOL veto thresholds) prefer the
+        normalized form. The on-the-wire contract still uses the integer
+        ``confidence_score`` so the LLM JSON schema is unchanged.
+        """
+        return self.confidence_score / 100.0
+
 
 class EngineError(RuntimeError):
     """Raised for non-recoverable engine errors (no API key, budget exhausted)."""
@@ -131,6 +141,18 @@ Hard rules:
   - If unsure, output intent=neutral and confidence_score <= 40.
   - If KOL accounts are obviously low-follower or post-only-after-pump,
     set kol_intent="exit_liquidity" and lower confidence_score by at least 20.
+  - SR-4 BOT-SPAM / SYBIL DEFENSE: if a meaningful share (>=30%) of the social
+    posts look like coordinated retail bots — highly homogeneous wording,
+    emoji-only or "to the moon"-only content, no original analysis,
+    posted within a tight time window from accounts with low follower
+    counts — treat the social signal as MANUFACTURED. In that case:
+      * lower confidence_score by an additional 15-25,
+      * never output intent="pump" with confidence_score >= 70 unless
+        market features alone (funding, OI, sweep) independently justify it,
+      * if KOLs ALSO appear to be distributing, set kol_intent="exit_liquidity".
+    Genuine grass-roots discussion has variance: differing arguments,
+    counter-takes, links to charts, varying follower counts. Manufactured
+    shilling is uniform.
   - DO NOT output markdown, code fences, or any text outside the JSON.
 """
 
