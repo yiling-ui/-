@@ -14,6 +14,7 @@ from altcoin_agent.risk import (
     DynamicLeverageConfig,
     Position,
     PositionSizer,
+    PositionWatcher,
     Reconciler,
     RiskGate,
     RiskGateConfig,
@@ -528,3 +529,241 @@ def test_sr1_slippage_formula_matches_doc() -> None:
     assert math.isclose(gate._dynamic_slippage_cap(10.0), 0.03 / math.sqrt(2.0), rel_tol=1e-3)
     # 15x -> ~1.73%
     assert math.isclose(gate._dynamic_slippage_cap(15.0), 0.03 / math.sqrt(3.0), rel_tol=1e-3)
+
+
+
+# --------------------------------------------------------------------- #
+# PositionWatcher (Bug #1)
+# --------------------------------------------------------------------- #
+
+
+def _open_position(symbol: str = "RAVEUSDT", *, size: float = 100.0,
+                   side: Side = Side.LONG) -> Position:
+    return Position(
+        symbol=symbol, exchange="binance", side=side,
+        entry_price=1.000, size=size, leverage=10.0,
+        initial_stop=0.950, current_stop=0.950,
+        stop_order_id="stop-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_position_watcher_no_close_when_position_still_present() -> None:
+    adapter = FakeAdapter()
+    pos = _open_position()
+    a = AccountState()
+    a.open_positions[pos.symbol] = pos
+    adapter.fetched_positions = [
+        {"symbol": pos.symbol, "side": "long", "contracts": pos.size,
+         "entryPrice": pos.entry_price},
+    ]
+
+    closes: list[tuple[str, str]] = []
+
+    async def on_close(p: Position, reason: str) -> None:
+        closes.append((p.symbol, reason))
+
+    watcher = PositionWatcher(
+        adapter=adapter, account=a, on_close=on_close,
+        poll_interval_sec=0.01, miss_threshold=2,
+    )
+    # Two polls in a row, position is still there both times.
+    await watcher.poll_once()
+    await watcher.poll_once()
+    assert closes == []
+    assert pos.symbol in a.open_positions
+
+
+@pytest.mark.asyncio
+async def test_position_watcher_fires_on_close_after_threshold() -> None:
+    adapter = FakeAdapter()
+    pos = _open_position()
+    a = AccountState()
+    a.open_positions[pos.symbol] = pos
+    # Exchange side: position no longer present (got closed by STOP_MARKET).
+    adapter.fetched_positions = []
+
+    closes: list[tuple[str, str]] = []
+
+    async def on_close(p: Position, reason: str) -> None:
+        closes.append((p.symbol, reason))
+
+    watcher = PositionWatcher(
+        adapter=adapter, account=a, on_close=on_close,
+        poll_interval_sec=0.01, miss_threshold=2,
+    )
+    # First poll = first miss; should not fire yet.
+    await watcher.poll_once()
+    assert closes == []
+    assert pos.symbol in a.open_positions
+
+    # Second poll = threshold reached; fires.
+    await watcher.poll_once()
+    assert closes == [(pos.symbol, "exchange_close_detected")]
+    assert pos.symbol not in a.open_positions
+    assert pos.closed is True
+
+
+@pytest.mark.asyncio
+async def test_position_watcher_treats_zero_size_as_closed() -> None:
+    """Some venues return rows with size=0 instead of dropping them."""
+    adapter = FakeAdapter()
+    pos = _open_position()
+    a = AccountState()
+    a.open_positions[pos.symbol] = pos
+    adapter.fetched_positions = [
+        {"symbol": pos.symbol, "side": "long", "contracts": 0.0,
+         "entryPrice": pos.entry_price},
+    ]
+
+    closes: list[Position] = []
+
+    async def on_close(p: Position, reason: str) -> None:
+        closes.append(p)
+
+    watcher = PositionWatcher(
+        adapter=adapter, account=a, on_close=on_close,
+        poll_interval_sec=0.01, miss_threshold=1,
+    )
+    await watcher.poll_once()
+    assert len(closes) == 1
+    assert pos.symbol not in a.open_positions
+
+
+@pytest.mark.asyncio
+async def test_position_watcher_resets_misses_when_position_returns() -> None:
+    """A transient drop in one snapshot followed by a recovery must NOT
+    cause a false close."""
+    adapter = FakeAdapter()
+    pos = _open_position()
+    a = AccountState()
+    a.open_positions[pos.symbol] = pos
+
+    closes: list[Position] = []
+
+    async def on_close(p: Position, reason: str) -> None:
+        closes.append(p)
+
+    watcher = PositionWatcher(
+        adapter=adapter, account=a, on_close=on_close,
+        poll_interval_sec=0.01, miss_threshold=3,
+    )
+
+    # Miss #1
+    adapter.fetched_positions = []
+    await watcher.poll_once()
+    # Recovers: position visible again.
+    adapter.fetched_positions = [
+        {"symbol": pos.symbol, "side": "long", "contracts": pos.size,
+         "entryPrice": pos.entry_price},
+    ]
+    await watcher.poll_once()
+    # Miss again, but counter must have reset.
+    adapter.fetched_positions = []
+    await watcher.poll_once()
+    await watcher.poll_once()
+    # Two misses after reset (< threshold of 3) -> no close yet.
+    assert closes == []
+    assert pos.symbol in a.open_positions
+
+
+@pytest.mark.asyncio
+async def test_position_watcher_swallows_fetch_errors() -> None:
+    """fetch_positions raising must NOT advance miss counts."""
+
+    class ExplodingAdapter(FakeAdapter):
+        async def fetch_positions(self):  # type: ignore[override]
+            raise RuntimeError("api timeout")
+
+    adapter = ExplodingAdapter()
+    pos = _open_position()
+    a = AccountState()
+    a.open_positions[pos.symbol] = pos
+
+    closes: list[Position] = []
+
+    async def on_close(p: Position, reason: str) -> None:
+        closes.append(p)
+
+    watcher = PositionWatcher(
+        adapter=adapter, account=a, on_close=on_close,
+        poll_interval_sec=0.01, miss_threshold=1,
+    )
+    # Even with miss_threshold=1, a fetch error must not falsely close.
+    for _ in range(5):
+        await watcher.poll_once()
+    assert closes == []
+    assert pos.symbol in a.open_positions
+
+
+@pytest.mark.asyncio
+async def test_position_watcher_swallows_on_close_exception() -> None:
+    """If on_close raises, the watcher still removes the position locally
+    so we don't loop forever."""
+    adapter = FakeAdapter()
+    pos = _open_position()
+    a = AccountState()
+    a.open_positions[pos.symbol] = pos
+    adapter.fetched_positions = []
+
+    async def on_close(p: Position, reason: str) -> None:
+        raise RuntimeError("downstream blew up")
+
+    watcher = PositionWatcher(
+        adapter=adapter, account=a, on_close=on_close,
+        poll_interval_sec=0.01, miss_threshold=1,
+    )
+    closed = await watcher.poll_once()
+    assert len(closed) == 1
+    assert pos.symbol not in a.open_positions
+    assert pos.closed is True
+
+
+@pytest.mark.asyncio
+async def test_position_watcher_aggregates_hedge_mode_rows() -> None:
+    """Hedge-mode shorts can return as negative ``contracts`` and may
+    appear as two rows; we abs-sum so we don't conclude false-close."""
+    adapter = FakeAdapter()
+    pos = _open_position(size=100.0)
+    a = AccountState()
+    a.open_positions[pos.symbol] = pos
+    adapter.fetched_positions = [
+        {"symbol": pos.symbol, "side": "long", "contracts": 60.0,
+         "entryPrice": 1.0},
+        {"symbol": pos.symbol, "side": "long", "contracts": 40.0,
+         "entryPrice": 1.0},
+    ]
+
+    closes: list[Position] = []
+
+    async def on_close(p: Position, reason: str) -> None:
+        closes.append(p)
+
+    watcher = PositionWatcher(
+        adapter=adapter, account=a, on_close=on_close,
+        poll_interval_sec=0.01, miss_threshold=1,
+    )
+    await watcher.poll_once()
+    assert closes == []
+    assert pos.symbol in a.open_positions
+
+
+@pytest.mark.asyncio
+async def test_position_watcher_run_loop_terminates_on_stop_event() -> None:
+    """The long-running ``run()`` must exit promptly when stop_event is set."""
+    adapter = FakeAdapter()
+    a = AccountState()
+
+    async def on_close(p: Position, reason: str) -> None:
+        return None
+
+    watcher = PositionWatcher(
+        adapter=adapter, account=a, on_close=on_close,
+        poll_interval_sec=0.01, miss_threshold=2,
+    )
+    import asyncio
+    stop = asyncio.Event()
+    task = asyncio.create_task(watcher.run(stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await asyncio.wait_for(task, timeout=1.0)
