@@ -4,8 +4,10 @@ from altcoin_agent.ai_engine import (
     AIVerdict,
     DeepSeekEngine,
     EngineError,
+    LLMEngine,
     SocialPost,
 )
+from altcoin_agent.dashboard import DashboardState, install_dashboard
 from altcoin_agent.fuser import (
     Direction,
     FusedSignal,
@@ -22,6 +24,18 @@ from altcoin_agent.learning_engine import (
     fetch_historical_slice,
     run_post_mortem,
     synthesize_dump_slice,
+)
+from altcoin_agent.llm_provider import (
+    AnthropicProvider,
+    LLMProvider,
+    OpenAICompatibleProvider,
+    build_default_provider,
+)
+from altcoin_agent.notifier import (
+    Notifier,
+    NullNotifier,
+    TelegramNotifier,
+    build_default_notifier,
 )
 from altcoin_agent.risk import (
     AccountState,
@@ -56,6 +70,7 @@ from altcoin_agent.screener import (
     VolumeSpikeDetector,
     WashTradingDetector,
 )
+from altcoin_agent.slice_cache import SliceCache
 
 __all__ = [
     # screener
@@ -71,18 +86,23 @@ __all__ = [
     "OISurgeDetector",
     "LiquidityPoolAnalyzer",
     "WashTradingDetector",
-    # ai_engine
+    # ai_engine + providers
+    "LLMEngine",
     "DeepSeekEngine",
     "AIVerdict",
     "SocialPost",
     "EngineError",
+    "LLMProvider",
+    "OpenAICompatibleProvider",
+    "AnthropicProvider",
+    "build_default_provider",
     # fuser
     "ScoreFuser",
     "FuserConfig",
     "FusedSignal",
     "Direction",
     "RuleIndex",
-    # learning engine
+    # learning engine + cache
     "RuleStore",
     "DynamicRule",
     "HistoricalSlice",
@@ -91,6 +111,7 @@ __all__ = [
     "extract_candidate_features",
     "run_post_mortem",
     "synthesize_dump_slice",
+    "SliceCache",
     # risk
     "Side",
     "Position",
@@ -109,4 +130,12 @@ __all__ = [
     "CCXTExchangeAdapter",
     "ATRCalculator",
     "build_ccxt_adapter",
+    # notifiers
+    "Notifier",
+    "NullNotifier",
+    "TelegramNotifier",
+    "build_default_notifier",
+    # dashboard
+    "DashboardState",
+    "install_dashboard",
 ]
