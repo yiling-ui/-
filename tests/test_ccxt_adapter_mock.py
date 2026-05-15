@@ -144,3 +144,83 @@ async def test_fetch_open_orders_normalizes_reduce_only() -> None:
     orders = await a.fetch_open_orders()
     assert orders[0]["reduceOnly"] is True
     assert orders[0]["type"] == "stop_market"
+
+
+
+# --------------------------------------------------------------------- #
+# Bug #2: fetch_ticker_price provides the live quote that SR-1 compares
+# the trigger against. Without it, the gate's adverse-slip check is a
+# no-op (the bug we're fixing).
+# --------------------------------------------------------------------- #
+
+
+class FakeTickerCCXT(FakeCCXT):
+    """Adds a ``fetch_ticker`` method whose payload is configurable
+    per-test; lets us pin the price-extraction precedence."""
+
+    def __init__(self, ticker: dict | None = None,
+                 raise_exc: Exception | None = None) -> None:
+        super().__init__()
+        self._ticker = ticker
+        self._raise_exc = raise_exc
+
+    async def fetch_ticker(self, symbol):  # noqa: ANN001
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return dict(self._ticker or {})
+
+
+@pytest.mark.asyncio
+async def test_fetch_ticker_price_prefers_last() -> None:
+    cli = FakeTickerCCXT(ticker={"last": 1.234, "markPrice": 9.99,
+                                  "info": {"markPrice": 8.88},
+                                  "close": 5.55})
+    a = CCXTExchangeAdapter(client=cli, exchange_name="binance")
+    assert await a.fetch_ticker_price("RAVEUSDT") == pytest.approx(1.234)
+
+
+@pytest.mark.asyncio
+async def test_fetch_ticker_price_falls_back_to_mark() -> None:
+    cli = FakeTickerCCXT(ticker={"last": None, "markPrice": 1.5,
+                                  "close": 9.99})
+    a = CCXTExchangeAdapter(client=cli, exchange_name="binance")
+    assert await a.fetch_ticker_price("RAVEUSDT") == pytest.approx(1.5)
+
+
+@pytest.mark.asyncio
+async def test_fetch_ticker_price_falls_back_to_info_markprice() -> None:
+    cli = FakeTickerCCXT(ticker={"last": 0, "markPrice": None,
+                                  "info": {"markPrice": "2.0"},
+                                  "close": 9.99})
+    a = CCXTExchangeAdapter(client=cli, exchange_name="binance")
+    assert await a.fetch_ticker_price("RAVEUSDT") == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_fetch_ticker_price_falls_back_to_close_last() -> None:
+    cli = FakeTickerCCXT(ticker={"last": None, "markPrice": None,
+                                  "close": 0.42})
+    a = CCXTExchangeAdapter(client=cli, exchange_name="binance")
+    assert await a.fetch_ticker_price("RAVEUSDT") == pytest.approx(0.42)
+
+
+@pytest.mark.asyncio
+async def test_fetch_ticker_price_raises_when_all_fields_zero_or_missing() -> None:
+    """No usable price -> raise. The caller in main.py turns this into a
+    fail-closed ``quote_unavailable`` rejection so SR-1 can never be
+    silently bypassed."""
+    cli = FakeTickerCCXT(ticker={"last": None, "markPrice": 0,
+                                  "close": None})
+    a = CCXTExchangeAdapter(client=cli, exchange_name="binance")
+    with pytest.raises(RuntimeError, match="no usable price"):
+        await a.fetch_ticker_price("RAVEUSDT")
+
+
+@pytest.mark.asyncio
+async def test_fetch_ticker_price_propagates_client_exceptions() -> None:
+    """Network blip -> upstream exception bubbles up; ``_get_live_quote``
+    in main.py catches it and rejects the order."""
+    cli = FakeTickerCCXT(raise_exc=RuntimeError("upstream timeout"))
+    a = CCXTExchangeAdapter(client=cli, exchange_name="binance")
+    with pytest.raises(RuntimeError, match="upstream timeout"):
+        await a.fetch_ticker_price("RAVEUSDT")
