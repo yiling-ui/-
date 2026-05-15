@@ -21,6 +21,8 @@ Public surface:
     )
 """
 
+from altcoin_agent.risk.atr import ATRCalculator
+from altcoin_agent.risk.ccxt_adapter import CCXTExchangeAdapter, build_ccxt_adapter
 from altcoin_agent.risk.executor import (
     CCXTExecutor,
     ExchangeAdapter,
@@ -34,6 +36,8 @@ from altcoin_agent.risk.trailing import TrailingState, TrailingStopFSM
 
 __all__ = [
     "AccountState",
+    "ATRCalculator",
+    "CCXTExchangeAdapter",
     "CCXTExecutor",
     "DynamicLeverageConfig",
     "ExchangeAdapter",
@@ -48,4 +52,5 @@ __all__ = [
     "Side",
     "TrailingState",
     "TrailingStopFSM",
+    "build_ccxt_adapter",
 ]

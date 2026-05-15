@@ -2,18 +2,20 @@
 
 Responsibilities:
     * Load .env / YAML config.
-    * Wire screener -> asyncio.Queue -> fuser -> (dry-run logging, for now).
-    * Run reconciler at startup (SR-2). Refuses non-dry-run mode in V1.0
-      because no live exchange adapter is yet wired in this entry point.
+    * Wire screener -> asyncio.Queue -> fuser -> risk_gate -> executor.
+    * Run reconciler at startup (SR-2). Until reconciliation completes the
+      gate refuses every signal.
+    * Maintain a TrailingStopFSM per open position, fed by closed klines
+      and live ATR.
     * Expose /healthz on aiohttp for Docker healthcheck.
     * SIGINT / SIGTERM -> graceful shutdown:
         1. Stop accepting new screener events.
         2. Drain the queue with a bounded timeout.
         3. Cancel exchange WS subscriptions, close clients.
-    * --dry-run: no real orders, only structured logging.
-
-V1 keeps it simple: asyncio.Queue, single process, no Redis. Multi-process
-scaling is documented in design.md but not implemented here.
+    * Three operating modes:
+        --dry-run         (default): no orders, just structured logging.
+        --paper-trade           : real ccxt orders against testnet/sandbox.
+        live (no flag, set in .env): real ccxt orders against mainnet.
 """
 
 from __future__ import annotations
@@ -30,11 +32,24 @@ from dataclasses import dataclass, field
 
 from aiohttp import web
 
-from altcoin_agent.fuser import FusedSignal, FuserConfig, ScoreFuser
-from altcoin_agent.risk.executor import ExchangeAdapter
-from altcoin_agent.risk.reconciler import Reconciler
-from altcoin_agent.risk.state import AccountState, Side
-from altcoin_agent.screener import Screener, SignalEvent
+from altcoin_agent.fuser import Direction, FusedSignal, FuserConfig, ScoreFuser
+from altcoin_agent.risk import (
+    AccountState,
+    ATRCalculator,
+    CCXTExchangeAdapter,
+    CCXTExecutor,
+    ExchangeAdapter,
+    Position,
+    PositionSizer,
+    Reconciler,
+    RiskDecision,
+    RiskGate,
+    RiskGateConfig,
+    TrailingState,
+    TrailingStopFSM,
+    build_ccxt_adapter,
+)
+from altcoin_agent.screener import Kline, Screener, SignalEvent
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +68,9 @@ class AppConfig:
     graceful_timeout_sec: float = 30.0
     initial_equity_usdt: float = 10_000.0
     dry_run: bool = True
+    paper_trade: bool = False             # use ccxt with testnet=true
+    hedge_mode: bool = False
+    min_liquidity_usdt: float = 200_000.0
 
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
@@ -70,6 +88,9 @@ class AppConfig:
             graceful_timeout_sec=float(d.get("graceful_timeout_sec", 30)),
             initial_equity_usdt=float(d.get("initial_equity_usdt", 10_000)),
             dry_run=bool(d.get("dry_run", True)),
+            paper_trade=bool(d.get("paper_trade", False)),
+            hedge_mode=bool(d.get("hedge_mode", False)),
+            min_liquidity_usdt=float(d.get("min_liquidity_usdt", 200_000)),
         )
 
 
@@ -87,6 +108,10 @@ class HealthState:
     last_signal_ts: float = 0.0
     high_priority_count: int = 0
     rule_event_count: int = 0
+    open_positions: int = 0
+    orders_placed: int = 0
+    orders_rejected: int = 0
+    last_error: str | None = None
 
 
 async def make_health_app(state: HealthState) -> web.Application:
@@ -104,7 +129,11 @@ async def make_health_app(state: HealthState) -> web.Application:
             "reconciliation_complete": state.reconciliation_complete,
             "high_priority_count": state.high_priority_count,
             "rule_event_count": state.rule_event_count,
+            "open_positions": state.open_positions,
+            "orders_placed": state.orders_placed,
+            "orders_rejected": state.orders_rejected,
             "last_signal_ts": state.last_signal_ts,
+            "last_error": state.last_error,
         }
         return web.json_response(body, status=200 if ok else 503)
 
@@ -114,13 +143,13 @@ async def make_health_app(state: HealthState) -> web.Application:
 
 
 # --------------------------------------------------------------------- #
-# Dry-run exchange adapter
+# Dry-run exchange adapter (no network)
 # --------------------------------------------------------------------- #
 
 
 class DryRunExchangeAdapter:
-    """Mimics the ExchangeAdapter Protocol but logs everything instead of
-    placing real orders. Used when --dry-run is set."""
+    """Mimics ``ExchangeAdapter`` but logs everything instead of placing
+    real orders. Used when ``--dry-run`` is set."""
 
     def __init__(self) -> None:
         self.market_orders: list[dict] = []
@@ -163,18 +192,108 @@ class DryRunExchangeAdapter:
         return {"symbol": symbol, "leverage": leverage}
 
     async def fetch_positions(self) -> list[dict]:
-        return []  # dry-run starts clean
+        return []
 
     async def fetch_open_orders(self) -> list[dict]:
         return []
 
 
-# Sanity check the protocol fit at import time (helps catch drift early).
 assert isinstance(DryRunExchangeAdapter(), ExchangeAdapter), (
     "DryRunExchangeAdapter does not satisfy ExchangeAdapter protocol"
 )
-# Side import only used for the protocol assertion above.
-_ = Side
+
+
+# --------------------------------------------------------------------- #
+# Live adapter factory
+# --------------------------------------------------------------------- #
+
+
+def _build_live_adapter(cfg: AppConfig) -> CCXTExchangeAdapter | None:
+    """Build a ccxt-backed adapter from environment variables."""
+    exchange = cfg.exchanges[0] if cfg.exchanges else "binance"
+    key_var = f"{exchange.upper()}_API_KEY"
+    sec_var = f"{exchange.upper()}_API_SECRET"
+    pass_var = f"{exchange.upper()}_API_PASSPHRASE"
+    testnet_var = f"{exchange.upper()}_TESTNET"
+
+    api_key = os.getenv(key_var, "")
+    api_secret = os.getenv(sec_var, "")
+    api_passphrase = os.getenv(pass_var) or None
+    testnet = os.getenv(testnet_var, "true").lower() in ("1", "true", "yes")
+
+    if not api_key or not api_secret:
+        logger.error("Missing %s / %s in environment; cannot build live adapter.",
+                     key_var, sec_var)
+        return None
+    try:
+        return build_ccxt_adapter(
+            exchange_name=exchange,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            testnet=testnet or cfg.paper_trade,
+            hedge_mode=cfg.hedge_mode,
+        )
+    except Exception as e:
+        logger.error("Failed to build live adapter: %s", e)
+        return None
+
+
+# --------------------------------------------------------------------- #
+# Trailing controller
+# --------------------------------------------------------------------- #
+
+
+@dataclass
+class _Tracked:
+    position: Position
+    state: TrailingState = TrailingState.INIT
+
+
+@dataclass
+class TrailingController:
+    """Per-symbol trailing FSM state machine.
+
+    On every closed kline we update ATR and feed the latest price to the
+    FSM. When the FSM proposes a tighter stop, we ask the executor to
+    cancel + replace via ``tighten_hard_stop``.
+    """
+
+    fsm: TrailingStopFSM
+    atr: ATRCalculator
+    executor: CCXTExecutor
+    account: AccountState
+    health: HealthState
+    _by_symbol: dict[str, _Tracked] = field(default_factory=dict)
+
+    def attach(self, position: Position) -> None:
+        self._by_symbol[position.symbol] = _Tracked(position=position)
+
+    def detach(self, symbol: str) -> None:
+        self._by_symbol.pop(symbol, None)
+
+    async def on_kline(self, exchange: str, symbol: str, bar: Kline) -> None:
+        atr = self.atr.update(exchange, symbol, bar)
+        tracked = self._by_symbol.get(symbol)
+        if tracked is None or tracked.position.closed:
+            return
+        next_state, new_stop, reason = self.fsm.tick(
+            position=tracked.position,
+            current_price=bar.close,
+            atr=atr,
+            current_state=tracked.state,
+        )
+        tracked.state = next_state
+        if new_stop is None:
+            return
+        ok = await self.executor.tighten_hard_stop(tracked.position, new_stop)
+        if ok:
+            logger.info("trailing %s: %s -> stop %s (atr=%.5f)",
+                        symbol, reason, new_stop, atr)
+        else:
+            logger.warning("trailing %s: tighten FAILED (%s); position may be naked",
+                           symbol, reason)
+            self.health.last_error = f"trailing tighten failed on {symbol}"
 
 
 # --------------------------------------------------------------------- #
@@ -190,13 +309,50 @@ class App:
     _tasks: list[asyncio.Task] = field(default_factory=list)
     _runner: web.AppRunner | None = None
     _screener: Screener | None = None
+    _adapter: ExchangeAdapter | None = None
 
     async def run(self) -> None:
         self.state.started_at = time.time()
-        logger.info("Altcoin Agent V1.0 starting (dry_run=%s)", self.cfg.dry_run)
+        mode = self._mode_label()
+        logger.info("Altcoin Agent V1.0 starting (mode=%s)", mode)
+
+        # ----- adapter selection -----
+        if self.cfg.dry_run:
+            self._adapter = DryRunExchangeAdapter()
+        else:
+            adapter = _build_live_adapter(self.cfg)
+            if adapter is None:
+                logger.error("Live mode requires valid API keys. Aborting.")
+                raise SystemExit(2)
+            self._adapter = adapter
+
+        executor = CCXTExecutor(adapter=self._adapter,
+                                exchange_name=self.cfg.exchanges[0])
+        sizer = PositionSizer()
+        gate = RiskGate(sizer, RiskGateConfig(
+            min_liquidity_usdt=self.cfg.min_liquidity_usdt,
+        ))
+        atr = ATRCalculator()
+        account = AccountState(
+            equity_usdt=self.cfg.initial_equity_usdt,
+            starting_equity_today_usdt=self.cfg.initial_equity_usdt,
+        )
+
+        # ----- reconciler (SR-2) -----
+        rec_report = await Reconciler(
+            exchange_name=self.cfg.exchanges[0], adapter=self._adapter,
+        ).run(account)
+        logger.info("Reconciler: %s", rec_report)
+        self.state.reconciliation_complete = account.reconciliation_complete
+
+        trailing = TrailingController(
+            fsm=TrailingStopFSM(), atr=atr, executor=executor,
+            account=account, health=self.state,
+        )
 
         # ----- queue + components -----
         signal_q: asyncio.Queue[SignalEvent] = asyncio.Queue(maxsize=1000)
+        kline_q: asyncio.Queue[tuple[str, str, Kline]] = asyncio.Queue(maxsize=1000)
 
         async def screener_sink(ev: SignalEvent) -> None:
             self.state.last_signal_ts = time.time()
@@ -204,43 +360,33 @@ class App:
             with suppress(asyncio.QueueFull):
                 signal_q.put_nowait(ev)
 
+        # Hook into screener's kline callback so trailing reacts to closed bars.
+        # We do it by wrapping Screener.on_kline once the screener is built.
         self._screener = Screener(
             exchanges=self.cfg.exchanges,
             symbols=self.cfg.symbols,
             sink=screener_sink,
             timeframes=self.cfg.timeframes,
         )
+        original_on_kline = self._screener.on_kline
 
+        async def on_kline_wrapper(exchange: str, symbol: str, bar: Kline) -> None:
+            with suppress(asyncio.QueueFull):
+                kline_q.put_nowait((exchange, symbol, bar))
+            await original_on_kline(exchange, symbol, bar)
+
+        self._screener.on_kline = on_kline_wrapper  # type: ignore[method-assign]
+
+        # ----- fused-signal handling -----
         async def fused_sink(sig: FusedSignal) -> None:
             self.state.high_priority_count += 1
             logger.info("HIGH PRIORITY: %s", sig.as_dict())
-            if not self.cfg.dry_run:
-                # In a future PR, this is where we'd call:
-                #   decision = risk_gate.evaluate(...)
-                #   if decision.approved: await executor.open(...)
-                logger.warning(
-                    "live trading entry point not wired in V1.0 main.py; "
-                    "no order placed despite dry_run=False",
-                )
+            await self._handle_high_priority(
+                sig=sig, gate=gate, executor=executor,
+                trailing=trailing, account=account,
+            )
 
         fuser = ScoreFuser(sink=fused_sink, config=FuserConfig())
-
-        # ----- reconciler (SR-2) -----
-        account = AccountState(equity_usdt=self.cfg.initial_equity_usdt)
-        if self.cfg.dry_run:
-            adapter = DryRunExchangeAdapter()
-            rec_report = await Reconciler(
-                exchange_name=self.cfg.exchanges[0], adapter=adapter,
-            ).run(account)
-            logger.info("Reconciler: %s", rec_report)
-        else:
-            logger.error(
-                "Live mode requested but no live exchange adapter is wired in "
-                "main.py for V1.0. Run with DRY_RUN=true while we add "
-                "exchange-specific adapters.",
-            )
-            raise SystemExit(2)
-        self.state.reconciliation_complete = account.reconciliation_complete
 
         # ----- health server -----
         health_app = await make_health_app(self.state)
@@ -263,10 +409,27 @@ class App:
                         await fuser.on_rule_signal(ev)
                     except Exception as e:
                         logger.exception("fuser failed on event: %s", e)
+                        self.state.last_error = f"fuser:{type(e).__name__}"
             except asyncio.CancelledError:
                 pass
             finally:
                 self.state.fuser_alive = False
+
+        async def trailing_worker() -> None:
+            try:
+                while not self._stop_event.is_set():
+                    try:
+                        exchange, symbol, bar = await asyncio.wait_for(
+                            kline_q.get(), timeout=1.0,
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    try:
+                        await trailing.on_kline(exchange, symbol, bar)
+                    except Exception as e:
+                        logger.exception("trailing failed on bar: %s", e)
+            except asyncio.CancelledError:
+                pass
 
         async def screener_worker() -> None:
             try:
@@ -275,14 +438,80 @@ class App:
                 raise
             except Exception as e:
                 logger.exception("screener failed: %s", e)
+                self.state.last_error = f"screener:{type(e).__name__}"
             finally:
                 self.state.screener_alive = False
 
         self._tasks.append(asyncio.create_task(fuse_worker(), name="fuse_worker"))
+        self._tasks.append(asyncio.create_task(trailing_worker(), name="trailing_worker"))
         self._tasks.append(asyncio.create_task(screener_worker(), name="screener_worker"))
 
         await self._stop_event.wait()
         await self._shutdown()
+
+    async def _handle_high_priority(
+        self,
+        *,
+        sig: FusedSignal,
+        gate: RiskGate,
+        executor: CCXTExecutor,
+        trailing: TrailingController,
+        account: AccountState,
+    ) -> None:
+        """Translate a high-priority FusedSignal into an order if Risk Gate
+        approves. Attaches a trailing tracker to the new position."""
+        if sig.direction == Direction.NEUTRAL:
+            return
+        if sig.trigger_price is None or sig.trigger_price <= 0:
+            logger.warning("missing trigger_price on %s; skipping order", sig.symbol)
+            return
+
+        # 5% protective initial stop based on direction. The stop distance is
+        # also what Risk Gate uses to size the position via risk-parity.
+        if sig.direction == Direction.LONG:
+            initial_stop = sig.trigger_price * 0.95
+        else:
+            initial_stop = sig.trigger_price * 1.05
+
+        decision: RiskDecision = gate.evaluate(
+            signal=sig,
+            account=account,
+            current_price=sig.trigger_price,
+            top5_depth_usdt=self.cfg.min_liquidity_usdt,  # placeholder
+            realized_vol_pct=0.05,                          # placeholder
+            initial_stop=initial_stop,
+        )
+        if not decision.approved:
+            logger.info("Risk Gate REJECT %s: %s", sig.symbol, decision.reason)
+            self.state.orders_rejected += 1
+            return
+        try:
+            position = await executor.open(
+                symbol=sig.symbol,
+                decision=decision,
+                current_price=sig.trigger_price,
+                account=account,
+                trace_id=str(sig.ts),
+            )
+            self.state.orders_placed += 1
+            self.state.open_positions = len(account.open_positions)
+            trailing.attach(position)
+            logger.info(
+                "OPENED %s %s size=%.4f lev=%.2f stop=%.6f",
+                position.side.value, position.symbol, position.size,
+                position.leverage, position.current_stop,
+            )
+        except Exception as e:
+            logger.exception("Executor failed for %s: %s", sig.symbol, e)
+            self.state.last_error = f"executor:{type(e).__name__}"
+            self.state.orders_rejected += 1
+
+    def _mode_label(self) -> str:
+        if self.cfg.dry_run:
+            return "DRY-RUN"
+        if self.cfg.paper_trade:
+            return "PAPER-TRADE (testnet)"
+        return "LIVE"
 
     async def _shutdown(self) -> None:
         logger.info(
@@ -304,6 +533,13 @@ class App:
         if self._runner is not None:
             with suppress(Exception):
                 await self._runner.cleanup()
+        # Close ccxt client if any
+        client = getattr(self._adapter, "client", None)
+        if client is not None:
+            close = getattr(client, "close", None)
+            if close is not None:
+                with suppress(Exception):
+                    await close()
         logger.info("Shutdown complete.")
 
     def request_stop(self) -> None:
@@ -331,6 +567,8 @@ def main() -> None:
                         help="path to YAML config")
     parser.add_argument("--dry-run", action="store_true",
                         help="never place real orders, only log")
+    parser.add_argument("--paper-trade", action="store_true",
+                        help="real ccxt orders against testnet/sandbox")
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     args = parser.parse_args()
 
@@ -344,6 +582,9 @@ def main() -> None:
 
     if args.dry_run or os.getenv("DRY_RUN", "").lower() in ("1", "true", "yes"):
         cfg.dry_run = True
+    if args.paper_trade or os.getenv("PAPER_TRADE", "").lower() in ("1", "true", "yes"):
+        cfg.paper_trade = True
+        cfg.dry_run = False
 
     app = App(cfg=cfg)
     loop = asyncio.new_event_loop()
