@@ -116,13 +116,40 @@ class Bar:
 
 @dataclass
 class HistoricalSlice:
-    """4 hours of data leading up to (and including) a target timestamp."""
+    """Market data window around a target event.
+
+    Two layouts are supported:
+
+    * **Backward-only (legacy):**  `[target_ts_ms - hours_back, target_ts_ms]`.
+      Used by `discover_events` / standalone backtests where the "event" is
+      the whole 4h window. ``entry_ts_ms`` is 0; ``compute_event_result`` and
+      ``extract_candidate_features`` then operate on the entire bar list.
+    * **Around an entry (Bug #2 fix):**  `[entry_ts_ms - hours_back,
+      entry_ts_ms + hours_forward]`. Used by the live post-mortem scheduler
+      and any backtest that wants to evaluate what happened *after* a given
+      decision point. When ``entry_ts_ms > 0``:
+        - ``extract_candidate_features`` uses bars strictly before
+          ``entry_ts_ms`` (the predictors).
+        - ``compute_event_result`` evaluates the realized direction/magnitude
+          using only bars at or after ``entry_ts_ms``, with the close of the
+          last pre-entry bar as the reference price (the most accurate
+          available proxy for our actual fill).
+
+    ``target_ts_ms`` is kept as the *anchor* timestamp for both layouts; it's
+    the field the slice cache keys on.
+    """
 
     symbol: str
     target_ts_ms: int
     bars: list[Bar] = field(default_factory=list)        # oldest -> newest
     funding_rates: list[tuple[int, float]] = field(default_factory=list)  # (ts, rate)
     open_interest: list[tuple[int, float]] = field(default_factory=list)  # (ts, oi)
+    # Bug #2 fix: when set, the slice spans both before and after this
+    # timestamp. compute_event_result and extract_candidate_features split
+    # the bars on this boundary so the realized result is measured AFTER
+    # entry and the predictive features are measured BEFORE entry. When 0,
+    # the legacy whole-slice behaviour is used.
+    entry_ts_ms: int = 0
 
     @property
     def first_close(self) -> float:
@@ -131,6 +158,29 @@ class HistoricalSlice:
     @property
     def last_close(self) -> float:
         return self.bars[-1].close if self.bars else 0.0
+
+    def pre_entry_bars(self) -> list[Bar]:
+        """Bars strictly before ``entry_ts_ms``; the predictive window."""
+        if self.entry_ts_ms <= 0:
+            return list(self.bars)
+        return [b for b in self.bars if b.ts_ms < self.entry_ts_ms]
+
+    def post_entry_bars(self) -> list[Bar]:
+        """Bars at or after ``entry_ts_ms``; the result-evaluation window."""
+        if self.entry_ts_ms <= 0:
+            return list(self.bars)
+        return [b for b in self.bars if b.ts_ms >= self.entry_ts_ms]
+
+    def entry_reference_price(self) -> float:
+        """Close of the last bar before ``entry_ts_ms`` — the best proxy
+        for our actual fill price. Falls back to first post-entry open."""
+        if self.entry_ts_ms <= 0:
+            return self.first_close
+        pre = self.pre_entry_bars()
+        if pre:
+            return pre[-1].close
+        post = self.post_entry_bars()
+        return post[0].open if post else 0.0
 
 
 @dataclass
@@ -164,24 +214,44 @@ async def fetch_historical_slice(
     target_ts_ms: int,
     *,
     hours_back: int = 4,
+    hours_forward: int = 0,
+    entry_ts_ms: int | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> HistoricalSlice:
     """
-    Pull the `hours_back` window leading up to ``target_ts_ms`` for a symbol
-    via OKX public REST. Symbol is normalized to OKX swap form
-    (e.g. RAVE-USDT-SWAP).
+    Pull a market-data slice for ``symbol`` via OKX public REST. Symbol is
+    normalized to OKX swap form (e.g. RAVE-USDT-SWAP).
+
+    Two modes:
+
+    * **Legacy** (``hours_forward == 0`` and ``entry_ts_ms`` unset): pulls
+      ``[target_ts_ms - hours_back, target_ts_ms]``, the original 4h-leading
+      window used by ``discover_events`` and standalone backtests.
+    * **Entry-aware** (Bug #2 fix): when ``entry_ts_ms`` is provided, pulls
+      ``[entry_ts_ms - hours_back, entry_ts_ms + hours_forward]`` and tags
+      the resulting ``HistoricalSlice.entry_ts_ms``. Downstream
+      ``compute_event_result`` / ``extract_candidate_features`` then split
+      bars on that boundary so realized outcomes are measured strictly
+      AFTER entry and predictive features strictly BEFORE.
     """
     inst_id = _to_okx_inst_id(symbol)
-    start_ms = target_ts_ms - hours_back * 3600 * 1000
+
+    anchor_ms = entry_ts_ms if entry_ts_ms is not None else target_ts_ms
+    start_ms = anchor_ms - hours_back * 3600 * 1000
+    end_ms = anchor_ms + hours_forward * 3600 * 1000
+    if end_ms < target_ts_ms:
+        # Caller may have set both target_ts_ms and entry_ts_ms; the network
+        # window must include both so the slice cache key remains valid.
+        end_ms = target_ts_ms
 
     owns_client = client is None
     if client is None:
         client = httpx.AsyncClient(timeout=15.0)
 
     try:
-        bars = await _fetch_okx_candles(client, inst_id, start_ms, target_ts_ms)
-        funding = await _fetch_okx_funding(client, inst_id, start_ms, target_ts_ms)
-        oi = await _fetch_okx_oi(client, inst_id, start_ms, target_ts_ms)
+        bars = await _fetch_okx_candles(client, inst_id, start_ms, end_ms)
+        funding = await _fetch_okx_funding(client, inst_id, start_ms, end_ms)
+        oi = await _fetch_okx_oi(client, inst_id, start_ms, end_ms)
     finally:
         if owns_client:
             await client.aclose()
@@ -192,6 +262,7 @@ async def fetch_historical_slice(
         bars=bars,
         funding_rates=funding,
         open_interest=oi,
+        entry_ts_ms=entry_ts_ms or 0,
     )
 
 
@@ -271,24 +342,49 @@ async def _fetch_okx_oi(
 # --------------------------------------------------------------------- #
 
 
-def compute_event_result(s: HistoricalSlice) -> EventResult:
-    """Derive realized direction + magnitude from the slice tail.
+def compute_event_result(
+    s: HistoricalSlice,
+    *,
+    expected_direction: Direction | None = None,
+) -> EventResult:
+    """Derive realized direction + magnitude from the slice.
 
-    Compares the close at slice start with the most extreme price reached
-    by the end of the slice; whichever extremum is greater (in %) defines
-    the realized direction.
+    Entry-aware (Bug #2 fix): when ``s.entry_ts_ms > 0`` the realized result
+    is computed strictly from bars at or after entry, with the close of the
+    last pre-entry bar as the reference price (the best proxy for our actual
+    fill). This guarantees we evaluate "what happened after we opened",
+    not "what was the biggest move anywhere in the lookback window".
+
+    Legacy (when ``s.entry_ts_ms == 0``): the whole slice is scanned with the
+    first close as reference, preserving the behaviour expected by
+    ``discover_events`` / standalone backtests.
+
+    ``expected_direction`` (Bug #2 fix): if provided, the result is reported
+    AS IF the trader took that direction, so a long that gets stopped out
+    correctly registers as ``"pump"`` with a *negative* magnitude (a missed
+    pump = a loss). This is what lets the rule store learn from losers as
+    well as winners. When omitted, the larger-extremum-wins behaviour is
+    preserved for backward compatibility.
     """
-    if not s.bars:
-        return EventResult("pump", 0.0, 0, s.target_ts_ms)
-    ref = s.bars[0].close
+    bars = s.post_entry_bars() if s.entry_ts_ms > 0 else list(s.bars)
+    if not bars:
+        return EventResult(
+            expected_direction or "pump", 0.0, 0,
+            s.entry_ts_ms or s.target_ts_ms,
+        )
+
+    ref = s.entry_reference_price() if s.entry_ts_ms > 0 else bars[0].close
     if ref <= 0:
-        return EventResult("pump", 0.0, 0, s.target_ts_ms)
+        return EventResult(
+            expected_direction or "pump", 0.0, 0,
+            bars[0].ts_ms,
+        )
 
     max_up = 0.0
     max_dn = 0.0
     up_bar: Bar | None = None
     dn_bar: Bar | None = None
-    for b in s.bars:
+    for b in bars:
         up = (b.high - ref) / ref
         dn = (b.low - ref) / ref
         if up > max_up:
@@ -298,16 +394,38 @@ def compute_event_result(s: HistoricalSlice) -> EventResult:
             max_dn = dn
             dn_bar = b
 
-    if abs(max_up) >= abs(max_dn):
-        target_bar = up_bar or s.bars[-1]
-        mag = max_up
+    if expected_direction == "pump":
+        # Trader's thesis was UP. Magnitude is the run UP if it materialized,
+        # else the (negative) drawdown — the move that took us out.
+        if max_up > 0:
+            target_bar = up_bar or bars[-1]
+            mag = max_up
+        else:
+            target_bar = dn_bar or bars[-1]
+            mag = max_dn
         direction: Direction = "pump"
-    else:
-        target_bar = dn_bar or s.bars[-1]
-        mag = max_dn
+    elif expected_direction == "dump":
+        # Trader's thesis was DOWN. Magnitude is the run DOWN if it
+        # materialized, else the (positive) drawdown.
+        if max_dn < 0:
+            target_bar = dn_bar or bars[-1]
+            mag = max_dn
+        else:
+            target_bar = up_bar or bars[-1]
+            mag = max_up
         direction = "dump"
+    else:
+        # Legacy: whichever extremum is bigger wins.
+        if abs(max_up) >= abs(max_dn):
+            target_bar = up_bar or bars[-1]
+            mag = max_up
+            direction = "pump"
+        else:
+            target_bar = dn_bar or bars[-1]
+            mag = max_dn
+            direction = "dump"
 
-    minutes = max(0, (target_bar.ts_ms - s.bars[0].ts_ms) // 60_000)
+    minutes = max(0, (target_bar.ts_ms - bars[0].ts_ms) // 60_000)
     return EventResult(
         direction=direction,
         magnitude_pct=mag,
@@ -333,13 +451,31 @@ def _zscore(values: list[float], x: float) -> float:
 
 
 def extract_candidate_features(s: HistoricalSlice, result: EventResult) -> list[CandidateFeature]:
-    """Compute 8 quantitative candidate features over the PRE-event window
-    (everything strictly before `result.realized_at_ts_ms`). The LLM may only
-    pick from these.
+    """Compute 8 quantitative candidate features over the PRE-event window.
+
+    Two windowing modes:
+
+    * **Entry-aware** (``s.entry_ts_ms > 0``, the live post-mortem path
+      after the Bug #2 fix): the predictive window is the bars strictly
+      before ``entry_ts_ms``. This is the only window the LLM is allowed to
+      see when deciding what predicted the post-entry move — it cannot peek
+      at bars from after we opened.
+    * **Legacy** (``s.entry_ts_ms == 0``): the predictive window is
+      everything before ``result.realized_at_ts_ms``, preserving the
+      historical behaviour used by ``discover_events`` / standalone
+      backtests.
+
+    The LLM may only pick from these features.
     """
-    pre = [b for b in s.bars if b.ts_ms < result.realized_at_ts_ms]
-    if not pre:
-        pre = s.bars
+    if s.entry_ts_ms > 0:
+        pre = s.pre_entry_bars()
+        # Anchor used for "last 1h / last 2h" funding/OI windows below.
+        feature_anchor_ts_ms = s.entry_ts_ms
+    else:
+        pre = [b for b in s.bars if b.ts_ms < result.realized_at_ts_ms]
+        if not pre:
+            pre = s.bars
+        feature_anchor_ts_ms = s.target_ts_ms
 
     out: list[CandidateFeature] = []
     if not pre:
@@ -356,8 +492,11 @@ def extract_candidate_features(s: HistoricalSlice, result: EventResult) -> list[
     out.append(CandidateFeature("volume_zscore_last1h", bucket_zscore(z), z,
                                 "Mean 1m volume in last 60min vs prior 3h"))
 
-    # 2. funding_pre2h_extreme — most-extreme funding in last 2h
-    last_2h = [r for r in s.funding_rates if r[0] >= s.target_ts_ms - 2 * 3600 * 1000]
+    # 2. funding_pre2h_extreme — most-extreme funding in last 2h (pre-entry only)
+    last_2h = [
+        r for r in s.funding_rates
+        if feature_anchor_ts_ms - 2 * 3600 * 1000 <= r[0] < feature_anchor_ts_ms
+    ]
     extreme_rate = 0.0
     if last_2h:
         extreme_rate = max(last_2h, key=lambda r: abs(r[1]))[1]
@@ -367,7 +506,10 @@ def extract_candidate_features(s: HistoricalSlice, result: EventResult) -> list[
     # 3. oi_growth_pre1h — % change in OI over the last hour of pre window
     oi_growth = 0.0
     if len(s.open_interest) >= 2:
-        last_oi = [o for o in s.open_interest if o[0] >= s.target_ts_ms - 3600 * 1000]
+        last_oi = [
+            o for o in s.open_interest
+            if feature_anchor_ts_ms - 3600 * 1000 <= o[0] < feature_anchor_ts_ms
+        ]
         if len(last_oi) >= 2 and last_oi[0][1] > 0:
             oi_growth = (last_oi[-1][1] - last_oi[0][1]) / last_oi[0][1]
     out.append(CandidateFeature("oi_growth_pre1h", bucket_pct(oi_growth), oi_growth,
@@ -417,7 +559,10 @@ def extract_candidate_features(s: HistoricalSlice, result: EventResult) -> list[
 
     # 8. funding_slope_pre1h — funding rate trend over the last 1h
     slope = 0.0
-    last_fr = [r for r in s.funding_rates if r[0] >= s.target_ts_ms - 3600 * 1000]
+    last_fr = [
+        r for r in s.funding_rates
+        if feature_anchor_ts_ms - 3600 * 1000 <= r[0] < feature_anchor_ts_ms
+    ]
     if len(last_fr) >= 2:
         slope = last_fr[-1][1] - last_fr[0][1]
     out.append(CandidateFeature("funding_slope_pre1h", bucket_pct(slope * 100),
@@ -627,15 +772,18 @@ async def post_mortem_via_deepseek(
     """
     allowed: dict[str, CandidateFeature] = {c.name: c for c in candidates}
     user = (
-        "You are reviewing a confirmed altcoin event AFTER it happened.\n"
+        "You are reviewing a confirmed altcoin trade AFTER it was opened.\n"
         f"Symbol: {symbol}\n"
         f"Realized direction: {result.direction}\n"
-        f"Magnitude: {result.magnitude_pct * 100:+.2f}%\n"
-        f"Minutes from window start to extremum: {result.minutes_to_extremum}\n\n"
-        "Here are 8 PRE-EVENT candidate features measured on the 4-hour\n"
-        "window leading up to the move. You MUST pick 1 or 2 features\n"
-        "from this list (no others) that you judge most predictive of the\n"
-        "realized direction.\n\n"
+        f"Magnitude (signed PnL relative to entry): {result.magnitude_pct * 100:+.2f}%\n"
+        f"Minutes from entry to extremum: {result.minutes_to_extremum}\n\n"
+        "Below are 8 PRE-ENTRY candidate features measured strictly before\n"
+        "entry. Pick 1-2 features from this list (no others) that you judge\n"
+        "most predictive of the realized post-entry move. A negative\n"
+        "magnitude means the trader's thesis missed (e.g. a long got\n"
+        "stopped out); the picks should still be the features that BEST\n"
+        "explained the realized direction, even when that direction was\n"
+        "the opposite of the trader's bet.\n\n"
     )
     for c in candidates:
         user += f"- name={c.name} bucket={c.bucket} value={c.raw_value:.6f}  ({c.description})\n"
@@ -756,14 +904,45 @@ async def run_post_mortem(
     store: RuleStore,
     engine: DeepSeekEngine | None = None,
     slice_override: HistoricalSlice | None = None,
+    entry_ts_ms: int | None = None,
+    expected_direction: Direction | None = None,
+    hours_back: int = 4,
+    hours_forward: int = 1,
 ) -> PostMortemReport:
     """Main entry point. Returns the full report and persists rule updates.
 
     `slice_override` lets tests / demos inject a synthetic slice without
     touching the network.
+
+    Bug #2 fix:
+
+    * When called with ``entry_ts_ms`` (the live post-mortem path), the slice
+      spans ``[entry - hours_back, entry + hours_forward]``; ``compute_event_result``
+      evaluates only the post-entry segment and ``extract_candidate_features``
+      uses only the pre-entry segment. The features can no longer be
+      contaminated by post-entry data, and the result can no longer be
+      "the biggest move that happened before we even opened".
+    * ``expected_direction`` makes the result direction-aware: a long that
+      gets stopped out is recorded as a *negative-magnitude pump* (we bet
+      pump, lost money), so the rule store learns from misses too. Without
+      this, a stopped-out long would pick up the dump bucket of every
+      losing pre-entry feature, training the system to short the very
+      patterns it had marked as bullish.
     """
-    s = slice_override or await fetch_historical_slice(symbol, target_ts_ms)
-    result = compute_event_result(s)
+    if slice_override is not None:
+        s = slice_override
+    elif entry_ts_ms is not None:
+        s = await fetch_historical_slice(
+            symbol, target_ts_ms,
+            hours_back=hours_back,
+            hours_forward=hours_forward,
+            entry_ts_ms=entry_ts_ms,
+        )
+    else:
+        s = await fetch_historical_slice(symbol, target_ts_ms,
+                                          hours_back=hours_back)
+
+    result = compute_event_result(s, expected_direction=expected_direction)
     candidates = extract_candidate_features(s, result)
 
     if engine is not None and engine.api_key:
@@ -780,6 +959,12 @@ async def run_post_mortem(
     # Update every candidate feature's rule store entry: pick = hit, others = miss.
     # This is what gives non-picked features a way to grow their `total` and
     # eventually move into the archived band if their bucket value never wins.
+    #
+    # Rules are filed under ``result.direction``. For the entry-aware path
+    # this is the realized direction RELATIVE TO THE TRADER'S BET (so a
+    # losing long records under "pump" with a negative magnitude, training
+    # the feature against false-positive pump signatures rather than
+    # falsely teaching the system the same features predict dumps).
     for c in candidates:
         is_hit = (c.name, c.bucket) in picked_keys
         rule = store.update(
@@ -867,3 +1052,91 @@ def synthesize_dump_slice(
 
     return HistoricalSlice(symbol=symbol, target_ts_ms=target_ts_ms,
                            bars=bars, funding_rates=funding, open_interest=oi)
+
+
+
+
+def synthesize_long_stopout_slice(
+    symbol: str = "RAVEUSDT",
+    entry_ts_ms: int | None = None,
+    *,
+    hours_back: int = 4,
+    hours_forward: int = 1,
+) -> HistoricalSlice:
+    """Build an entry-aware slice where a LONG would get stopped out.
+
+    Bug #2 fix needed a fixture that exercises both halves of the slice:
+      * Pre-entry (4h): a textbook bullish-looking compression+OI build.
+        These are the features that *fired the long signal*.
+      * Post-entry (1h): the price falls 6%, taking the long out.
+
+    Used by ``test_compute_event_result_*`` and ``test_run_post_mortem_*``
+    to prove the entry-aware path picks features from the bullish setup
+    yet records the result with negative magnitude under ``"pump"`` (the
+    expected direction), not ``"dump"``.
+    """
+    if entry_ts_ms is None:
+        entry_ts_ms = int(time.time() * 1000)
+    bars: list[Bar] = []
+    funding: list[tuple[int, float]] = []
+    oi: list[tuple[int, float]] = []
+
+    pre_minutes = hours_back * 60
+    post_minutes = hours_forward * 60
+
+    base_price = 1.0000
+    # ---- pre-entry: 4h bullish setup ending right at entry_ts_ms ----
+    pre_start_ms = entry_ts_ms - pre_minutes * 60_000
+    for i in range(pre_minutes):
+        ts = pre_start_ms + i * 60_000
+        if i < pre_minutes - 60:
+            # Quiet compression for the first 3h
+            o = base_price + (i % 5 - 2) * 0.001
+            c = o + (i % 3 - 1) * 0.0005
+            h = max(o, c) + 0.001
+            lo = min(o, c) - 0.001
+            v = 1000.0 + (i % 7) * 50
+            oi_val = 800_000 + i * 200
+        else:
+            # Last 1h: bullish OI build + rising volume (the trigger)
+            step = i - (pre_minutes - 60)
+            o = base_price + step * 0.0008
+            c = o + 0.001
+            h = c + 0.001
+            lo = o - 0.001
+            v = 2500.0 + step * 100
+            oi_val = 1_000_000 + step * 5000   # +30% over the hour
+        bars.append(Bar(ts, o, h, lo, c, v))
+        if i % 10 == 0 and i >= pre_minutes - 120:
+            # Funding climbing positive in the last 2h
+            rate = 0.0006 + (i - (pre_minutes - 120)) * 1e-5
+            funding.append((ts, rate))
+        if i % 5 == 0:
+            oi.append((ts, oi_val))
+
+    # entry close ~ base_price + 0.06 ish
+    entry_ref = bars[-1].close
+
+    # ---- post-entry: 1h waterfall down 6% ----
+    for j in range(post_minutes):
+        ts = entry_ts_ms + j * 60_000
+        # Falls from entry_ref to entry_ref * 0.94 over 60 minutes.
+        # We pin the bar high BELOW entry_ref so a "pump thesis" post-mortem
+        # records a strictly negative magnitude (no spurious tiny wick up).
+        frac = (j + 1) / post_minutes
+        c = entry_ref * (1.0 - 0.06 * frac)
+        o = entry_ref * (1.0 - 0.06 * (j / post_minutes))
+        # cap high below entry by a small epsilon so max_up is exactly 0
+        h = min(max(o, c) + 0.0005, entry_ref - 0.0005)
+        lo = min(o, c) - 0.0010
+        v = 5000.0 + j * 100
+        bars.append(Bar(ts, o, h, lo, c, v))
+
+    return HistoricalSlice(
+        symbol=symbol,
+        target_ts_ms=entry_ts_ms,
+        bars=bars,
+        funding_rates=funding,
+        open_interest=oi,
+        entry_ts_ms=entry_ts_ms,
+    )
