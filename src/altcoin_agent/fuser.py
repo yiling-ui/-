@@ -231,6 +231,12 @@ class FuserConfig:
     kol_exit_hard_veto_score: float = 30.0
     kol_exit_soft_cap_score: float = 70.0
     conflict_penalty: float = 15.0     # mixed-direction rule signals
+    # SR-3 / TA-07: wash trading detection. When a WASH_TRADING_DETECTED
+    # event is fresh in the window AND the rule direction is LONG, we apply
+    # a hard veto. SHORT entries are NOT vetoed — wash trading typically
+    # precedes a real dump (manipulators artificially propping the price for
+    # exit liquidity), so a short alongside it is exactly the trade we want.
+    wash_trading_veto_score: float = 25.0
     window_sec: int = 90
     cooldown_sec: int = 60
     require_min_rule_score: float = 35.0  # below this, even high LLM can't promote
@@ -303,6 +309,34 @@ class ScoreFuser:
 
         # 3) rule-only score and direction
         rule_score, rule_direction, conflict = self._score_rules(fresh, notes)
+
+        # 3b) Wash-trading hard veto (SR-3 / TA-07).
+        # If a WASH_TRADING_DETECTED event sits inside the active window AND
+        # the rule_direction is LONG, refuse to promote — this is the
+        # definitional "fake pump" scenario. Shorts are explicitly allowed
+        # to ride the wash, since wash spikes typically precede a real dump.
+        wash_events = [
+            e for e in fresh if e.kind == SignalKind.WASH_TRADING_DETECTED
+        ]
+        if wash_events and rule_direction == Direction.LONG:
+            ev = wash_events[-1]
+            notes.append(
+                f"HARD VETO (wash trading on LONG): patterns="
+                f"{ev.payload.get('patterns')}, "
+                f"vol/count_z_ratio={ev.payload.get('volume_to_count_z_ratio')}"
+            )
+            return self._make_signal(
+                symbol=symbol, exchange=exchange, ts=now_ts,
+                rule_score=rule_score, llm_score=0.0,
+                final_score=min(rule_score, self.cfg.wash_trading_veto_score),
+                direction=Direction.NEUTRAL,
+                is_high_priority=False,
+                blocked=True,
+                block_reason="wash_trading_detected",
+                rule_signals=fresh,
+                llm_verdict=None,
+                notes=notes,
+            )
 
         # 4) LLM score (independent informational, used in payload)
         llm_score = 0.0

@@ -48,11 +48,21 @@ class SignalKind(str, Enum):
     OI_SILENT_BUILD = "oi_silent_build"
     LIQUIDITY_SWEEP = "liquidity_sweep"
     LIQUIDITY_POOL_FORMED = "liquidity_pool_formed"
+    # SR-3 / TA-07: emitted when a volume spike looks like wash trading
+    # (high volume, low trade count or anomalously large avg trade size).
+    # Downstream consumers (fuser) treat this as a hard veto on long entries.
+    WASH_TRADING_DETECTED = "wash_trading_detected"
 
 
 @dataclass(frozen=True)
 class Kline:
-    """OHLCV bar from a single timeframe."""
+    """OHLCV bar from a single timeframe.
+
+    ``trade_count`` is the number of distinct trades in the bar. It defaults
+    to 0 so existing tests/fixtures don't need to be updated; the wash-
+    trading detector ignores bars where ``trade_count == 0`` (treats it
+    as 'unknown' and emits no signal).
+    """
 
     ts: int  # ms since epoch, bar OPEN time
     open: float
@@ -61,6 +71,7 @@ class Kline:
     close: float
     volume: float
     timeframe: str = "1m"
+    trade_count: int = 0  # SR-3: real trade count, when available
 
     @property
     def body(self) -> float:
@@ -351,6 +362,160 @@ class OISurgeDetector:
 
 
 # --------------------------------------------------------------------------- #
+# Wash Trading Filter (SR-3 / TA-07)
+# --------------------------------------------------------------------------- #
+
+
+class WashTradingDetector:
+    """Detects suspected wash-traded volume spikes.
+
+    Real altcoin pumps are characterized by **simultaneous** explosions in
+    BOTH volume AND distinct trade count: lots of retail traders piling in
+    one click at a time. Wash trading inflates only one of those:
+
+      Pattern 1 — "Ghost volume":
+          volume z-score is high, but trade_count z-score is flat (or the
+          ratio volume_z / trade_z exceeds ``z_ratio_max``). One whale
+          pinging back and forth between two of their own accounts.
+
+      Pattern 2 — "Whale single-print":
+          avg_trade_size = volume / trade_count is grossly larger than the
+          rolling baseline. A real organic spike has avg_trade_size FALLING
+          (because thousands of small retail orders dilute it). A wash spike
+          has avg_trade_size SOARING (because the few "trades" are giant
+          self-deals).
+
+    Either pattern is a hard veto on long entries (per SR-3). The fuser
+    consumes ``WASH_TRADING_DETECTED`` events and refuses to promote
+    long signals while one is fresh in the window.
+
+    The detector is GATED on a concurrent volume_spike condition: it never
+    flags a calm bar. This avoids spurious alerts during low activity.
+    """
+
+    def __init__(
+        self,
+        window: int = 60,
+        min_samples: int = 20,
+        # Pattern 1: how much higher must volume_z be vs trade_count_z?
+        # 2.0 means "volume looks 2x more extreme than trade count" -> suspect.
+        z_ratio_max: float = 2.0,
+        # Below which trade-count z is considered "flat" regardless of ratio.
+        trade_count_z_floor: float = 1.5,
+        # Pattern 2: avg_trade_size must be this many sigma above baseline.
+        avg_size_sigma_threshold: float = 4.0,
+        # The companion volume-spike threshold for gating.
+        volume_z_gate: float = 4.0,
+    ):
+        if window < min_samples:
+            raise ValueError("window must be >= min_samples")
+        self.window = window
+        self.min_samples = min_samples
+        self.z_ratio_max = z_ratio_max
+        self.trade_count_z_floor = trade_count_z_floor
+        self.avg_size_sigma_threshold = avg_size_sigma_threshold
+        self.volume_z_gate = volume_z_gate
+        self._buf: dict[str, deque[Kline]] = {}
+        self._fired_bar: dict[str, int] = {}
+
+    @staticmethod
+    def _zscore(values: list[float], current: float) -> float | None:
+        if not values:
+            return None
+        mean = sum(values) / len(values)
+        var = sum((v - mean) ** 2 for v in values) / len(values)
+        std = math.sqrt(var) if var > 0 else 0.0
+        if std == 0:
+            return None
+        return (current - mean) / std
+
+    def feed(self, exchange: str, symbol: str, bar: Kline) -> SignalEvent | None:
+        # Bars without trade_count are just ignored — we never claim to
+        # detect wash trading without the data to do so.
+        if bar.trade_count <= 0:
+            self._buf.setdefault(
+                f"{exchange}:{symbol}:{bar.timeframe}",
+                deque(maxlen=self.window),
+            ).append(bar)
+            return None
+
+        key = f"{exchange}:{symbol}:{bar.timeframe}"
+        buf = self._buf.setdefault(key, deque(maxlen=self.window))
+        buf.append(bar)
+
+        if len(buf) < self.min_samples:
+            return None
+
+        prior = list(buf)[:-1]  # everything except the current bar
+        if not prior:
+            return None
+        # Only compute z-scores on prior bars that actually had trade_count
+        prior_with_tc = [b for b in prior if b.trade_count > 0]
+        if len(prior_with_tc) < self.min_samples - 1:
+            return None
+
+        vol_z = self._zscore([b.volume for b in prior], bar.volume)
+        tc_z = self._zscore(
+            [b.trade_count for b in prior_with_tc], float(bar.trade_count),
+        )
+
+        # Gate: only inspect when the volume itself is anomalously high.
+        if vol_z is None or vol_z < self.volume_z_gate:
+            return None
+        if tc_z is None:
+            return None
+
+        # Pattern 1: "ghost volume"
+        ghost = (
+            tc_z < self.trade_count_z_floor
+            and (vol_z / max(tc_z, 0.1)) > self.z_ratio_max
+        )
+
+        # Pattern 2: "whale single-print" — avg trade size shoots up
+        avg_sizes = [
+            b.volume / b.trade_count for b in prior_with_tc if b.trade_count > 0
+        ]
+        cur_avg = bar.volume / bar.trade_count
+        size_z = self._zscore(avg_sizes, cur_avg)
+        whale_print = (
+            size_z is not None and size_z >= self.avg_size_sigma_threshold
+        )
+
+        if not (ghost or whale_print):
+            return None
+
+        if self._fired_bar.get(key) == bar.ts:
+            return None
+        self._fired_bar[key] = bar.ts
+
+        reasons = []
+        if ghost:
+            reasons.append("ghost_volume")
+        if whale_print:
+            reasons.append("whale_single_print")
+
+        return SignalEvent(
+            kind=SignalKind.WASH_TRADING_DETECTED,
+            symbol=symbol,
+            ts=bar.ts,
+            exchange=exchange,
+            payload={
+                "patterns": reasons,
+                "volume_zscore": round(vol_z, 3),
+                "trade_count_zscore": round(tc_z, 3),
+                "avg_trade_size_zscore": (
+                    round(size_z, 3) if size_z is not None else None
+                ),
+                "current_avg_trade_size": round(cur_avg, 6),
+                "current_trade_count": bar.trade_count,
+                "volume_to_count_z_ratio": round(vol_z / max(tc_z, 0.1), 3),
+                "timeframe": bar.timeframe,
+                "window": self.window,
+            },
+        )
+
+
+# --------------------------------------------------------------------------- #
 # SMC: Liquidity Pool Analyzer
 # --------------------------------------------------------------------------- #
 
@@ -609,6 +774,7 @@ class Screener:
         funding_detector: FundingAnomalyDetector | None = None,
         oi_detector: OISurgeDetector | None = None,
         liquidity_analyzer: LiquidityPoolAnalyzer | None = None,
+        wash_trading_detector: WashTradingDetector | None = None,
         funding_poll_sec: float = 30.0,
         oi_poll_sec: float = 60.0,
     ):
@@ -623,6 +789,7 @@ class Screener:
         self.funding_detector = funding_detector or FundingAnomalyDetector()
         self.oi_detector = oi_detector or OISurgeDetector()
         self.liquidity_analyzer = liquidity_analyzer or LiquidityPoolAnalyzer()
+        self.wash_trading_detector = wash_trading_detector or WashTradingDetector()
 
         self._stop = asyncio.Event()
 
@@ -632,6 +799,9 @@ class Screener:
         ev = self.volume_detector.feed(exchange, symbol, bar)
         if ev is not None:
             await self.sink(ev)
+        wash_ev = self.wash_trading_detector.feed(exchange, symbol, bar)
+        if wash_ev is not None:
+            await self.sink(wash_ev)
         for ev in self.liquidity_analyzer.feed(exchange, symbol, bar):
             await self.sink(ev)
 
