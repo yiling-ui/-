@@ -43,6 +43,21 @@ from altcoin_agent.screener import (
     SignalEvent,
     SignalKind,
     VolumeSpikeDetector,
+    WashTradingDetector,
+)
+from altcoin_agent.social.binance_square import (
+    BinanceSquareScraper,
+    CookieJar,
+    ProxyConfig,
+    ScraperAuthRequired,
+    ScraperError,
+    ScraperGeoBlocked,
+    SquarePost,
+)
+from altcoin_agent.social.crawler import (
+    MarketSnapshot,
+    SocialSnapshot,
+    focus_on_symbol,
 )
 
 __all__ = [
@@ -58,6 +73,18 @@ __all__ = [
     "FundingAnomalyDetector",
     "OISurgeDetector",
     "LiquidityPoolAnalyzer",
+    "WashTradingDetector",
+    # social
+    "BinanceSquareScraper",
+    "CookieJar",
+    "ProxyConfig",
+    "SquarePost",
+    "ScraperError",
+    "ScraperGeoBlocked",
+    "ScraperAuthRequired",
+    "MarketSnapshot",
+    "SocialSnapshot",
+    "focus_on_symbol",
     # ai_engine
     "DeepSeekEngine",
     "AIVerdict",

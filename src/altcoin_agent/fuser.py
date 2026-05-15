@@ -87,6 +87,10 @@ class FusedSignal:
     rule_signals: list[SignalEvent] = field(default_factory=list)
     llm_verdict: AIVerdict | None = None
     notes: list[str] = field(default_factory=list)
+    # Mid-price at the moment Task A first detected the trigger condition.
+    # Required by Risk Gate's slippage check (SR-1). Set by the bus
+    # integration layer; tests construct it explicitly.
+    trigger_price: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -167,15 +171,20 @@ def _rule_direction(ev: SignalEvent) -> Direction:
         return Direction.NEUTRAL
 
     if kind in (SignalKind.OI_SURGE, SignalKind.OI_SILENT_BUILD):
-        # OI growth alone is not directional; pair with price move
+        # Direction comes from PRICE motion, not from the kind alone.
+        # OI growth + price up   = longs piling in   -> LONG
+        # OI growth + price down = SHORTS piling in -> SHORT  (smart-money distribution!)
+        # OI growth + price flat = ambiguous; let other rules decide -> NEUTRAL
         from_p = p.get("from_price", 0.0)
         to_p = p.get("to_price", 0.0)
-        if to_p > from_p:
+        if from_p <= 0:
+            return Direction.NEUTRAL
+        move_pct = (to_p - from_p) / from_p
+        if move_pct > 0.003:        # +0.30%
             return Direction.LONG
-        if to_p < from_p:
+        if move_pct < -0.003:       # -0.30%
             return Direction.SHORT
-        # Silent build with flat price -> mild long bias (typical pre-pump)
-        return Direction.LONG if kind == SignalKind.OI_SILENT_BUILD else Direction.NEUTRAL
+        return Direction.NEUTRAL
 
     if kind == SignalKind.LIQUIDITY_SWEEP:
         # sweep above sell_side highs that fails -> reversal SHORT
@@ -222,6 +231,12 @@ class FuserConfig:
     kol_exit_hard_veto_score: float = 30.0
     kol_exit_soft_cap_score: float = 70.0
     conflict_penalty: float = 15.0     # mixed-direction rule signals
+    # SR-3 / TA-07: wash trading detection. When a WASH_TRADING_DETECTED
+    # event is fresh in the window AND the rule direction is LONG, we apply
+    # a hard veto. SHORT entries are NOT vetoed — wash trading typically
+    # precedes a real dump (manipulators artificially propping the price for
+    # exit liquidity), so a short alongside it is exactly the trade we want.
+    wash_trading_veto_score: float = 25.0
     window_sec: int = 90
     cooldown_sec: int = 60
     require_min_rule_score: float = 35.0  # below this, even high LLM can't promote
@@ -295,6 +310,34 @@ class ScoreFuser:
         # 3) rule-only score and direction
         rule_score, rule_direction, conflict = self._score_rules(fresh, notes)
 
+        # 3b) Wash-trading hard veto (SR-3 / TA-07).
+        # If a WASH_TRADING_DETECTED event sits inside the active window AND
+        # the rule_direction is LONG, refuse to promote — this is the
+        # definitional "fake pump" scenario. Shorts are explicitly allowed
+        # to ride the wash, since wash spikes typically precede a real dump.
+        wash_events = [
+            e for e in fresh if e.kind == SignalKind.WASH_TRADING_DETECTED
+        ]
+        if wash_events and rule_direction == Direction.LONG:
+            ev = wash_events[-1]
+            notes.append(
+                f"HARD VETO (wash trading on LONG): patterns="
+                f"{ev.payload.get('patterns')}, "
+                f"vol/count_z_ratio={ev.payload.get('volume_to_count_z_ratio')}"
+            )
+            return self._make_signal(
+                symbol=symbol, exchange=exchange, ts=now_ts,
+                rule_score=rule_score, llm_score=0.0,
+                final_score=min(rule_score, self.cfg.wash_trading_veto_score),
+                direction=Direction.NEUTRAL,
+                is_high_priority=False,
+                blocked=True,
+                block_reason="wash_trading_detected",
+                rule_signals=fresh,
+                llm_verdict=None,
+                notes=notes,
+            )
+
         # 4) LLM score (independent informational, used in payload)
         llm_score = 0.0
         if verdict is not None and verdict.confidence_score > 0:
@@ -334,48 +377,68 @@ class ScoreFuser:
                     notes=notes,
                 )
 
-            # 5b) KOL exit_liquidity HARD VETO (returns immediately)
+            # 5b) KOL exit_liquidity handling — DIRECTION-AWARE.
+            #     - On a LONG signal: KOL distributing IS the trap. VETO/CAP.
+            #     - On a SHORT signal: KOL distributing IS the catalyst we want
+            #       to ride. The "smart" play is to short alongside the dump
+            #       liquidity. Do NOT veto, but slightly DAMPEN to require very
+            #       strong confluence (we still need to confirm with rule signals).
             kol_exit = verdict.kol_intent == "exit_liquidity"
-            if kol_exit and verdict.confidence >= self.cfg.kol_exit_hard_veto_conf:
-                notes.append(
-                    f"HARD VETO: kol_intent=exit_liquidity, llm.confidence="
-                    f"{verdict.confidence:.2f} >= {self.cfg.kol_exit_hard_veto_conf}"
-                )
-                return self._make_signal(
-                    symbol=symbol, exchange=exchange, ts=now_ts,
-                    rule_score=rule_score, llm_score=llm_score,
-                    final_score=min(rule_score, self.cfg.kol_exit_hard_veto_score),
-                    direction=Direction.NEUTRAL,
-                    is_high_priority=False,
-                    blocked=True,
-                    block_reason="kol_exit_liquidity_hard_veto",
-                    rule_signals=fresh,
-                    llm_verdict=verdict,
-                    notes=notes,
-                )
+            kol_exit_aligned_short = kol_exit and rule_direction == Direction.SHORT
+
+            if kol_exit and not kol_exit_aligned_short:
+                # Trap territory: rule says LONG but KOLs are dumping.
+                if verdict.confidence >= self.cfg.kol_exit_hard_veto_conf:
+                    notes.append(
+                        f"HARD VETO: kol_intent=exit_liquidity on LONG, llm.confidence="
+                        f"{verdict.confidence:.2f} >= {self.cfg.kol_exit_hard_veto_conf}"
+                    )
+                    return self._make_signal(
+                        symbol=symbol, exchange=exchange, ts=now_ts,
+                        rule_score=rule_score, llm_score=llm_score,
+                        final_score=min(rule_score, self.cfg.kol_exit_hard_veto_score),
+                        direction=Direction.NEUTRAL,
+                        is_high_priority=False,
+                        blocked=True,
+                        block_reason="kol_exit_liquidity_hard_veto",
+                        rule_signals=fresh,
+                        llm_verdict=verdict,
+                        notes=notes,
+                    )
 
             # 5c) LLM agreement -> multiplier boost.
-            #     Skipped when KOL is suspected of distributing (even soft case)
-            #     because the very signal we'd be boosting is suspect.
-            if (
-                not kol_exit
-                and llm_dir == rule_direction
-                and llm_dir != Direction.NEUTRAL
-            ):
-                spread = self.cfg.llm_boost_max - self.cfg.llm_boost_min
-                multiplier = self.cfg.llm_boost_min + spread * verdict.confidence
-                before = final
-                final = min(final * multiplier, self.cfg.final_score_cap)
-                notes.append(
-                    f"LLM agree: x{multiplier:.3f} ({before:.1f} -> {final:.1f})"
-                )
+            #     - Pure agreement (no exit_liquidity flag): full boost
+            #     - SHORT + exit_liquidity (aligned): MILD boost (KOL behavior is
+            #       the very evidence we're trading on, so it does add weight)
+            #     - LONG + exit_liquidity (non-vetoed soft case): no boost
+            if llm_dir == rule_direction and llm_dir != Direction.NEUTRAL:
+                if not kol_exit or kol_exit_aligned_short:
+                    spread = self.cfg.llm_boost_max - self.cfg.llm_boost_min
+                    # Aligned short with exit_liquidity gets a HALF multiplier
+                    # bump (still positive, since this is supporting evidence).
+                    effective_conf = (
+                        verdict.confidence * 0.5 if kol_exit_aligned_short
+                        else verdict.confidence
+                    )
+                    multiplier = self.cfg.llm_boost_min + spread * effective_conf
+                    before = final
+                    final = min(final * multiplier, self.cfg.final_score_cap)
+                    if kol_exit_aligned_short:
+                        notes.append(
+                            f"LLM agree (SHORT alongside KOL exit_liquidity): "
+                            f"x{multiplier:.3f} ({before:.1f} -> {final:.1f})"
+                        )
+                    else:
+                        notes.append(
+                            f"LLM agree: x{multiplier:.3f} ({before:.1f} -> {final:.1f})"
+                        )
 
-            # 5d) KOL exit_liquidity SOFT CAP — applied AFTER any boost so the
-            #     cap is the final word: under exit_liquidity suspicion, no
-            #     amount of confluence can produce a high_priority signal.
-            if kol_exit:
+            # 5d) KOL exit_liquidity SOFT CAP for the LONG-case-only.
+            #     SHORT-aligned-with-exit_liquidity is NOT capped — we WANT to
+            #     promote that to high_priority because it's the dump-front-run.
+            if kol_exit and not kol_exit_aligned_short:
                 notes.append(
-                    f"SOFT CAP: kol_intent=exit_liquidity, llm.confidence="
+                    f"SOFT CAP: kol_intent=exit_liquidity on LONG, llm.confidence="
                     f"{verdict.confidence:.2f} < {self.cfg.kol_exit_hard_veto_conf}, "
                     f"capping at {self.cfg.kol_exit_soft_cap_score}"
                 )
