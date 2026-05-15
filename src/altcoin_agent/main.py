@@ -29,6 +29,7 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -224,6 +225,12 @@ class DryRunExchangeAdapter:
         self._n = 0
         # symbol -> {"side": "long"/"short", "size": float, "entryPrice": float}
         self._open_positions: dict[str, dict[str, Any]] = {}
+        # Test/integration helper for the dynamic-slippage live-quote path
+        # (Bug #2). When set, ``fetch_ticker_price`` returns this value;
+        # otherwise it raises so the gate falls into the fail-closed path
+        # (matching live-mode behaviour where a missing quote is fatal for
+        # SR-1, not a silent passthrough).
+        self._mark_prices: dict[str, float] = {}
 
     def _id(self) -> str:
         self._n += 1
@@ -275,6 +282,23 @@ class DryRunExchangeAdapter:
 
     async def fetch_open_orders(self) -> list[dict]:
         return []
+
+    async def fetch_ticker_price(self, symbol: str) -> float:
+        """Return the test-supplied mark price, or raise if none was set.
+
+        Tests drive this via ``set_mark_price`` to exercise SR-1's adverse-
+        slip check. Raising on missing data is the deliberate, conservative
+        choice: it makes the dry-run path behave the same way live mode
+        will when the venue is unreachable -- the gate fail-closes with
+        ``quote_unavailable`` instead of silently re-using the trigger.
+        """
+        if symbol in self._mark_prices:
+            return self._mark_prices[symbol]
+        raise RuntimeError(f"DryRun: no mark price set for {symbol}")
+
+    # Test helper: pretend the exchange returns this mark price.
+    def set_mark_price(self, symbol: str, price: float) -> None:
+        self._mark_prices[symbol] = float(price)
 
     # Test helper: pretend the exchange-side STOP_MARKET fired.
     def simulate_close(self, symbol: str) -> None:
@@ -385,6 +409,11 @@ class App:
     state: HealthState = field(default_factory=HealthState)
     dashboard: DashboardState = field(default_factory=DashboardState)
     notifier: Notifier | None = None
+    # Bug #2 fix hook: production code uses the adapter's
+    # ``fetch_ticker_price``; tests can inject a fixed price (or an
+    # exception) to exercise SR-1 without a network round-trip. When None,
+    # ``_get_live_quote`` falls back to ``adapter.fetch_ticker_price``.
+    quote_provider: Callable[[str], Awaitable[float]] | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     _tasks: list[asyncio.Task] = field(default_factory=list)
     _runner: web.AppRunner | None = None
@@ -700,6 +729,30 @@ class App:
         await self._stop_event.wait()
         await self._shutdown()
 
+    async def _get_live_quote(self, symbol: str) -> float:
+        """Return a fresh mark/last price for ``symbol``.
+
+        Bug #2 fix: ``_handle_high_priority`` used to pass the
+        ``signal.trigger_price`` as both the trigger AND the
+        ``current_price`` to ``RiskGate.evaluate``, which made the SR-1
+        adverse-slippage check a no-op (it was comparing the trigger to
+        itself). We now sample a live price here and let the gate compare
+        the two -- the slip threshold finally has teeth.
+
+        Resolution order:
+          1. ``self.quote_provider`` (test hook / custom integration);
+          2. ``adapter.fetch_ticker_price`` (live ccxt + dry-run helper);
+          3. raise -- the caller fail-closes the order with
+             ``quote_unavailable`` rather than silently bypassing SR-1.
+        """
+        if self.quote_provider is not None:
+            return float(await self.quote_provider(symbol))
+        adapter = self._adapter
+        fetcher = getattr(adapter, "fetch_ticker_price", None)
+        if fetcher is None:
+            raise RuntimeError("adapter has no fetch_ticker_price")
+        return float(await fetcher(symbol))
+
     async def _handle_high_priority(
         self,
         *,
@@ -717,6 +770,29 @@ class App:
             logger.warning("missing trigger_price on %s; skipping order", sig.symbol)
             return
 
+        # Bug #2 fix: pull a *live* quote from the venue/adapter and feed
+        # that to the gate as ``current_price``. If we can't get one, abort
+        # the order -- this is the same fail-closed posture the rest of the
+        # gate uses (SR-2 reconciliation, SR-1 slippage cap, etc.).
+        try:
+            current_price = await self._get_live_quote(sig.symbol)
+        except Exception as e:
+            logger.warning(
+                "live-quote unavailable for %s (%s); aborting order",
+                sig.symbol, e,
+            )
+            self.state.orders_rejected += 1
+            self.state.last_error = f"quote_unavailable:{type(e).__name__}"
+            rej = {
+                "ts": int(time.time() * 1000),
+                "symbol": sig.symbol,
+                "reason": f"quote_unavailable:{type(e).__name__}",
+            }
+            self.dashboard.push_rejection(rej)
+            with suppress(Exception):
+                await self.notifier.rejected(rej)
+            return
+
         if sig.direction == Direction.LONG:
             initial_stop = sig.trigger_price * 0.95
         else:
@@ -725,7 +801,7 @@ class App:
         decision: RiskDecision = gate.evaluate(
             signal=sig,
             account=account,
-            current_price=sig.trigger_price,
+            current_price=current_price,
             top5_depth_usdt=self.cfg.min_liquidity_usdt,
             realized_vol_pct=0.05,
             initial_stop=initial_stop,
@@ -743,7 +819,7 @@ class App:
             position = await executor.open(
                 symbol=sig.symbol,
                 decision=decision,
-                current_price=sig.trigger_price,
+                current_price=current_price,
                 account=account,
                 trace_id=str(sig.ts),
             )
