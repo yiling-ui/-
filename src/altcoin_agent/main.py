@@ -57,10 +57,12 @@ from altcoin_agent.risk import (
     ExchangeAdapter,
     Position,
     PositionSizer,
+    PositionWatcher,
     Reconciler,
     RiskDecision,
     RiskGate,
     RiskGateConfig,
+    Side,
     TrailingState,
     TrailingStopFSM,
     build_ccxt_adapter,
@@ -103,6 +105,9 @@ class AppConfig:
     llm_queue_max: int = 256
     # Online post-mortem (self-evolution)
     post_mortem_delay_sec: int = 3600     # 1h after open
+    # Position-watcher (close lifecycle)
+    position_watcher_poll_sec: float = 5.0
+    position_watcher_miss_threshold: int = 2
 
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
@@ -129,6 +134,12 @@ class AppConfig:
             llm_consult_cooldown_sec=int(d.get("llm_consult_cooldown_sec", 300)),
             llm_queue_max=int(d.get("llm_queue_max", 256)),
             post_mortem_delay_sec=int(d.get("post_mortem_delay_sec", 3600)),
+            position_watcher_poll_sec=float(
+                d.get("position_watcher_poll_sec", 5.0),
+            ),
+            position_watcher_miss_threshold=int(
+                d.get("position_watcher_miss_threshold", 2),
+            ),
         )
 
 
@@ -149,6 +160,8 @@ class HealthState:
     open_positions: int = 0
     orders_placed: int = 0
     orders_rejected: int = 0
+    closed_positions: int = 0
+    last_close_ts: float = 0.0
     llm_consults: int = 0
     llm_consults_skipped: int = 0
     post_mortems_scheduled: int = 0
@@ -173,6 +186,8 @@ async def make_health_app(state: HealthState) -> web.Application:
             "open_positions": state.open_positions,
             "orders_placed": state.orders_placed,
             "orders_rejected": state.orders_rejected,
+            "closed_positions": state.closed_positions,
+            "last_close_ts": state.last_close_ts,
             "llm_consults": state.llm_consults,
             "llm_consults_skipped": state.llm_consults_skipped,
             "post_mortems_scheduled": state.post_mortems_scheduled,
@@ -193,7 +208,13 @@ async def make_health_app(state: HealthState) -> web.Application:
 
 class DryRunExchangeAdapter:
     """Mimics ``ExchangeAdapter`` but logs everything instead of placing
-    real orders. Used when ``--dry-run`` is set."""
+    real orders. Used when ``--dry-run`` is set.
+
+    Tracks a tiny in-memory ``_open_positions`` map so the
+    :class:`PositionWatcher` can observe simulated entries and reduce-only
+    market closes the same way it observes real exchange state. Tests can
+    drive ``simulate_close()`` to mimic the exchange firing a STOP_MARKET.
+    """
 
     def __init__(self) -> None:
         self.market_orders: list[dict] = []
@@ -201,6 +222,8 @@ class DryRunExchangeAdapter:
         self.cancelled: list[str] = []
         self.leverages: list[tuple[str, float]] = []
         self._n = 0
+        # symbol -> {"side": "long"/"short", "size": float, "entryPrice": float}
+        self._open_positions: dict[str, dict[str, Any]] = {}
 
     def _id(self) -> str:
         self._n += 1
@@ -212,6 +235,18 @@ class DryRunExchangeAdapter:
                "price": price, "reduce_only": reduce_only,
                "average": price or 0.0}
         self.market_orders.append(rec)
+        # Maintain a fake position book so PositionWatcher sees consistent
+        # state. An entry is the order whose side matches the position's
+        # eventual side; a reduce_only market order closes it.
+        if reduce_only:
+            self._open_positions.pop(symbol, None)
+        else:
+            pos_side = "long" if side.value == "long" else "short"
+            self._open_positions[symbol] = {
+                "symbol": symbol, "side": pos_side,
+                "contracts": float(size),
+                "entryPrice": float(price or 0.0),
+            }
         logger.info("[DRY-RUN] MARKET %s %s %s @ %s reduce=%s",
                     side.value.upper(), size, symbol, price, reduce_only)
         return rec
@@ -236,10 +271,14 @@ class DryRunExchangeAdapter:
         return {"symbol": symbol, "leverage": leverage}
 
     async def fetch_positions(self) -> list[dict]:
-        return []
+        return [dict(p) for p in self._open_positions.values()]
 
     async def fetch_open_orders(self) -> list[dict]:
         return []
+
+    # Test helper: pretend the exchange-side STOP_MARKET fired.
+    def simulate_close(self, symbol: str) -> None:
+        self._open_positions.pop(symbol, None)
 
 
 assert isinstance(DryRunExchangeAdapter(), ExchangeAdapter), (
@@ -400,6 +439,27 @@ class App:
         trailing = TrailingController(
             fsm=TrailingStopFSM(), atr=atr, executor=executor,
             account=account, health=self.state,
+        )
+
+        # Position-watcher: detects exchange-side closures (STOP_MARKET fired
+        # or manual close) so we can update PnL, daily DD, consec losses,
+        # detach trailing, and notify Telegram. Without this, ``Position.closed``
+        # is never set to True and the system keeps acting on a phantom
+        # position. (Bug #1.)
+        async def _watcher_close_cb(position: Position, reason: str) -> None:
+            await self._on_position_close(
+                position=position,
+                reason=reason,
+                trailing=trailing,
+                account=account,
+            )
+
+        position_watcher = PositionWatcher(
+            adapter=self._adapter,
+            account=account,
+            on_close=_watcher_close_cb,
+            poll_interval_sec=self.cfg.position_watcher_poll_sec,
+            miss_threshold=self.cfg.position_watcher_miss_threshold,
         )
 
         # ----- queue + components -----
@@ -620,10 +680,22 @@ class App:
             except asyncio.CancelledError:
                 pass
 
+        async def position_watcher_worker() -> None:
+            try:
+                await position_watcher.run(self._stop_event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("position_watcher failed: %s", e)
+                self.state.last_error = f"position_watcher:{type(e).__name__}"
+
         self._tasks.append(asyncio.create_task(fuse_worker(), name="fuse_worker"))
         self._tasks.append(asyncio.create_task(trailing_worker(), name="trailing_worker"))
         self._tasks.append(asyncio.create_task(screener_worker(), name="screener_worker"))
         self._tasks.append(asyncio.create_task(llm_worker(), name="llm_worker"))
+        self._tasks.append(asyncio.create_task(
+            position_watcher_worker(), name="position_watcher_worker",
+        ))
 
         await self._stop_event.wait()
         await self._shutdown()
@@ -714,6 +786,97 @@ class App:
             self.state.orders_rejected += 1
             with suppress(Exception):
                 await self.notifier.error(f"executor failed for {sig.symbol}: {e}")
+
+    async def _on_position_close(
+        self,
+        *,
+        position: Position,
+        reason: str,
+        trailing: TrailingController,
+        account: AccountState,
+    ) -> None:
+        """Run all the housekeeping that becomes due once a position is
+        confirmed closed exchange-side.
+
+        Steps:
+            1. Estimate realized PnL using the position's current_stop as
+               the most likely fill price (exchange-side STOP_MARKET fired)
+               and the position's leverage.
+            2. Update ``account.realized_pnl_today_usdt`` and
+               ``account.equity_usdt`` so the daily-drawdown circuit
+               breaker can actually fire.
+            3. Bump ``account.daily_stoploss_hits`` if the close was a loss
+               (so the 3-strike circuit breaker can engage).
+            4. Bump consecutive_losses for the symbol on a loss; reset on a
+               win — feeds the per-symbol cooldown.
+            5. Detach the trailing FSM tracker (no more cancel/replace on a
+               ghost position).
+            6. Push to dashboard, notify Telegram.
+
+        Failure modes are all logged and swallowed: by the time we get
+        here the exchange has already done the close, our job is purely
+        to record it.
+        """
+        symbol = position.symbol
+        # Best-effort fill price: the resting stop is what the exchange
+        # most likely filled at. Live integrations can later replace this
+        # with a real fetch_my_trades lookup — for now we record the
+        # expected stop fill so the daily-DD math is *directionally*
+        # correct rather than zero (the previous behaviour).
+        fill_price = position.current_stop
+        r_unit = position.r_unit
+
+        if position.side == Side.LONG:
+            price_delta = fill_price - position.entry_price
+        else:
+            price_delta = position.entry_price - fill_price
+        realized_pnl_usdt = price_delta * position.size
+        realized_r = (price_delta / r_unit) if r_unit > 0 else 0.0
+        is_loss = realized_pnl_usdt < 0
+
+        # 2) account-level rollups
+        account.realized_pnl_today_usdt += realized_pnl_usdt
+        account.equity_usdt += realized_pnl_usdt
+
+        # 3 + 4) loss accounting
+        if is_loss:
+            account.daily_stoploss_hits += 1
+            account.consecutive_losses[symbol] = (
+                account.consecutive_losses.get(symbol, 0) + 1
+            )
+        else:
+            account.consecutive_losses.pop(symbol, None)
+
+        # 5) detach trailing tracker
+        trailing.detach(symbol)
+
+        self.state.closed_positions += 1
+        self.state.last_close_ts = time.time()
+        self.state.open_positions = len(account.open_positions)
+
+        logger.info(
+            "CLOSED %s %s size=%.4f entry=%.6f fill=%.6f pnl=%.4f R=%.2f reason=%s",
+            position.side.value, symbol, position.size,
+            position.entry_price, fill_price,
+            realized_pnl_usdt, realized_r, reason,
+        )
+
+        closed_payload = {
+            "ts": int(time.time() * 1000),
+            "symbol": symbol,
+            "side": position.side.value,
+            "size": position.size,
+            "entry_price": position.entry_price,
+            "fill_price": fill_price,
+            "realized_pnl_usdt": round(realized_pnl_usdt, 6),
+            "realized_r": round(realized_r, 4),
+            "reason": reason,
+        }
+        with suppress(Exception):
+            self.dashboard.push_close(closed_payload)
+        if self.notifier is not None:
+            with suppress(Exception):
+                await self.notifier.closed(closed_payload)
 
     def _mode_label(self) -> str:
         if self.cfg.dry_run:
