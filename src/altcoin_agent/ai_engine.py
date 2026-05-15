@@ -1,5 +1,8 @@
-"""
-ai_engine.py — Task B: AI Inference Engine (DeepSeek).
+"""ai_engine.py — AI Inference Engine (provider-agnostic).
+
+Refactored from a DeepSeek-only client to a provider-agnostic engine that
+can target DeepSeek / OpenAI / OpenRouter / Moonshot / Qwen / Anthropic /
+any OpenAI-compatible endpoint. Set LLM_PROVIDER env to switch.
 
 Design points (per requirements.md FR-C1..C4 and design.md §3.3):
 
@@ -8,17 +11,9 @@ Design points (per requirements.md FR-C1..C4 and design.md §3.3):
   verdict instead of crashing the bus.
 * Configurable timeout, retries, and an in-process token-budget guard so the
   hot path can never run away with the user's wallet.
-* The DeepSeek API key is read from `DEEPSEEK_API_KEY` env var, never from
-  config files (security).
-* Network IO is encapsulated in `_call_api`, which is the single place to
-  monkey-patch in tests (`respx` does this transparently via httpx).
-
-The output schema requested in the user task is:
-    {"intent": "pump|dump|neutral", "confidence_score": 0..100, "reason": "..."}
-
-We extend it lightly (kol_intent, key_evidence) to match design.md FR-C3, but
-keep `intent` and `confidence_score` at the top level for backward compat with
-any downstream consumer asking for the simpler shape.
+* Provider keys are read from <BACKEND>_API_KEY env vars, never config files.
+* Network IO is encapsulated in the LLMProvider, which is the single place
+  to monkey-patch in tests.
 """
 
 from __future__ import annotations
@@ -34,12 +29,19 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from altcoin_agent.llm_provider import (
+    LLMProvider,
+    OpenAICompatibleProvider,
+    build_default_provider,
+    parse_chat_json,
+)
+
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
-# Public types
-# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------- #
+# Public types (unchanged from V1)
+# --------------------------------------------------------------------- #
 
 
 Intent = Literal["pump", "dump", "neutral"]
@@ -71,7 +73,7 @@ class SMCContext:
 
 
 class AIVerdict(BaseModel):
-    """Strict response contract from DeepSeek."""
+    """Strict response contract for any LLM provider."""
 
     intent: Intent
     confidence_score: int = Field(ge=0, le=100)
@@ -86,22 +88,17 @@ class AIVerdict(BaseModel):
 
     @property
     def confidence(self) -> float:
-        """Convenience: confidence as a 0..1 float (= confidence_score / 100).
-
-        Downstream consumers (e.g. fuser.py KOL veto thresholds) prefer the
-        normalized form. The on-the-wire contract still uses the integer
-        ``confidence_score`` so the LLM JSON schema is unchanged.
-        """
+        """0..1 float (= confidence_score / 100)."""
         return self.confidence_score / 100.0
 
 
 class EngineError(RuntimeError):
-    """Raised for non-recoverable engine errors (no API key, budget exhausted)."""
+    """Raised for non-recoverable engine errors (no key, budget exhausted)."""
 
 
-# --------------------------------------------------------------------------- #
-# Prompt template
-# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------- #
+# Prompt template (provider-agnostic)
+# --------------------------------------------------------------------- #
 
 
 SYSTEM_PROMPT = """You are a senior cryptocurrency derivatives analyst specialized in
@@ -166,7 +163,7 @@ def build_user_prompt(
     posts: list[SocialPost],
     extra: dict[str, Any] | None = None,
 ) -> str:
-    """Build the structured user message. Kept as a pure function for testing."""
+    """Build the structured user message."""
     payload: dict[str, Any] = {
         "symbol": symbol,
         "exchange": exchange,
@@ -193,7 +190,6 @@ def build_user_prompt(
     }
     if extra:
         payload["extra"] = extra
-
     return (
         "CONTEXT (JSON):\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -201,20 +197,14 @@ def build_user_prompt(
     )
 
 
-# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------- #
 # Token budget
-# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------- #
 
 
 @dataclass
 class TokenBudget:
-    """In-process monthly token budget guard.
-
-    For multi-process deployments this would be backed by Redis (see design.md);
-    here we keep it simple and dependency-free for unit tests.
-    """
-
-    monthly_token_limit: int = 5_000_000  # ~$200 of deepseek-chat at quoted rates
+    monthly_token_limit: int = 5_000_000
     _used: int = 0
     _month_key: str = ""
 
@@ -237,65 +227,51 @@ class TokenBudget:
 
     def assert_available(self) -> None:
         if self.remaining() <= 0:
-            raise EngineError("monthly LLM token budget exhausted; degrading to rule-only mode")
+            raise EngineError(
+                "monthly LLM token budget exhausted; degrading to rule-only mode"
+            )
 
 
-# --------------------------------------------------------------------------- #
-# DeepSeek engine
-# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------- #
+# LLMEngine — the provider-agnostic engine
+# --------------------------------------------------------------------- #
 
 
 @dataclass
-class DeepSeekEngine:
-    """
-    Thin async wrapper around DeepSeek's OpenAI-compatible chat endpoint.
+class LLMEngine:
+    """Provider-agnostic AI engine.
 
-    Args:
-        model: deepseek-chat / deepseek-reasoner. Default: deepseek-chat.
-        api_base: override for self-hosted gateway / mock servers.
-        api_key: explicit override; if None, read from DEEPSEEK_API_KEY env.
-        timeout: per-request seconds.
-        max_retries: corrective retries on JSON-parse failure (>=0).
-        budget: optional TokenBudget instance.
+    By default (no provider passed), build one from env vars (LLM_PROVIDER,
+    <backend>_API_KEY). For tests, inject a fake provider that satisfies
+    ``LLMProvider``.
     """
 
-    model: str = "deepseek-chat"
-    api_base: str = "https://api.deepseek.com"
-    api_key: str | None = None
+    provider: LLMProvider | None = None
     timeout: float = 8.0
     max_retries: int = 1
-    temperature: float = 0.2
     budget: TokenBudget = field(default_factory=TokenBudget)
 
-    _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
-
-    # ------------------------- lifecycle ------------------------- #
-
     def __post_init__(self) -> None:
-        if self.api_key is None:
-            self.api_key = os.getenv("DEEPSEEK_API_KEY")
+        if self.provider is None:
+            self.provider = build_default_provider()
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self.api_base,
-                timeout=self.timeout,
-                headers={"User-Agent": "altcoin-momentum-agent/0.1"},
-            )
-        return self._client
+    @property
+    def model(self) -> str:
+        return self.provider.model if self.provider is not None else "<none>"
+
+    @property
+    def name(self) -> str:
+        return self.provider.name if self.provider is not None else "none"
 
     async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        if self.provider is not None:
+            await self.provider.aclose()
 
-    async def __aenter__(self) -> DeepSeekEngine:
+    async def __aenter__(self) -> LLMEngine:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.aclose()
-
-    # ------------------------- public API ------------------------- #
 
     async def judge(
         self,
@@ -308,130 +284,132 @@ class DeepSeekEngine:
         posts: list[SocialPost],
         extra: dict[str, Any] | None = None,
     ) -> AIVerdict:
-        """
-        One shot judgement. On any failure path that is *not* a budget /
-        config error, returns a degraded neutral verdict with a useful
-        ``reason`` instead of raising — the caller (fuser) can then decide
-        weight reduction.
-        """
-        if not self.api_key:
+        if self.provider is None:
             raise EngineError(
-                "DEEPSEEK_API_KEY is not set. Export it or pass api_key=... to DeepSeekEngine."
+                "No LLM provider configured. Set LLM_PROVIDER and the matching "
+                "<BACKEND>_API_KEY env var."
             )
         self.budget.assert_available()
 
         user_prompt = build_user_prompt(
-            symbol=symbol,
-            exchange=exchange,
+            symbol=symbol, exchange=exchange,
             funding_rate=funding_rate,
             funding_deviation_z=funding_deviation_z,
-            smc=smc,
-            posts=posts,
-            extra=extra,
+            smc=smc, posts=posts, extra=extra,
         )
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
-
         last_err: str = ""
+        raw: str = ""
         for attempt in range(self.max_retries + 1):
             try:
-                raw, used_tokens = await self._call_api(messages)
+                raw, used_tokens = await self.provider.chat_json(
+                    messages, timeout=self.timeout,
+                )
                 self.budget.add(used_tokens)
-                return _parse_verdict(raw)
+                obj = parse_chat_json(raw)
+                # Normalize common drifts
+                if isinstance(obj.get("confidence_score"), str) and obj["confidence_score"].isdigit():
+                    obj["confidence_score"] = int(obj["confidence_score"])
+                if isinstance(obj.get("intent"), str):
+                    obj["intent"] = obj["intent"].lower()
+                if isinstance(obj.get("kol_intent"), str):
+                    obj["kol_intent"] = obj["kol_intent"].lower()
+                return AIVerdict.model_validate(obj)
             except ValidationError as e:
                 last_err = f"json schema invalid: {e.errors()[:3]}"
-                logger.warning("DeepSeek response failed validation (attempt %s): %s", attempt + 1, last_err)
-                messages.append({"role": "assistant", "content": raw if "raw" in locals() else ""})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your previous reply was not valid JSON or did not match the required schema. "
-                            "Re-emit ONE valid JSON object exactly matching the schema, with no surrounding text."
-                        ),
-                    }
-                )
+                logger.warning("LLM response failed validation (attempt %s): %s",
+                                attempt + 1, last_err)
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous reply was not valid JSON or did not match "
+                        "the required schema. Re-emit ONE valid JSON object "
+                        "exactly matching the schema, with no surrounding text."
+                    ),
+                })
             except json.JSONDecodeError as e:
                 last_err = f"json decode error: {e}"
-                logger.warning("DeepSeek response not JSON (attempt %s): %s", attempt + 1, last_err)
-                messages.append({"role": "assistant", "content": raw if "raw" in locals() else ""})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "Re-emit ONE valid JSON object exactly matching the schema. No prose, no markdown.",
-                    }
-                )
+                logger.warning("LLM response not JSON (attempt %s): %s",
+                                attempt + 1, last_err)
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({
+                    "role": "user",
+                    "content": "Re-emit ONE valid JSON object exactly matching the schema. No prose, no markdown.",
+                })
             except (httpx.TimeoutException, httpx.HTTPError) as e:
                 last_err = f"http error: {type(e).__name__}: {e}"
-                logger.warning("DeepSeek HTTP error (attempt %s): %s", attempt + 1, last_err)
+                logger.warning("LLM HTTP error (attempt %s): %s",
+                                attempt + 1, last_err)
                 if attempt < self.max_retries:
                     await asyncio.sleep(0.5 * (2 ** attempt))
 
-        # All retries exhausted — degrade gracefully.
-        logger.error("DeepSeek inference failed after %s attempts: %s", self.max_retries + 1, last_err)
+        logger.error("LLM inference failed after %s attempts: %s",
+                     self.max_retries + 1, last_err)
         return AIVerdict(
-            intent="neutral",
-            confidence_score=0,
+            intent="neutral", confidence_score=0,
             reason=f"degraded: {last_err}",
-            kol_intent="neutral",
-            key_evidence=[],
+            kol_intent="neutral", key_evidence=[],
         )
 
-    # ------------------------- transport ------------------------- #
 
-    async def _call_api(self, messages: list[dict[str, str]]) -> tuple[str, int]:
-        client = await self._get_client()
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "response_format": {"type": "json_object"},
-            "stream": False,
-        }
-        resp = await client.post(
-            "/v1/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=body,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        usage = data.get("usage") or {}
-        used = int(usage.get("total_tokens") or 0)
-        return content, used
+# --------------------------------------------------------------------- #
+# Backward-compat alias
+# --------------------------------------------------------------------- #
 
 
-# --------------------------------------------------------------------------- #
-# Parsing helpers
-# --------------------------------------------------------------------------- #
+@dataclass
+class DeepSeekEngine(LLMEngine):
+    """Back-compat: defaults to a DeepSeek provider when no provider is set.
+
+    Existing callers that did ``DeepSeekEngine(api_key=...)`` keep working.
+    """
+
+    api_key: str | None = None
+    api_base: str = "https://api.deepseek.com"
+    model_name: str = "deepseek-chat"
+    temperature: float = 0.2
+
+    def __post_init__(self) -> None:
+        # Don't call LLMEngine.__post_init__ (which builds default provider);
+        # we want the DeepSeek-shaped behaviour.
+        if self.provider is None:
+            key = self.api_key or os.getenv("DEEPSEEK_API_KEY")
+            if key:
+                self.provider = OpenAICompatibleProvider(
+                    name="deepseek",
+                    api_key=key,
+                    api_base=self.api_base,
+                    model=self.model_name,
+                    supports_json_format=True,
+                    temperature=self.temperature,
+                )
+
+    async def judge(self, **kwargs: Any) -> AIVerdict:
+        if self.provider is None:
+            raise EngineError(
+                "DEEPSEEK_API_KEY is not set. Export it or pass api_key=... "
+                "to DeepSeekEngine."
+            )
+        return await super().judge(**kwargs)
+
+
+# --------------------------------------------------------------------- #
+# Internal helpers (test-friendly)
+# --------------------------------------------------------------------- #
 
 
 def _parse_verdict(raw: str) -> AIVerdict:
-    """Parse DeepSeek raw content into AIVerdict.
-
-    DeepSeek with response_format=json_object returns a clean JSON string,
-    but real models occasionally wrap it in ```json fences. We tolerate that.
-    """
-    text = raw.strip()
-    if text.startswith("```"):
-        # strip ``` and optional language tag
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
-    obj = json.loads(text)
-
-    # Normalize a couple of common drifts seen from LLMs:
-    #   "confidence_score": "88"   -> int
-    #   "intent": "PUMP"           -> lower
+    """Public helper kept for tests that exercise the parsing logic alone."""
+    obj = parse_chat_json(raw)
     if isinstance(obj.get("confidence_score"), str) and obj["confidence_score"].isdigit():
         obj["confidence_score"] = int(obj["confidence_score"])
     if isinstance(obj.get("intent"), str):
         obj["intent"] = obj["intent"].lower()
     if isinstance(obj.get("kol_intent"), str):
         obj["kol_intent"] = obj["kol_intent"].lower()
-
     return AIVerdict.model_validate(obj)
