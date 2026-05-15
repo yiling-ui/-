@@ -45,6 +45,9 @@ class DashboardState:
     recent_rejections: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=50),
     )
+    recent_closes: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=50),
+    )
 
     def push_signal(self, payload: dict[str, Any]) -> None:
         self.recent_signals.append(payload)
@@ -54,6 +57,9 @@ class DashboardState:
 
     def push_rejection(self, payload: dict[str, Any]) -> None:
         self.recent_rejections.append(payload)
+
+    def push_close(self, payload: dict[str, Any]) -> None:
+        self.recent_closes.append(payload)
 
 
 # --------------------------------------------------------------------- #
@@ -116,23 +122,28 @@ _HTML = """<!doctype html>
     <table id="rules"><thead><tr><th>Feature</th><th>Bucket</th><th>Side</th><th>Hits/Total</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
   </div>
   <div class="card" style="grid-column:1 / -1">
+    <h2>Recent Closes (last 50)</h2>
+    <table id="closes"><thead><tr><th>Time</th><th>Sym</th><th>Side</th><th>Size</th><th>Entry</th><th>Fill</th><th>PnL</th><th>R</th><th>Reason</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card" style="grid-column:1 / -1">
     <h2>Recent Rejections (last 50)</h2>
     <table id="rejections"><thead><tr><th>Time</th><th>Sym</th><th>Reason</th></tr></thead><tbody></tbody></table>
   </div>
 </main>
-<footer>auto-refresh every 5s · /healthz · /api/state · /api/signals · /api/positions · /api/orders · /api/rules</footer>
+<footer>auto-refresh every 5s · /healthz · /api/state · /api/signals · /api/positions · /api/orders · /api/closes · /api/rules</footer>
 <script>
 function fmtTime(ms){if(!ms)return "-";const d=new Date(ms);return d.toISOString().slice(11,19)+"Z"}
 function row(parent,cells,cls){const tr=document.createElement("tr");for(const c of cells){const td=document.createElement("td");td.textContent=c==null?"-":String(c);if(cls&&c===cells[2])td.className=cls;tr.appendChild(td)}parent.appendChild(tr)}
 async function refresh(){
   try{
-    const [s,sigs,pos,ords,rules,rejs]=await Promise.all([
+    const [s,sigs,pos,ords,rules,rejs,closes]=await Promise.all([
       fetch("/api/state").then(r=>r.json()),
       fetch("/api/signals").then(r=>r.json()),
       fetch("/api/positions").then(r=>r.json()),
       fetch("/api/orders").then(r=>r.json()),
       fetch("/api/rules").then(r=>r.json()),
       fetch("/api/rejections").then(r=>r.json()),
+      fetch("/api/closes").then(r=>r.json()),
     ]);
     const status=document.getElementById("status");
     status.textContent=s.status||"?";
@@ -147,6 +158,8 @@ async function refresh(){
       ["Orders placed", s.orders_placed],
       ["Orders rejected", s.orders_rejected],
       ["Open positions", s.open_positions],
+      ["Closed positions", s.closed_positions],
+      ["Last close ts", fmtTime((s.last_close_ts||0)*1000)],
       ["Last signal ts", fmtTime((s.last_signal_ts||0)*1000)],
       ["Last error", s.last_error||"-"],
     ]){
@@ -171,6 +184,11 @@ async function refresh(){
     }
     const rejBody=document.querySelector("#rejections tbody");rejBody.innerHTML="";
     for(const x of rejs.slice().reverse())row(rejBody,[fmtTime(x.ts),x.symbol,x.reason]);
+    const closesBody=document.querySelector("#closes tbody");closesBody.innerHTML="";
+    for(const x of closes.slice().reverse()){
+      const cls=(x.realized_pnl_usdt!=null && x.realized_pnl_usdt>=0)?"long":"short";
+      row(closesBody,[fmtTime(x.ts),x.symbol,x.side,x.size,x.entry_price,x.fill_price,x.realized_pnl_usdt,x.realized_r,x.reason],cls);
+    }
   }catch(e){console.error(e);}
 }
 refresh();setInterval(refresh,5000);
@@ -205,6 +223,8 @@ def _build_routes(state: DashboardState, mode_label: str) -> list[web.RouteDef]:
                 "orders_placed": getattr(h, "orders_placed", 0),
                 "orders_rejected": getattr(h, "orders_rejected", 0),
                 "open_positions": getattr(h, "open_positions", 0),
+                "closed_positions": getattr(h, "closed_positions", 0),
+                "last_close_ts": getattr(h, "last_close_ts", 0.0),
                 "last_signal_ts": getattr(h, "last_signal_ts", 0.0),
                 "last_error": getattr(h, "last_error", None),
             })
@@ -218,6 +238,9 @@ def _build_routes(state: DashboardState, mode_label: str) -> list[web.RouteDef]:
 
     async def api_rejections(_req: web.Request) -> web.Response:
         return web.json_response(list(state.recent_rejections))
+
+    async def api_closes(_req: web.Request) -> web.Response:
+        return web.json_response(list(state.recent_closes))
 
     async def api_positions(_req: web.Request) -> web.Response:
         rows: list[dict[str, Any]] = []
@@ -263,6 +286,7 @@ def _build_routes(state: DashboardState, mode_label: str) -> list[web.RouteDef]:
         web.get("/api/signals", api_signals),
         web.get("/api/orders", api_orders),
         web.get("/api/rejections", api_rejections),
+        web.get("/api/closes", api_closes),
         web.get("/api/positions", api_positions),
         web.get("/api/rules", api_rules),
     ]
