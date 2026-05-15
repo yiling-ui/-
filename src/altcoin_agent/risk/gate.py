@@ -164,10 +164,18 @@ class RiskGate:
                 )
 
             # 10) sizing
+            #
+            # Bug #1 fix: pass the dynamic ``leverage`` we just computed so
+            # ``compute_size`` can clamp ``notional <= equity * leverage``.
+            # Without this, a tight sweep stop (e.g. 0.05%) would produce
+            # 30-100x equity notional and either be rejected by the venue
+            # (-> emergency close + 4h cooldown) or quietly oversize the
+            # book on cross margin.
             size, notional, risk_amount = self.sizer.compute_size(
                 equity_usdt=account.equity_usdt,
                 entry_price=current_price,
                 initial_stop=initial_stop,
+                leverage=leverage,
             )
             if size <= 0 or notional <= 0:
                 return RiskDecision(
