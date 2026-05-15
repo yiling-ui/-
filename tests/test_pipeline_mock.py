@@ -468,3 +468,82 @@ async def test_post_mortem_scheduler_swallows_errors(
     task = sched.schedule(symbol="RAVEUSDT", target_ts_ms=1)
     # Must NOT raise — pipeline swallows post-mortem errors.
     await asyncio.wait_for(task, timeout=2.0)
+
+
+
+
+@pytest.mark.asyncio
+async def test_post_mortem_scheduler_forwards_entry_and_direction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug #2 fix: when ``schedule(entry_ts_ms=..., expected_direction=...)``
+    is called, the scheduler must forward both kwargs into
+    ``run_post_mortem`` so the entry-aware slicing + direction-aware
+    result kick in."""
+    store = RuleStore(json_path=tmp_path / "rules.json",
+                       md_path=tmp_path / "rules.md")
+
+    captured: dict = {}
+
+    async def fake_run_post_mortem(**kwargs):
+        captured.update(kwargs)
+        from altcoin_agent.learning_engine import (
+            EventResult,
+            PostMortemReport,
+        )
+        return PostMortemReport(
+            symbol=kwargs["symbol"],
+            target_ts_ms=kwargs["target_ts_ms"],
+            result=EventResult(direction="pump", magnitude_pct=-0.05,
+                                minutes_to_extremum=10,
+                                realized_at_ts_ms=kwargs["target_ts_ms"]),
+            candidates=[], picks=[],
+        )
+
+    monkeypatch.setattr(pipeline_mod, "run_post_mortem", fake_run_post_mortem)
+
+    sched = DelayedPostMortemScheduler(store=store, engine=None, delay_sec=0)
+    task = sched.schedule(
+        symbol="RAVEUSDT",
+        target_ts_ms=12_345 + 3_600_000,
+        entry_ts_ms=12_345,
+        expected_direction="pump",
+    )
+    await asyncio.wait_for(task, timeout=2.0)
+    assert captured["symbol"] == "RAVEUSDT"
+    assert captured["entry_ts_ms"] == 12_345
+    assert captured["expected_direction"] == "pump"
+    # target_ts_ms is the moment we *evaluate* (entry + delay).
+    assert captured["target_ts_ms"] == 12_345 + 3_600_000
+
+
+@pytest.mark.asyncio
+async def test_post_mortem_scheduler_omits_entry_kwargs_for_legacy_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward-compat: legacy callers without entry_ts_ms must NOT
+    receive those kwargs (so the legacy code path inside
+    ``run_post_mortem`` remains untouched)."""
+    store = RuleStore(json_path=tmp_path / "rules.json",
+                       md_path=tmp_path / "rules.md")
+    captured: dict = {}
+
+    async def fake_run_post_mortem(**kwargs):
+        captured.update(kwargs)
+        from altcoin_agent.learning_engine import (
+            EventResult,
+            PostMortemReport,
+        )
+        return PostMortemReport(
+            symbol=kwargs["symbol"],
+            target_ts_ms=kwargs["target_ts_ms"],
+            result=EventResult("pump", 0.0, 0, kwargs["target_ts_ms"]),
+            candidates=[], picks=[],
+        )
+
+    monkeypatch.setattr(pipeline_mod, "run_post_mortem", fake_run_post_mortem)
+    sched = DelayedPostMortemScheduler(store=store, engine=None, delay_sec=0)
+    task = sched.schedule(symbol="RAVEUSDT", target_ts_ms=12_345)
+    await asyncio.wait_for(task, timeout=2.0)
+    assert "entry_ts_ms" not in captured
+    assert "expected_direction" not in captured

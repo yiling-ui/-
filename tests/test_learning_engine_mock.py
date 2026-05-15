@@ -205,3 +205,162 @@ async def test_run_post_mortem_two_runs_climb_hit_rate(tmp_path: Path) -> None:
 def test_post_mortem_pick_dataclass() -> None:
     p = PostMortemPick(feature_name="x", bucket="b", rationale="r")
     assert p.feature_name == "x"
+
+
+
+
+# --------------------------------------------------------------------- #
+# Bug #2 — entry-aware slice + direction-aware result
+# --------------------------------------------------------------------- #
+
+
+def test_historical_slice_pre_post_split() -> None:
+    """``pre_entry_bars`` and ``post_entry_bars`` partition the slice on
+    ``entry_ts_ms``; the entry reference price is the close of the last
+    pre-entry bar."""
+    from altcoin_agent.learning_engine import (
+        Bar,
+        HistoricalSlice,
+        synthesize_long_stopout_slice,
+    )
+    s = synthesize_long_stopout_slice(entry_ts_ms=1_000_000_000_000)
+    pre = s.pre_entry_bars()
+    post = s.post_entry_bars()
+    assert len(pre) == 4 * 60   # 4h
+    assert len(post) == 60      # 1h
+    assert pre[-1].ts_ms < s.entry_ts_ms <= post[0].ts_ms
+    assert s.entry_reference_price() == pre[-1].close
+
+    # Legacy path: no entry_ts_ms -> both views return the whole slice.
+    legacy = HistoricalSlice(
+        symbol="X", target_ts_ms=1, entry_ts_ms=0,
+        bars=[Bar(0, 1.0, 1.0, 1.0, 1.0, 1.0)],
+    )
+    assert legacy.pre_entry_bars() == legacy.bars
+    assert legacy.post_entry_bars() == legacy.bars
+
+
+def test_compute_event_result_evaluates_post_entry_only() -> None:
+    """The realized result must be derived from the post-entry bars; the
+    bullish pre-entry move must NOT leak into the magnitude."""
+    from altcoin_agent.learning_engine import (
+        compute_event_result,
+        synthesize_long_stopout_slice,
+    )
+    s = synthesize_long_stopout_slice(entry_ts_ms=1_000_000_000_000)
+    # Without expected_direction the legacy "biggest extremum wins" rule
+    # still applies, but on the post-entry bars only — so the dump dominates.
+    result = compute_event_result(s)
+    assert result.direction == "dump"
+    assert result.magnitude_pct < -0.04
+    # The realized timestamp must fall in the post-entry segment.
+    assert result.realized_at_ts_ms >= s.entry_ts_ms
+
+
+def test_compute_event_result_pump_thesis_records_negative_magnitude() -> None:
+    """A long that gets stopped out must be reported as a pump with
+    negative magnitude — the trader bet up, lost money. Crucially, the
+    direction stays ``pump`` so the rule store learns from the LOSS
+    against the bullish features."""
+    from altcoin_agent.learning_engine import (
+        compute_event_result,
+        synthesize_long_stopout_slice,
+    )
+    s = synthesize_long_stopout_slice(entry_ts_ms=1_000_000_000_000)
+    result = compute_event_result(s, expected_direction="pump")
+    assert result.direction == "pump"
+    assert result.magnitude_pct < 0
+    assert result.magnitude_pct < -0.04
+
+
+def test_compute_event_result_dump_thesis_records_negative_for_pump() -> None:
+    """Symmetry: a SHORT that gets squeezed up is recorded as ``dump``
+    direction with positive magnitude (a missed dump)."""
+    from altcoin_agent.learning_engine import (
+        Bar,
+        HistoricalSlice,
+        compute_event_result,
+    )
+    # Build a tiny custom slice: enter at price 1.0, then run UP 8% (squeeze).
+    entry = 1_000_000_000_000
+    bars = [
+        Bar(entry - 60_000, 1.000, 1.001, 0.999, 1.000, 1000.0),  # pre
+        Bar(entry, 1.000, 1.005, 1.000, 1.005, 2000.0),
+        Bar(entry + 60_000, 1.005, 1.080, 1.005, 1.080, 5000.0),
+    ]
+    s = HistoricalSlice(symbol="X", target_ts_ms=entry, bars=bars,
+                         entry_ts_ms=entry)
+    result = compute_event_result(s, expected_direction="dump")
+    assert result.direction == "dump"
+    # The magnitude is the run UP (positive) — the missed dump.
+    assert result.magnitude_pct > 0
+
+
+def test_extract_features_uses_pre_entry_only() -> None:
+    """Features measured on the entry-aware slice must come from the
+    pre-entry segment exclusively. Truncating post-entry bars to zero
+    must not change the feature values; truncating pre-entry bars must."""
+    from altcoin_agent.learning_engine import (
+        compute_event_result,
+        extract_candidate_features,
+        synthesize_long_stopout_slice,
+    )
+    s_full = synthesize_long_stopout_slice(entry_ts_ms=1_000_000_000_000)
+    result = compute_event_result(s_full, expected_direction="pump")
+    features_full = extract_candidate_features(s_full, result)
+
+    # Drop all post-entry bars: features must not change.
+    s_pre_only = synthesize_long_stopout_slice(entry_ts_ms=1_000_000_000_000)
+    s_pre_only.bars = s_pre_only.pre_entry_bars()
+    # Result direction is pinned by expected_direction; the features should
+    # be identical because they only depend on the pre-entry segment.
+    result_pre = compute_event_result(s_pre_only, expected_direction="pump")
+    features_pre_only = extract_candidate_features(s_pre_only, result_pre)
+    by_name = {f.name: f.bucket for f in features_full}
+    by_name_pre = {f.name: f.bucket for f in features_pre_only}
+    assert by_name == by_name_pre
+
+
+@pytest.mark.asyncio
+async def test_run_post_mortem_loser_files_under_intended_direction(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a stopped-out long must update the rule store under
+    ``side="pump"`` (the trader's intent), not ``side="dump"`` — even though
+    the post-entry price went down."""
+    from altcoin_agent.learning_engine import (
+        RuleStore,
+        run_post_mortem,
+        synthesize_long_stopout_slice,
+    )
+    store = RuleStore(json_path=tmp_path / "rules.json")
+    s = synthesize_long_stopout_slice(entry_ts_ms=1_000_000_000_000)
+    report = await run_post_mortem(
+        symbol="RAVEUSDT", target_ts_ms=s.target_ts_ms,
+        store=store, engine=None, slice_override=s,
+        expected_direction="pump",
+    )
+    assert report.result.direction == "pump"
+    assert report.result.magnitude_pct < 0
+    # All persisted rules must be filed under "pump".
+    sides = {r.side for r in store.all_rules()}
+    assert sides == {"pump"}
+    # The picks should still represent the bullish pre-entry features
+    # (compression + OI build) — those are what the rule store now
+    # associates with a *failing* pump signature.
+    assert len(report.picks) >= 1
+
+
+def test_legacy_compute_event_result_unchanged_for_backward_only_slice() -> None:
+    """``compute_event_result`` on a slice with ``entry_ts_ms == 0`` must
+    behave exactly as before the Bug #2 refactor. This guards the
+    discover_events / standalone backtest path."""
+    from altcoin_agent.learning_engine import (
+        compute_event_result,
+        synthesize_dump_slice,
+    )
+    s = synthesize_dump_slice()
+    result = compute_event_result(s)
+    assert result.direction == "dump"
+    assert result.magnitude_pct < -0.10
+    assert result.minutes_to_extremum > 0
