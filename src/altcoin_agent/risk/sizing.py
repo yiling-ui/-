@@ -76,22 +76,64 @@ class PositionSizer:
         equity_usdt: float,
         entry_price: float,
         initial_stop: float,
+        leverage: float | None = None,
     ) -> tuple[float, float, float]:
         """Returns (size_in_base, notional_usdt, risk_amount_usdt).
 
         Treats one contract as one unit of base (size_in_base equals quantity).
         The exchange-specific contract face value translation belongs in the
         executor, not here.
+
+        Bug #1 fix — leverage cap on notional:
+
+        Risk-parity sizing alone produces ``notional = risk_amount * entry /
+        stop_distance``. With a tight stop (e.g. 0.05% on a sweep entry) this
+        can balloon to 30-100x equity, blowing through Binance's leverage cap
+        and the operator-configured ``max_leverage_long/short``. The exchange
+        will either reject the order (-> emergency close + 4h cooldown) or
+        worse, accept it on cross margin and quietly oversize the book.
+
+        We now clamp ``notional <= equity * leverage`` and recompute
+        ``risk_amount`` from the clamped size so the returned tuple honestly
+        reflects what was actually committed.
+
+        ``leverage`` is the dynamic leverage produced by ``compute_leverage``;
+        when omitted we default to ``leverage_cfg.max_leverage_long`` (the
+        side-agnostic upper bound) which preserves existing risk-parity
+        behaviour for any caller that hasn't been updated yet.
         """
         if entry_price <= 0:
             return 0.0, 0.0, 0.0
         stop_distance = abs(entry_price - initial_stop)
         if stop_distance <= 0:
             return 0.0, 0.0, 0.0
+        if equity_usdt <= 0:
+            return 0.0, 0.0, 0.0
+
+        if leverage is None:
+            leverage = self.leverage_cfg.max_leverage_long
+        # Clamp leverage into a sane band so a stale or buggy upstream value
+        # cannot inflate the notional past the configured side caps.
+        max_lev_cap = max(
+            self.leverage_cfg.max_leverage_long,
+            self.leverage_cfg.max_leverage_short,
+        )
+        leverage = float(max(0.0, min(max_lev_cap, leverage)))
+        if leverage <= 0:
+            return 0.0, 0.0, 0.0
+
         risk_amount = equity_usdt * self.max_risk_per_trade
-        size_quote = risk_amount / stop_distance * entry_price  # = risk_amount * entry / stop_distance
-        notional = size_quote
+        notional_risk_parity = risk_amount * entry_price / stop_distance
+        notional_cap = equity_usdt * leverage
+        notional = min(notional_risk_parity, notional_cap)
+
         if notional < self.min_notional_usdt:
             return 0.0, 0.0, 0.0
+
         size_in_base = notional / entry_price
-        return size_in_base, notional, risk_amount
+        # When we clamped, the realised dollar risk is smaller than the
+        # configured ``max_risk_per_trade``. Recompute it so the gate's
+        # bookkeeping reflects reality (this is what gets logged & shown on
+        # the dashboard).
+        actual_risk = stop_distance * size_in_base
+        return size_in_base, notional, actual_risk
