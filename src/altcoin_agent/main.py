@@ -29,10 +29,21 @@ import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from typing import Any
 
 from aiohttp import web
 
+from altcoin_agent.ai_engine import DeepSeekEngine
 from altcoin_agent.fuser import Direction, FusedSignal, FuserConfig, ScoreFuser
+from altcoin_agent.learning_engine import RuleStore
+from altcoin_agent.pipeline import (
+    CandidateGate,
+    DelayedPostMortemScheduler,
+    LLMConsultor,
+    RecentSignalsCache,
+    cookie_jar_from_env,
+    proxy_config_from_env,
+)
 from altcoin_agent.risk import (
     AccountState,
     ATRCalculator,
@@ -49,7 +60,13 @@ from altcoin_agent.risk import (
     TrailingStopFSM,
     build_ccxt_adapter,
 )
-from altcoin_agent.screener import Kline, Screener, SignalEvent
+from altcoin_agent.screener import (
+    FundingSnapshot,
+    Kline,
+    OISnapshot,
+    Screener,
+    SignalEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +88,12 @@ class AppConfig:
     paper_trade: bool = False             # use ccxt with testnet=true
     hedge_mode: bool = False
     min_liquidity_usdt: float = 200_000.0
+    # LLM consult tuning
+    llm_consult_cooldown_sec: int = 300   # per-symbol min spacing between consults
+    llm_queue_max: int = 256
+    # Online post-mortem (self-evolution)
+    post_mortem_delay_sec: int = 3600     # 1h after open
+    dynamic_rules_path: str | None = None  # None -> follow env / default
 
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
@@ -91,6 +114,10 @@ class AppConfig:
             paper_trade=bool(d.get("paper_trade", False)),
             hedge_mode=bool(d.get("hedge_mode", False)),
             min_liquidity_usdt=float(d.get("min_liquidity_usdt", 200_000)),
+            llm_consult_cooldown_sec=int(d.get("llm_consult_cooldown_sec", 300)),
+            llm_queue_max=int(d.get("llm_queue_max", 256)),
+            post_mortem_delay_sec=int(d.get("post_mortem_delay_sec", 3600)),
+            dynamic_rules_path=d.get("dynamic_rules_path"),
         )
 
 
@@ -111,6 +138,9 @@ class HealthState:
     open_positions: int = 0
     orders_placed: int = 0
     orders_rejected: int = 0
+    llm_consults: int = 0
+    llm_consults_skipped: int = 0
+    post_mortems_scheduled: int = 0
     last_error: str | None = None
 
 
@@ -132,6 +162,9 @@ async def make_health_app(state: HealthState) -> web.Application:
             "open_positions": state.open_positions,
             "orders_placed": state.orders_placed,
             "orders_rejected": state.orders_rejected,
+            "llm_consults": state.llm_consults,
+            "llm_consults_skipped": state.llm_consults_skipped,
+            "post_mortems_scheduled": state.post_mortems_scheduled,
             "last_signal_ts": state.last_signal_ts,
             "last_error": state.last_error,
         }
@@ -310,6 +343,9 @@ class App:
     _runner: web.AppRunner | None = None
     _screener: Screener | None = None
     _adapter: ExchangeAdapter | None = None
+    _llm_engine: DeepSeekEngine | None = None
+    _post_mortem: DelayedPostMortemScheduler | None = None
+    _llm_consultor: LLMConsultor | None = None
 
     async def run(self) -> None:
         self.state.started_at = time.time()
@@ -353,12 +389,30 @@ class App:
         # ----- queue + components -----
         signal_q: asyncio.Queue[SignalEvent] = asyncio.Queue(maxsize=1000)
         kline_q: asyncio.Queue[tuple[str, str, Kline]] = asyncio.Queue(maxsize=1000)
+        llm_q: asyncio.Queue[SignalEvent] = asyncio.Queue(maxsize=self.cfg.llm_queue_max)
+
+        # Per-symbol rolling cache of rule events / funding / OI for SMC
+        # context reconstruction. window_sec mirrors the fuser default so the
+        # LLM sees the same horizon the fuser is currently scoring on.
+        recent_cache = RecentSignalsCache(window_sec=FuserConfig().window_sec)
+        candidate_gate = CandidateGate(
+            cooldown_sec=self.cfg.llm_consult_cooldown_sec,
+        )
 
         async def screener_sink(ev: SignalEvent) -> None:
             self.state.last_signal_ts = time.time()
             self.state.rule_event_count += 1
+            recent_cache.add_signal(ev)
             with suppress(asyncio.QueueFull):
                 signal_q.put_nowait(ev)
+            # Fan-out to LLM consult queue when this event is worth the
+            # token spend. Failures here NEVER block rule scoring.
+            if candidate_gate.should_consult(ev):
+                try:
+                    llm_q.put_nowait(ev)
+                    candidate_gate.mark_consulted(ev.symbol, ev.ts)
+                except asyncio.QueueFull:
+                    self.state.llm_consults_skipped += 1
 
         # Hook into screener's kline callback so trailing reacts to closed bars.
         # We do it by wrapping Screener.on_kline once the screener is built.
@@ -369,13 +423,25 @@ class App:
             timeframes=self.cfg.timeframes,
         )
         original_on_kline = self._screener.on_kline
+        original_on_funding = self._screener.on_funding
+        original_on_oi = self._screener.on_oi
 
         async def on_kline_wrapper(exchange: str, symbol: str, bar: Kline) -> None:
             with suppress(asyncio.QueueFull):
                 kline_q.put_nowait((exchange, symbol, bar))
             await original_on_kline(exchange, symbol, bar)
 
-        self._screener.on_kline = on_kline_wrapper  # type: ignore[method-assign]
+        async def on_funding_wrapper(exchange: str, snap: FundingSnapshot) -> None:
+            recent_cache.add_funding(snap)
+            await original_on_funding(exchange, snap)
+
+        async def on_oi_wrapper(exchange: str, snap: OISnapshot) -> None:
+            recent_cache.add_oi(snap)
+            await original_on_oi(exchange, snap)
+
+        self._screener.on_kline = on_kline_wrapper      # type: ignore[method-assign]
+        self._screener.on_funding = on_funding_wrapper  # type: ignore[method-assign]
+        self._screener.on_oi = on_oi_wrapper            # type: ignore[method-assign]
 
         # ----- fused-signal handling -----
         async def fused_sink(sig: FusedSignal) -> None:
@@ -386,7 +452,55 @@ class App:
                 trailing=trailing, account=account,
             )
 
-        fuser = ScoreFuser(sink=fused_sink, config=FuserConfig())
+        # Resolve dynamic rules path: cfg override -> env -> fuser default.
+        fuser_cfg_kwargs: dict[str, Any] = {}
+        if self.cfg.dynamic_rules_path:
+            from pathlib import Path
+            fuser_cfg_kwargs["dynamic_rules_path"] = Path(
+                self.cfg.dynamic_rules_path,
+            )
+        fuser = ScoreFuser(sink=fused_sink, config=FuserConfig(**fuser_cfg_kwargs))
+
+        # ----- LLM engine + online learning loop -----
+        # The engine reads DEEPSEEK_API_KEY from env. If unset, we don't even
+        # build it; the LLM worker will short-circuit and the system stays
+        # in rule-only mode (a documented degraded mode).
+        if os.getenv("DEEPSEEK_API_KEY"):
+            self._llm_engine = DeepSeekEngine()
+            logger.info("DeepSeek engine initialised (model=%s)",
+                        self._llm_engine.model)
+        else:
+            self._llm_engine = None
+            logger.info("DEEPSEEK_API_KEY not set; running in rule-only mode "
+                        "(LLM consults and post-mortems disabled).")
+
+        # RuleStore: shared by ScoreFuser (read via dynamic_rules.json mtime
+        # reload) and the post-mortem scheduler (write side). The path
+        # follows the same precedence as RuleIndex so both ends always see
+        # the same file.
+        rules_json_path = (
+            self.cfg.dynamic_rules_path
+            or os.getenv("DYNAMIC_RULES_JSON")
+            or str(fuser.rule_index.json_path)
+        )
+        rule_store = RuleStore(json_path=rules_json_path)
+
+        self._post_mortem = DelayedPostMortemScheduler(
+            store=rule_store,
+            engine=self._llm_engine,
+            delay_sec=self.cfg.post_mortem_delay_sec,
+        )
+
+        if self._llm_engine is not None:
+            self._llm_consultor = LLMConsultor(
+                engine=self._llm_engine,
+                fuser=fuser,
+                cache=recent_cache,
+                cookies=cookie_jar_from_env(),
+                proxy=proxy_config_from_env(),
+            )
+        else:
+            self._llm_consultor = None
 
         # ----- health server -----
         health_app = await make_health_app(self.state)
@@ -442,9 +556,46 @@ class App:
             finally:
                 self.state.screener_alive = False
 
+        async def llm_worker() -> None:
+            """Drain `llm_q`, consult the LLM, feed verdicts into the fuser.
+
+            Runs only when an engine is configured. Each consult is wrapped
+            in suppress(Exception) so a misbehaving social/LLM call cannot
+            poison the trading bus.
+            """
+            if self._llm_consultor is None:
+                # No engine -> drain forever to keep the queue from filling.
+                while not self._stop_event.is_set():
+                    try:
+                        ev = await asyncio.wait_for(llm_q.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    self.state.llm_consults_skipped += 1
+                    del ev
+                return
+            try:
+                while not self._stop_event.is_set():
+                    try:
+                        ev = await asyncio.wait_for(llm_q.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    try:
+                        verdict = await self._llm_consultor.consult(ev)
+                        if verdict is not None:
+                            self.state.llm_consults += 1
+                        else:
+                            self.state.llm_consults_skipped += 1
+                    except Exception as e:
+                        logger.exception("llm_worker consult failed: %s", e)
+                        self.state.llm_consults_skipped += 1
+                        self.state.last_error = f"llm:{type(e).__name__}"
+            except asyncio.CancelledError:
+                pass
+
         self._tasks.append(asyncio.create_task(fuse_worker(), name="fuse_worker"))
         self._tasks.append(asyncio.create_task(trailing_worker(), name="trailing_worker"))
         self._tasks.append(asyncio.create_task(screener_worker(), name="screener_worker"))
+        self._tasks.append(asyncio.create_task(llm_worker(), name="llm_worker"))
 
         await self._stop_event.wait()
         await self._shutdown()
@@ -501,6 +652,17 @@ class App:
                 position.side.value, position.symbol, position.size,
                 position.leverage, position.current_stop,
             )
+            # Close the self-evolution loop: schedule a post-mortem 1h
+            # after entry so the rules learned from this trade flow back
+            # into the fuser via dynamic_rules.json.
+            if self._post_mortem is not None:
+                target_ts_ms = int(time.time() * 1000) + (
+                    self._post_mortem.delay_sec * 1000
+                )
+                self._post_mortem.schedule(
+                    symbol=sig.symbol, target_ts_ms=target_ts_ms,
+                )
+                self.state.post_mortems_scheduled += 1
         except Exception as e:
             logger.exception("Executor failed for %s: %s", sig.symbol, e)
             self.state.last_error = f"executor:{type(e).__name__}"
@@ -520,6 +682,10 @@ class App:
         )
         if self._screener is not None:
             self._screener.stop()
+        # Cancel any pending post-mortem tasks so we don't block on a 1h sleep.
+        if self._post_mortem is not None:
+            with suppress(Exception):
+                await self._post_mortem.shutdown()
         try:
             await asyncio.wait_for(
                 asyncio.gather(*self._tasks, return_exceptions=True),
@@ -533,6 +699,10 @@ class App:
         if self._runner is not None:
             with suppress(Exception):
                 await self._runner.cleanup()
+        # Close DeepSeek client if it was built.
+        if self._llm_engine is not None:
+            with suppress(Exception):
+                await self._llm_engine.aclose()
         # Close ccxt client if any
         client = getattr(self._adapter, "client", None)
         if client is not None:
