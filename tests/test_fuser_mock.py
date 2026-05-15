@@ -360,3 +360,116 @@ def test_default_weights_allow_three_signal_confluence_to_clear_threshold() -> N
         + DEFAULT_RULE_WEIGHTS[SignalKind.LIQUIDITY_SWEEP]
     )
     assert trio >= 85
+
+
+# --------------------------------------------------------------------------- #
+# DUMP / SHORT symmetry coverage  (audit-fix regressions)
+# --------------------------------------------------------------------------- #
+
+
+def test_oi_silent_build_in_DOWNTREND_is_now_classified_SHORT() -> None:
+    """
+    Audit fix A: OI暴涨 + 价跌 = 主力做空建仓 (distribution-then-short).
+    Was incorrectly classified as LONG before. Without this test the
+    detector "sees" zero short signals from OI in a real dump setup.
+    """
+    fuser = ScoreFuser()
+    now = 1_000_000
+    bucket = fuser._rules.setdefault("binance:RAVEUSDT", __import__("collections").deque(maxlen=64))
+    bucket.extend([
+        _ev(SignalKind.VOLUME_SPIKE, ts=now, payload={"side": "sell"}),
+        # OI grows 22%, price drops -0.5% (well past -0.3% threshold)
+        _ev(SignalKind.OI_SILENT_BUILD, ts=now,
+            payload={"oi_delta_pct": 0.22, "from_price": 1.000, "to_price": 0.995}),
+        _ev(SignalKind.LIQUIDITY_SWEEP, ts=now,
+            payload={"side": "sell_side", "wick_to_body": 2.5}),
+    ])
+    sig = fuser.evaluate("RAVEUSDT", "binance", now)
+    assert sig.direction == Direction.SHORT
+    assert sig.is_high_priority is True
+    assert sig.rule_score >= 85
+
+
+def test_oi_silent_build_with_FLAT_price_is_now_NEUTRAL() -> None:
+    """
+    Audit fix A boundary: OI grows but price is flat (within 0.3% band).
+    Was previously written as 'mild long bias' but in real dumps this is
+    ambiguous. New behavior: NEUTRAL — let other rules decide direction.
+    """
+    fuser = ScoreFuser()
+    now = 1_000_000
+    bucket = fuser._rules.setdefault("binance:X", __import__("collections").deque(maxlen=64))
+    # Only OI signal, price moved +0.1% (under 0.3% threshold)
+    bucket.append(_ev(SignalKind.OI_SILENT_BUILD, ts=now, symbol="X",
+                      payload={"oi_delta_pct": 0.22, "from_price": 1.000, "to_price": 1.001}))
+    sig = fuser.evaluate("X", "binance", now)
+    assert sig.direction == Direction.NEUTRAL
+
+
+def test_short_confluence_promotes_high_priority() -> None:
+    """Mirror of the long confluence test. Three short-aligned rule signals → HIGH PRIORITY SHORT."""
+    fuser = ScoreFuser()
+    now = 1_000_000
+    bucket = fuser._rules.setdefault("binance:RAVEUSDT", __import__("collections").deque(maxlen=64))
+    bucket.extend([
+        _ev(SignalKind.VOLUME_SPIKE, ts=now-5_000, payload={"side": "sell"}),
+        _ev(SignalKind.OI_SILENT_BUILD, ts=now-2_000,
+            payload={"oi_delta_pct": 0.20, "from_price": 1.000, "to_price": 0.99}),
+        _ev(SignalKind.LIQUIDITY_SWEEP, ts=now,
+            payload={"side": "sell_side", "wick_to_body": 2.2}),
+    ])
+    sig = fuser.evaluate("RAVEUSDT", "binance", now)
+    assert sig.direction == Direction.SHORT
+    assert sig.rule_score >= 85
+    assert sig.is_high_priority is True
+
+
+def test_kol_exit_liquidity_with_SHORT_signals_is_NOT_vetoed() -> None:
+    """
+    Critical audit fix: when our rules say SHORT and the LLM agrees with dump
+    AND identifies the KOLs as exit_liquidity, that is a CONFIRMING piece of
+    evidence — we want to short alongside the dump-front-run. Must promote.
+    """
+    fuser = ScoreFuser()
+    now = 1_000_000
+    key = "binance:RAVEUSDT"
+    bucket = fuser._rules.setdefault(key, __import__("collections").deque(maxlen=64))
+    # Strong SHORT confluence
+    bucket.extend([
+        _ev(SignalKind.VOLUME_SPIKE, ts=now, payload={"side": "sell"}),
+        _ev(SignalKind.OI_SILENT_BUILD, ts=now,
+            payload={"from_price": 1.000, "to_price": 0.99}),
+        _ev(SignalKind.LIQUIDITY_SWEEP, ts=now,
+            payload={"side": "sell_side", "wick_to_body": 2.5}),
+    ])
+    # LLM says dump AND flags KOL as exit_liquidity at high confidence
+    fuser._llm[key] = _v("dump", confidence=0.85, kol_intent="exit_liquidity")
+    fuser._llm_ts[key] = now
+
+    sig = fuser.evaluate("RAVEUSDT", "binance", now)
+    assert sig.direction == Direction.SHORT
+    assert sig.is_high_priority is True            # NOT vetoed
+    assert sig.blocked is False                    # NOT vetoed
+    assert any("alongside" in n.lower() for n in sig.notes)   # special boost note
+
+
+def test_kol_exit_liquidity_with_LONG_signals_STILL_HARD_vetoes() -> None:
+    """Sanity: the audit fix did not weaken the LONG-side veto."""
+    fuser = ScoreFuser()
+    now = 1_000_000
+    key = "binance:RAVEUSDT"
+    bucket = fuser._rules.setdefault(key, __import__("collections").deque(maxlen=64))
+    bucket.extend([
+        _ev(SignalKind.VOLUME_SPIKE, ts=now, payload={"side": "buy"}),
+        _ev(SignalKind.OI_SILENT_BUILD, ts=now,
+            payload={"from_price": 1.0, "to_price": 1.005}),
+        _ev(SignalKind.LIQUIDITY_SWEEP, ts=now,
+            payload={"side": "buy_side", "wick_to_body": 3.0}),
+    ])
+    fuser._llm[key] = _v("pump", confidence=0.85, kol_intent="exit_liquidity")
+    fuser._llm_ts[key] = now
+
+    sig = fuser.evaluate("RAVEUSDT", "binance", now)
+    assert sig.is_high_priority is False
+    assert sig.blocked is True
+    assert sig.block_reason == "kol_exit_liquidity_hard_veto"

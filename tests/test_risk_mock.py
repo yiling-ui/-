@@ -430,6 +430,66 @@ def test_trailing_short_mirrors_long() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# SHORT TARGET CAP — F item, "no death-grip to zero"
+# --------------------------------------------------------------------------- #
+
+
+def test_short_target_cap_force_closes_at_70pct_drop() -> None:
+    """User mandate F: shorts cap at -70% from entry. Below that, force close."""
+    fsm = TrailingStopFSM(atr_multiplier=2.0, short_target_cap_pct=0.70)
+    p = Position(
+        symbol="RAVEUSDT", exchange="binance", side=Side.SHORT,
+        entry_price=1.000, size_contracts=1.0, leverage=10.0, opened_ts=0,
+        initial_stop=1.05,                       # +5% stop
+        current_hard_stop=0.50,                  # already trailed way down
+    )
+    fsm.state = TrailingState.TRAILING
+
+    # Price has fallen 71% from entry of 1.0 → 0.29
+    state, new_stop = fsm.tick(position=p, current_price=0.29, atr=0.01)
+    assert state == TrailingState.TARGET_REACHED
+    assert new_stop is not None
+    # Stop placed JUST ABOVE current price -> next tick triggers it
+    assert new_stop == pytest.approx(0.29 * 1.0005, rel=1e-9)
+
+
+def test_short_target_cap_does_NOT_trigger_at_60pct_drop() -> None:
+    """Boundary: -60% should NOT trigger the cap. Normal trailing continues."""
+    fsm = TrailingStopFSM(atr_multiplier=2.0, short_target_cap_pct=0.70)
+    p = Position(
+        symbol="X", exchange="binance", side=Side.SHORT,
+        entry_price=1.000, size_contracts=1.0, leverage=10.0, opened_ts=0,
+        initial_stop=1.05,
+        current_hard_stop=0.55,
+    )
+    fsm.state = TrailingState.TRAILING
+
+    state, new_stop = fsm.tick(position=p, current_price=0.40, atr=0.01)  # -60%
+    # Should be normal trailing tighten, NOT target_reached
+    assert state == TrailingState.TRAILING
+    # ATR-trail stop = 0.40 + 2*0.01 = 0.42, which IS tighter than 0.55
+    assert new_stop == pytest.approx(0.42)
+
+
+def test_short_target_cap_does_not_apply_to_long() -> None:
+    """LONG positions have no equivalent cap (they have unbounded upside)."""
+    fsm = TrailingStopFSM(atr_multiplier=2.0, short_target_cap_pct=0.70)
+    p = Position(
+        symbol="X", exchange="binance", side=Side.LONG,
+        entry_price=1.000, size_contracts=1.0, leverage=10.0, opened_ts=0,
+        initial_stop=0.95,
+        current_hard_stop=1.50,
+    )
+    fsm.state = TrailingState.TRAILING
+
+    # +200% gain — long should keep trailing, not "force close"
+    state, new_stop = fsm.tick(position=p, current_price=3.00, atr=0.05)
+    assert state == TrailingState.TRAILING
+    assert new_stop == pytest.approx(2.90)
+    assert state != TrailingState.TARGET_REACHED
+
+
+# --------------------------------------------------------------------------- #
 # Reconciler — SR-2 startup
 # --------------------------------------------------------------------------- #
 

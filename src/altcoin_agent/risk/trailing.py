@@ -30,6 +30,7 @@ class TrailingState(str, Enum):
     ARMED = "armed"
     BREAKEVEN = "breakeven"
     TRAILING = "trailing"
+    TARGET_REACHED = "target_reached"     # SHORT only: -70% from entry hit
     CLOSED = "closed"
 
 
@@ -39,11 +40,22 @@ class TrailingStopFSM:
     Pure logic. Inputs: position + current price + ATR. Output: optional
     new_stop suggestion. The FSM never lowers the protective level for
     longs or raises it for shorts.
+
+    SHORT TARGET CAP (per user mandate):
+        Altcoin shorts riding a "to zero" move face two real risks:
+          (1) liquidity collapses near the bottom — exiting becomes expensive
+          (2) funding rate flips deeply negative — paying to hold the short
+        For SHORT positions, when price has dropped >= ``short_target_cap_pct``
+        from entry (default 70%), the FSM reports state=TARGET_REACHED with
+        new_stop = current_price + tiny buffer. Caller MUST market-close.
+        This prevents the "wait for zero" greed trap.
     """
 
     breakeven_r: float = 1.0
     trail_start_r: float = 2.0
     atr_multiplier: float = 2.0
+    short_target_cap_pct: float = 0.70   # SR: see class docstring
+    short_target_close_buffer: float = 0.0005  # 0.05% above current price for safety
     state: TrailingState = TrailingState.ARMED
 
     def tick(
@@ -70,6 +82,27 @@ class TrailingStopFSM:
             unrealized_r = (current_price - position.entry_price) / r_unit
         else:
             unrealized_r = (position.entry_price - current_price) / r_unit
+
+        # SHORT TARGET CAP: hard ceiling on greed.
+        # If the short has already collected >= short_target_cap_pct of entry
+        # price, force-close. We surface this by signalling TARGET_REACHED with
+        # a stop placed JUST ABOVE current price (so the next exchange tick
+        # triggers it). This keeps the executor path identical to a normal
+        # tighten — no separate "close" code path needed.
+        if position.side == Side.SHORT and position.entry_price > 0:
+            drop_pct = (position.entry_price - current_price) / position.entry_price
+            if drop_pct >= self.short_target_cap_pct:
+                close_stop = current_price * (1.0 + self.short_target_close_buffer)
+                # Only act once: if we've already moved into TARGET_REACHED and
+                # current_price hasn't materially changed, skip.
+                if (
+                    self.state != TrailingState.TARGET_REACHED
+                    or close_stop < position.current_hard_stop
+                ):
+                    new_stop = self._propose(position, close_stop)
+                    if new_stop is not None:
+                        self.state = TrailingState.TARGET_REACHED
+                        return self.state, new_stop
 
         # ARMED -> BREAKEVEN
         if self.state == TrailingState.ARMED and unrealized_r >= self.breakeven_r:
