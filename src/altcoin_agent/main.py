@@ -7,15 +7,17 @@ Responsibilities:
       gate refuses every signal.
     * Maintain a TrailingStopFSM per open position, fed by closed klines
       and live ATR.
-    * Expose /healthz on aiohttp for Docker healthcheck.
+    * Expose /healthz, /dashboard (HTML) and /api/* JSON on aiohttp.
     * SIGINT / SIGTERM -> graceful shutdown:
         1. Stop accepting new screener events.
         2. Drain the queue with a bounded timeout.
         3. Cancel exchange WS subscriptions, close clients.
     * Three operating modes:
-        --dry-run         (default): no orders, just structured logging.
-        --paper-trade           : real ccxt orders against testnet/sandbox.
+        --dry-run        (default): no orders, just structured logging.
+        --paper-trade    : real ccxt orders against testnet/sandbox.
         live (no flag, set in .env): real ccxt orders against mainnet.
+    * Optional Telegram notifier (TG_ENABLED=true).
+    * Optional dashboard (DASHBOARD_ENABLED=true, default true).
 """
 
 from __future__ import annotations
@@ -29,10 +31,13 @@ import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from aiohttp import web
 
+from altcoin_agent.dashboard import DashboardState, install_dashboard
 from altcoin_agent.fuser import Direction, FusedSignal, FuserConfig, ScoreFuser
+from altcoin_agent.notifier import Notifier, build_default_notifier
 from altcoin_agent.risk import (
     AccountState,
     ATRCalculator,
@@ -68,9 +73,11 @@ class AppConfig:
     graceful_timeout_sec: float = 30.0
     initial_equity_usdt: float = 10_000.0
     dry_run: bool = True
-    paper_trade: bool = False             # use ccxt with testnet=true
+    paper_trade: bool = False
     hedge_mode: bool = False
     min_liquidity_usdt: float = 200_000.0
+    dashboard_enabled: bool = True
+    dynamic_rules_path: str = ".kiro/steering/dynamic_rules.json"
 
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
@@ -91,6 +98,9 @@ class AppConfig:
             paper_trade=bool(d.get("paper_trade", False)),
             hedge_mode=bool(d.get("hedge_mode", False)),
             min_liquidity_usdt=float(d.get("min_liquidity_usdt", 200_000)),
+            dashboard_enabled=bool(d.get("dashboard_enabled", True)),
+            dynamic_rules_path=str(d.get(
+                "dynamic_rules_path", ".kiro/steering/dynamic_rules.json")),
         )
 
 
@@ -252,12 +262,7 @@ class _Tracked:
 
 @dataclass
 class TrailingController:
-    """Per-symbol trailing FSM state machine.
-
-    On every closed kline we update ATR and feed the latest price to the
-    FSM. When the FSM proposes a tighter stop, we ask the executor to
-    cancel + replace via ``tighten_hard_stop``.
-    """
+    """Per-symbol trailing FSM state machine."""
 
     fsm: TrailingStopFSM
     atr: ATRCalculator
@@ -305,6 +310,8 @@ class TrailingController:
 class App:
     cfg: AppConfig
     state: HealthState = field(default_factory=HealthState)
+    dashboard: DashboardState = field(default_factory=DashboardState)
+    notifier: Notifier | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     _tasks: list[asyncio.Task] = field(default_factory=list)
     _runner: web.AppRunner | None = None
@@ -315,6 +322,10 @@ class App:
         self.state.started_at = time.time()
         mode = self._mode_label()
         logger.info("Altcoin Agent V1.0 starting (mode=%s)", mode)
+
+        if self.notifier is None:
+            self.notifier = build_default_notifier()
+        logger.info("Notifier: %s", self.notifier.name)
 
         # ----- adapter selection -----
         if self.cfg.dry_run:
@@ -338,6 +349,10 @@ class App:
             starting_equity_today_usdt=self.cfg.initial_equity_usdt,
         )
 
+        self.dashboard.health = self.state
+        self.dashboard.account = account
+        self.dashboard.rules_path = Path(self.cfg.dynamic_rules_path)
+
         # ----- reconciler (SR-2) -----
         rec_report = await Reconciler(
             exchange_name=self.cfg.exchanges[0], adapter=self._adapter,
@@ -360,8 +375,6 @@ class App:
             with suppress(asyncio.QueueFull):
                 signal_q.put_nowait(ev)
 
-        # Hook into screener's kline callback so trailing reacts to closed bars.
-        # We do it by wrapping Screener.on_kline once the screener is built.
         self._screener = Screener(
             exchanges=self.cfg.exchanges,
             symbols=self.cfg.symbols,
@@ -380,7 +393,11 @@ class App:
         # ----- fused-signal handling -----
         async def fused_sink(sig: FusedSignal) -> None:
             self.state.high_priority_count += 1
-            logger.info("HIGH PRIORITY: %s", sig.as_dict())
+            payload = sig.as_dict()
+            payload["ts_ms"] = int(time.time() * 1000)
+            self.dashboard.push_signal(payload)
+            logger.info("HIGH PRIORITY: %s", payload)
+            await self.notifier.signal(payload)
             await self._handle_high_priority(
                 sig=sig, gate=gate, executor=executor,
                 trailing=trailing, account=account,
@@ -388,14 +405,19 @@ class App:
 
         fuser = ScoreFuser(sink=fused_sink, config=FuserConfig())
 
-        # ----- health server -----
+        # ----- HTTP server (healthz + dashboard) -----
         health_app = await make_health_app(self.state)
+        if self.cfg.dashboard_enabled:
+            install_dashboard(health_app, self.dashboard, mode_label=mode)
         self._runner = web.AppRunner(health_app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "0.0.0.0", self.cfg.healthz_port)
         await site.start()
         logger.info("Health endpoint live: http://0.0.0.0:%d/healthz",
                     self.cfg.healthz_port)
+        if self.cfg.dashboard_enabled:
+            logger.info("Dashboard live:        http://0.0.0.0:%d/dashboard",
+                        self.cfg.healthz_port)
 
         # ----- workers -----
         async def fuse_worker() -> None:
@@ -410,6 +432,10 @@ class App:
                     except Exception as e:
                         logger.exception("fuser failed on event: %s", e)
                         self.state.last_error = f"fuser:{type(e).__name__}"
+                        with suppress(Exception):
+                            await self.notifier.error(
+                                f"fuser failed: {e}", payload={"event": ev.as_dict()},
+                            )
             except asyncio.CancelledError:
                 pass
             finally:
@@ -439,6 +465,8 @@ class App:
             except Exception as e:
                 logger.exception("screener failed: %s", e)
                 self.state.last_error = f"screener:{type(e).__name__}"
+                with suppress(Exception):
+                    await self.notifier.error(f"screener failed: {e}")
             finally:
                 self.state.screener_alive = False
 
@@ -466,8 +494,6 @@ class App:
             logger.warning("missing trigger_price on %s; skipping order", sig.symbol)
             return
 
-        # 5% protective initial stop based on direction. The stop distance is
-        # also what Risk Gate uses to size the position via risk-parity.
         if sig.direction == Direction.LONG:
             initial_stop = sig.trigger_price * 0.95
         else:
@@ -477,13 +503,18 @@ class App:
             signal=sig,
             account=account,
             current_price=sig.trigger_price,
-            top5_depth_usdt=self.cfg.min_liquidity_usdt,  # placeholder
-            realized_vol_pct=0.05,                          # placeholder
+            top5_depth_usdt=self.cfg.min_liquidity_usdt,
+            realized_vol_pct=0.05,
             initial_stop=initial_stop,
         )
         if not decision.approved:
             logger.info("Risk Gate REJECT %s: %s", sig.symbol, decision.reason)
             self.state.orders_rejected += 1
+            rej = {"ts": int(time.time() * 1000),
+                   "symbol": sig.symbol, "reason": decision.reason}
+            self.dashboard.push_rejection(rej)
+            with suppress(Exception):
+                await self.notifier.rejected(rej)
             return
         try:
             position = await executor.open(
@@ -501,10 +532,26 @@ class App:
                 position.side.value, position.symbol, position.size,
                 position.leverage, position.current_stop,
             )
+            opened_payload = {
+                "ts": int(time.time() * 1000),
+                "symbol": position.symbol,
+                "side": position.side.value,
+                "size": position.size,
+                "leverage": position.leverage,
+                "entry_price": position.entry_price,
+                "initial_stop": position.initial_stop,
+                "type": "MARKET+STOP_MARKET",
+                "stop_price": position.current_stop,
+            }
+            self.dashboard.push_order(opened_payload)
+            with suppress(Exception):
+                await self.notifier.opened(opened_payload)
         except Exception as e:
             logger.exception("Executor failed for %s: %s", sig.symbol, e)
             self.state.last_error = f"executor:{type(e).__name__}"
             self.state.orders_rejected += 1
+            with suppress(Exception):
+                await self.notifier.error(f"executor failed for {sig.symbol}: {e}")
 
     def _mode_label(self) -> str:
         if self.cfg.dry_run:
@@ -533,13 +580,15 @@ class App:
         if self._runner is not None:
             with suppress(Exception):
                 await self._runner.cleanup()
-        # Close ccxt client if any
         client = getattr(self._adapter, "client", None)
         if client is not None:
             close = getattr(client, "close", None)
             if close is not None:
                 with suppress(Exception):
                     await close()
+        if self.notifier is not None:
+            with suppress(Exception):
+                await self.notifier.aclose()
         logger.info("Shutdown complete.")
 
     def request_stop(self) -> None:
@@ -585,6 +634,8 @@ def main() -> None:
     if args.paper_trade or os.getenv("PAPER_TRADE", "").lower() in ("1", "true", "yes"):
         cfg.paper_trade = True
         cfg.dry_run = False
+    if os.getenv("DASHBOARD_ENABLED", "true").lower() in ("0", "false", "no"):
+        cfg.dashboard_enabled = False
 
     app = App(cfg=cfg)
     loop = asyncio.new_event_loop()
