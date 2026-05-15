@@ -25,6 +25,8 @@ from altcoin_agent.learning_engine import (
 )
 from altcoin_agent.risk import (
     AccountState,
+    ATRCalculator,
+    CCXTExchangeAdapter,
     CCXTExecutor,
     DynamicLeverageConfig,
     ExchangeAdapter,
@@ -38,6 +40,7 @@ from altcoin_agent.risk import (
     Side,
     TrailingState,
     TrailingStopFSM,
+    build_ccxt_adapter,
 )
 from altcoin_agent.screener import (
     FundingAnomalyDetector,
@@ -103,4 +106,7 @@ __all__ = [
     "TrailingState",
     "Reconciler",
     "CCXTExecutor",
+    "CCXTExchangeAdapter",
+    "ATRCalculator",
+    "build_ccxt_adapter",
 ]
