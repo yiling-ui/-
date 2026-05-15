@@ -1,0 +1,24 @@
+# Altcoin Agent V1.0 minimal config
+# Override via the same keys in your own config file (mounted into the
+# container at /app/config/app.yaml).
+
+exchanges:
+  - binance
+
+# ccxt unified-symbol form for USDT-margined perpetual swaps.
+symbols:
+  - BTC/USDT:USDT
+
+timeframes:
+  - 1m
+  - 5m
+
+healthz_port: 8080
+graceful_timeout_sec: 30
+initial_equity_usdt: 10000
+
+# Dry-run is the default. ALWAYS run a fresh deploy with dry_run: true for
+# at least 24 hours before flipping to false. main.py refuses to start
+# with dry_run: false in V1.0 because the live exchange adapter is not
+# yet wired into main.py.
+dry_run: true
