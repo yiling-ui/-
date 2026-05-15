@@ -49,7 +49,6 @@ from altcoin_agent.risk.state import Side
 from altcoin_agent.risk.trailing import TrailingState
 from altcoin_agent.screener import SignalEvent, SignalKind
 
-
 # --------------------------------------------------------------------------- #
 # Pretty-printing helpers
 # --------------------------------------------------------------------------- #

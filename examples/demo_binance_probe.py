@@ -56,11 +56,11 @@ async def scenario_a_no_auth() -> None:
                 kv(f"post[{i}].source", p.source_endpoint)
                 kv(f"post[{i}].url", p.url)
     except ScraperGeoBlocked as e:
-        print(f"    EXPECTED IN SANDBOX: ScraperGeoBlocked")
+        print("    EXPECTED IN SANDBOX: ScraperGeoBlocked")
         print(f"      reason: {e}")
         print("    Production fix: pass ProxyConfig(pool=[...residential VPN...]).")
     except ScraperAuthRequired as e:
-        print(f"    EXPECTED WITHOUT COOKIES: ScraperAuthRequired")
+        print("    EXPECTED WITHOUT COOKIES: ScraperAuthRequired")
         print(f"      reason: {e}")
         print("    Production fix: pass CookieJar.from_header_string(<browser-cookie>).")
     except ScraperError as e:

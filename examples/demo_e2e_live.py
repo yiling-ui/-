@@ -17,19 +17,15 @@ Run:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 
 from altcoin_agent.ai_engine import (
     AIVerdict,
     DeepSeekEngine,
     SMCContext,
-    SocialPost,
     build_user_prompt,
 )
 from altcoin_agent.social.crawler import (
-    MarketSnapshot,
-    SocialSnapshot,
     crawl_full_context,
 )
 
@@ -97,7 +93,7 @@ async def main() -> None:
     )
 
     # Print the prompt (truncated for readability)
-    print(f"\n  User prompt (first 1000 chars):\n")
+    print("\n  User prompt (first 1000 chars):\n")
     for line in prompt[:1000].split("\n"):
         print(f"    {line}")
     if len(prompt) > 1000:
@@ -150,7 +146,7 @@ async def main() -> None:
             ],
         )
 
-    print(f"\n  --- Verdict ---")
+    print("\n  --- Verdict ---")
     kv("intent", verdict.intent)
     kv("confidence_score", verdict.confidence_score)
     kv("kol_intent", verdict.kol_intent)

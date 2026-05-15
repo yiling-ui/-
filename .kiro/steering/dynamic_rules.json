@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-15T11:09:18.700183+00:00",
+  "rules": [
+    {
+      "feature_name": "oi_growth_pre1h",
+      "bucket": "pos_xlarge",
+      "side": "dump",
+      "hits": 2,
+      "total": 2,
+      "last_seen_iso": "2026-05-15T11:09:18Z",
+      "last_summary": "LLM unavailable; rule chosen by quantitative fallback."
+    },
+    {
+      "feature_name": "oi_price_decoupling",
+      "bucket": "pos_xlarge",
+      "side": "dump",
+      "hits": 2,
+      "total": 2,
+      "last_seen_iso": "2026-05-15T11:09:18Z",
+      "last_summary": "LLM unavailable; rule chosen by quantitative fallback."
+    },
+    {
+      "feature_name": "funding_pre2h_extreme",
+      "bucket": "positive",
+      "side": "dump",
+      "hits": 0,
+      "total": 2,
+      "last_seen_iso": "2026-05-15T11:09:18Z",
+      "last_summary": "LLM unavailable; rule chosen by quantitative fallback."
+    },
+    {
+      "feature_name": "volume_zscore_last1h",
+      "bucket": "pos_extreme",
+      "side": "dump",
+      "hits": 0,
+      "total": 2,
+      "last_seen_iso": "2026-05-15T11:09:18Z",
+      "last_summary": "LLM unavailable; rule chosen by quantitative fallback."
+    },
+    {
+      "feature_name": "wick_asymmetry_last30m",
+      "bucket": "neg_xlarge",
+      "side": "dump",
+      "hits": 0,
+      "total": 2,
+      "last_seen_iso": "2026-05-15T11:09:18Z",
+      "last_summary": "LLM unavailable; rule chosen by quantitative fallback."
+    },
+    {
+      "feature_name": "upper_wick_dominance_last1h",
+      "bucket": "pos_xlarge",
+      "side": "dump",
+      "hits": 0,
+      "total": 2,
+      "last_seen_iso": "2026-05-15T11:09:18Z",
+      "last_summary": "LLM unavailable; rule chosen by quantitative fallback."
+    }
+  ]
+}
