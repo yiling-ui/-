@@ -199,8 +199,8 @@ class FundingAnomalyDetector:
 
     def __init__(
         self,
-        extreme_low: float = -0.001,   # -0.1% / 8h
-        extreme_high: float = 0.0015,  # +0.15% / 8h
+        extreme_low: float = -0.001,   # -0.10% / 8h (short_squeeze: shorts crowded -> bias LONG)
+        extreme_high: float = 0.001,   # +0.10% / 8h (long_fragile: longs over-leveraged -> bias SHORT)
         consecutive: int = 2,
         short_window: int = 3,
         long_window: int = 24,
