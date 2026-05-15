@@ -376,27 +376,59 @@ class DelayedPostMortemScheduler:
     delay_sec: int = 3600
     _tasks: set[asyncio.Task] = field(default_factory=set)
 
-    def schedule(self, *, symbol: str, target_ts_ms: int) -> asyncio.Task:
+    def schedule(
+        self,
+        *,
+        symbol: str,
+        target_ts_ms: int,
+        entry_ts_ms: int | None = None,
+        expected_direction: str | None = None,
+    ) -> asyncio.Task:
+        """Schedule a delayed post-mortem.
+
+        Bug #2 fix: the live post-mortem path now passes ``entry_ts_ms``
+        (the moment we actually opened the position) and
+        ``expected_direction`` ("pump" for LONG / "dump" for SHORT) so
+        ``run_post_mortem`` slices ``[entry - 4h, entry + 1h]``, evaluates
+        the move strictly post-entry, and files the rule update under the
+        trader's intended direction even when the trade lost.
+        """
         task = asyncio.create_task(
-            self._run(symbol=symbol, target_ts_ms=target_ts_ms),
+            self._run(
+                symbol=symbol, target_ts_ms=target_ts_ms,
+                entry_ts_ms=entry_ts_ms,
+                expected_direction=expected_direction,
+            ),
             name=f"post_mortem:{symbol}:{target_ts_ms}",
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
 
-    async def _run(self, *, symbol: str, target_ts_ms: int) -> None:
+    async def _run(
+        self,
+        *,
+        symbol: str,
+        target_ts_ms: int,
+        entry_ts_ms: int | None = None,
+        expected_direction: str | None = None,
+    ) -> None:
         try:
             await asyncio.sleep(self.delay_sec)
         except asyncio.CancelledError:
             return
         try:
-            report = await run_post_mortem(
-                symbol=symbol,
-                target_ts_ms=target_ts_ms,
-                store=self.store,
-                engine=self.engine,
-            )
+            kwargs: dict[str, Any] = {
+                "symbol": symbol,
+                "target_ts_ms": target_ts_ms,
+                "store": self.store,
+                "engine": self.engine,
+            }
+            if entry_ts_ms is not None:
+                kwargs["entry_ts_ms"] = entry_ts_ms
+            if expected_direction is not None:
+                kwargs["expected_direction"] = expected_direction
+            report = await run_post_mortem(**kwargs)
             logger.info(
                 "post-mortem ran for %s: dir=%s mag=%.4f picks=%s",
                 symbol, report.result.direction, report.result.magnitude_pct,

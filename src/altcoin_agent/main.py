@@ -61,6 +61,7 @@ from altcoin_agent.risk import (
     RiskDecision,
     RiskGate,
     RiskGateConfig,
+    Side,
     TrailingState,
     TrailingStopFSM,
     build_ccxt_adapter,
@@ -700,12 +701,27 @@ class App:
             # Close the self-evolution loop: schedule a post-mortem 1h
             # after entry so the rules learned from this trade flow back
             # into the fuser via dynamic_rules.json.
+            #
+            # Bug #2 fix: pass ``entry_ts_ms`` (now, the moment we opened)
+            # and ``expected_direction`` derived from the position side.
+            # The post-mortem will then slice [entry-4h, entry+1h], extract
+            # features strictly from the pre-entry segment, and evaluate
+            # the realized move strictly post-entry — so we learn what
+            # predicted what we actually got, not what predicted some
+            # arbitrary extremum in the lookback window.
             if self._post_mortem is not None:
-                target_ts_ms = int(time.time() * 1000) + (
+                entry_ts_ms = int(time.time() * 1000)
+                target_ts_ms = entry_ts_ms + (
                     self._post_mortem.delay_sec * 1000
                 )
+                expected_direction = (
+                    "pump" if position.side == Side.LONG else "dump"
+                )
                 self._post_mortem.schedule(
-                    symbol=sig.symbol, target_ts_ms=target_ts_ms,
+                    symbol=sig.symbol,
+                    target_ts_ms=target_ts_ms,
+                    entry_ts_ms=entry_ts_ms,
+                    expected_direction=expected_direction,
                 )
                 self.state.post_mortems_scheduled += 1
         except Exception as e:
