@@ -108,6 +108,15 @@ class AppConfig:
     # Position-watcher (close lifecycle)
     position_watcher_poll_sec: float = 5.0
     position_watcher_miss_threshold: int = 2
+    # Bug #3 fix: trading-day rollover.
+    # ``rollover_anchor_utc_hour`` (0-23) defines when one trading day
+    # ends and the next begins. Default 0 == midnight UTC, the
+    # convention used by Binance reporting and most prop desks.
+    # ``rollover_poll_sec`` is how often the background ticker checks
+    # for a day flip; small enough to fire within ~minute of the
+    # boundary, large enough to be free.
+    rollover_anchor_utc_hour: int = 0
+    rollover_poll_sec: float = 60.0
 
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
@@ -139,6 +148,12 @@ class AppConfig:
             ),
             position_watcher_miss_threshold=int(
                 d.get("position_watcher_miss_threshold", 2),
+            ),
+            rollover_anchor_utc_hour=int(
+                d.get("rollover_anchor_utc_hour", 0),
+            ),
+            rollover_poll_sec=float(
+                d.get("rollover_poll_sec", 60.0),
             ),
         )
 
@@ -423,7 +438,13 @@ class App:
         account = AccountState(
             equity_usdt=self.cfg.initial_equity_usdt,
             starting_equity_today_usdt=self.cfg.initial_equity_usdt,
+            rollover_anchor_utc_hour=self.cfg.rollover_anchor_utc_hour,
         )
+        # Bug #3 fix: stamp the boot day so the first real flip resets
+        # daily counters cleanly. Without this, ``maybe_roll_over_day``
+        # called from any path (the worker, the hot path) would treat
+        # boot as a "first ever stamp" and never detect day 1 -> day 2.
+        account.maybe_roll_over_day()
 
         self.dashboard.health = self.state
         self.dashboard.account = account
@@ -689,12 +710,62 @@ class App:
                 logger.exception("position_watcher failed: %s", e)
                 self.state.last_error = f"position_watcher:{type(e).__name__}"
 
+        async def daily_rollover_worker() -> None:
+            """Bug #3 fix: poll for the UTC-day flip and reset daily-scoped
+            counters when it happens. Without this worker the daily
+            drawdown breaker and 3-strike rule would be one-way latches:
+            once tripped, they would never re-arm.
+
+            Polls every ``rollover_poll_sec``; the actual reset is
+            idempotent so missing a beat just delays the reset by one
+            tick. We also call the same primitive from the hot path
+            (``_handle_high_priority``) for defence-in-depth in case
+            this worker is suspended (e.g., long GC pause)."""
+            try:
+                while not self._stop_event.is_set():
+                    try:
+                        if account.maybe_roll_over_day():
+                            logger.info(
+                                "Daily rollover: starting_equity=%.2f, "
+                                "previous_pnl=%.2f, stops_yesterday=%d",
+                                account.starting_equity_today_usdt,
+                                account.realized_pnl_today_usdt,
+                                account.daily_stoploss_hits,
+                            )
+                            with suppress(Exception):
+                                await self.notifier.error(
+                                    "daily rollover applied",
+                                    payload={
+                                        "trading_day": account.last_rollover_date_utc,
+                                        "starting_equity_usdt": (
+                                            account.starting_equity_today_usdt
+                                        ),
+                                    },
+                                )
+                    except Exception as e:
+                        logger.exception("daily_rollover failed: %s", e)
+                        self.state.last_error = (
+                            f"daily_rollover:{type(e).__name__}"
+                        )
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(),
+                            timeout=self.cfg.rollover_poll_sec,
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+            except asyncio.CancelledError:
+                pass
+
         self._tasks.append(asyncio.create_task(fuse_worker(), name="fuse_worker"))
         self._tasks.append(asyncio.create_task(trailing_worker(), name="trailing_worker"))
         self._tasks.append(asyncio.create_task(screener_worker(), name="screener_worker"))
         self._tasks.append(asyncio.create_task(llm_worker(), name="llm_worker"))
         self._tasks.append(asyncio.create_task(
             position_watcher_worker(), name="position_watcher_worker",
+        ))
+        self._tasks.append(asyncio.create_task(
+            daily_rollover_worker(), name="daily_rollover_worker",
         ))
 
         await self._stop_event.wait()
@@ -716,6 +787,17 @@ class App:
         if sig.trigger_price is None or sig.trigger_price <= 0:
             logger.warning("missing trigger_price on %s; skipping order", sig.symbol)
             return
+
+        # Bug #3 fix (defence-in-depth): the background rollover worker
+        # is the primary trigger, but the hot path also calls this so a
+        # delayed worker (long GC, scheduler stall) cannot leave the
+        # daily-drawdown breaker latched on a fresh trading day.
+        if account.maybe_roll_over_day():
+            logger.info(
+                "Hot-path daily rollover applied (worker was late): "
+                "starting_equity=%.2f",
+                account.starting_equity_today_usdt,
+            )
 
         if sig.direction == Direction.LONG:
             initial_stop = sig.trigger_price * 0.95
