@@ -114,6 +114,97 @@ def test_sizer_below_min_notional_returns_zero() -> None:
     assert size == 0.0 and notional == 0.0
 
 
+def test_sizer_clamps_notional_to_leverage_cap_on_tight_stop() -> None:
+    """Bug #1 regression: a 0.05% stop on $10k equity used to produce
+    $300k notional (= 30x equity), well past the configured 15x long cap.
+    The clamp must hold the notional at exactly ``equity * leverage``,
+    and the returned ``risk_amount`` must reflect the *actual* dollar
+    risk that ends up at exchange, not the configured ``max_risk_per_trade``.
+    """
+    sizer = PositionSizer(
+        max_risk_per_trade=0.015,
+        leverage_cfg=DynamicLeverageConfig(
+            max_leverage_long=15.0, max_leverage_short=10.0,
+        ),
+    )
+    entry, stop = 100.0, 99.95          # 0.05% stop -> would risk-parity to 30x
+    size, notional, risk = sizer.compute_size(
+        equity_usdt=10_000.0, entry_price=entry, initial_stop=stop,
+        leverage=15.0,
+    )
+    # Clamped to equity * leverage
+    assert notional == pytest.approx(150_000.0)
+    assert size == pytest.approx(1_500.0)
+    # Actual risk is stop_distance * size = 0.05 * 1500 = $75
+    # (significantly LESS than the $150 risk_amount the formula would
+    # have implied; the operator now sees the real exposure).
+    assert risk == pytest.approx(75.0)
+
+
+def test_sizer_does_not_clamp_when_risk_parity_within_leverage_cap() -> None:
+    """Wide stops (5% here) produce a small notional that's well inside
+    the leverage cap; no clamping should occur, and risk_amount stays
+    at exactly ``equity * max_risk_per_trade``."""
+    sizer = PositionSizer(
+        max_risk_per_trade=0.015,
+        leverage_cfg=DynamicLeverageConfig(
+            max_leverage_long=15.0, max_leverage_short=10.0,
+        ),
+    )
+    size, notional, risk = sizer.compute_size(
+        equity_usdt=10_000.0, entry_price=1.000, initial_stop=0.95,
+        leverage=10.0,
+    )
+    # Risk-parity: notional = 150 / 0.05 = 3000, well under 10k * 10 = 100k
+    assert notional == pytest.approx(3000.0, rel=1e-3)
+    assert risk == pytest.approx(150.0, rel=1e-3)
+
+
+def test_sizer_clamps_to_short_cap_when_leverage_passed_in() -> None:
+    """SHORT side cap is tighter (10x default). With a tight stop the
+    clamp must respect that lower ceiling, not the 15x long cap."""
+    sizer = PositionSizer(
+        max_risk_per_trade=0.015,
+        leverage_cfg=DynamicLeverageConfig(
+            max_leverage_long=15.0, max_leverage_short=10.0,
+        ),
+    )
+    size, notional, _ = sizer.compute_size(
+        equity_usdt=10_000.0, entry_price=100.0, initial_stop=100.05,
+        leverage=10.0,
+    )
+    assert notional == pytest.approx(100_000.0)   # 10k * 10x
+    assert size == pytest.approx(1_000.0)
+
+
+def test_sizer_default_leverage_used_when_omitted() -> None:
+    """Back-compat: legacy callers that don't pass ``leverage`` still get a
+    safe behaviour — clamped to ``max_leverage_long`` (the side-agnostic
+    upper bound) so notional can never exceed configured caps."""
+    sizer = PositionSizer(
+        max_risk_per_trade=0.015,
+        leverage_cfg=DynamicLeverageConfig(
+            max_leverage_long=15.0, max_leverage_short=10.0,
+        ),
+    )
+    size, notional, _ = sizer.compute_size(
+        equity_usdt=10_000.0, entry_price=100.0, initial_stop=99.95,
+    )
+    # Defaulted to 15x -> notional capped at $150k
+    assert notional == pytest.approx(150_000.0)
+    assert size == pytest.approx(1_500.0)
+
+
+def test_sizer_rejects_zero_or_negative_leverage() -> None:
+    sizer = PositionSizer(max_risk_per_trade=0.015)
+    for bad in (0.0, -1.0):
+        size, notional, _ = sizer.compute_size(
+            equity_usdt=10_000.0, entry_price=1.0, initial_stop=0.95,
+            leverage=bad,
+        )
+        assert size == 0.0 and notional == 0.0
+
+
 def test_dynamic_leverage_long_at_top_score_high_liq() -> None:
     sizer = PositionSizer(leverage_cfg=DynamicLeverageConfig())
     lev = sizer.compute_leverage(
@@ -206,6 +297,34 @@ def test_gate_rejects_low_liquidity() -> None:
     )
     assert not d.approved
     assert "insufficient_liquidity" in d.reason
+
+
+def test_gate_tight_stop_does_not_exceed_leverage_cap() -> None:
+    """End-to-end Bug #1 regression: a 0.05% sweep stop on $10k equity used
+    to size to $300k notional (30x), tripping Binance's leverage limit.
+    The gate must now produce ``notional <= equity * leverage`` so the
+    order will actually rest cleanly on the venue."""
+    sizer = PositionSizer(
+        max_risk_per_trade=0.015,
+        leverage_cfg=DynamicLeverageConfig(
+            max_leverage_long=15.0, max_leverage_short=10.0,
+        ),
+    )
+    gate = RiskGate(sizer)
+    decision = gate.evaluate(
+        signal=_signal(score=100.0, trigger=100.0),
+        account=_account(),
+        current_price=100.0,
+        top5_depth_usdt=400_000,
+        realized_vol_pct=0.05,
+        initial_stop=99.95,            # 0.05% — the buggy case
+    )
+    assert decision.approved
+    assert decision.leverage is not None
+    # The hard invariant: notional <= equity * leverage. Pre-fix this was
+    # 30x; post-fix it must respect the configured cap.
+    assert decision.notional_usdt is not None
+    assert decision.notional_usdt <= 10_000.0 * decision.leverage + 1e-6
 
 
 def test_gate_sr1_dynamic_slippage_at_10x() -> None:
