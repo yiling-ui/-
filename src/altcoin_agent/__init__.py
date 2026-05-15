@@ -1,9 +1,46 @@
-"""Altcoin Momentum Agent — public API surface."""
+"""Altcoin Momentum Agent V1.0 — public API surface."""
+
 from altcoin_agent.ai_engine import (
     AIVerdict,
     DeepSeekEngine,
     EngineError,
     SocialPost,
+)
+from altcoin_agent.fuser import (
+    Direction,
+    FusedSignal,
+    FuserConfig,
+    RuleIndex,
+    ScoreFuser,
+)
+from altcoin_agent.learning_engine import (
+    DynamicRule,
+    HistoricalSlice,
+    PostMortemReport,
+    RuleStore,
+    extract_candidate_features,
+    fetch_historical_slice,
+    run_post_mortem,
+    synthesize_dump_slice,
+)
+from altcoin_agent.risk import (
+    AccountState,
+    ATRCalculator,
+    CCXTExchangeAdapter,
+    CCXTExecutor,
+    DynamicLeverageConfig,
+    ExchangeAdapter,
+    ExecutionError,
+    Position,
+    PositionSizer,
+    Reconciler,
+    RiskDecision,
+    RiskGate,
+    RiskGateConfig,
+    Side,
+    TrailingState,
+    TrailingStopFSM,
+    build_ccxt_adapter,
 )
 from altcoin_agent.screener import (
     FundingAnomalyDetector,
@@ -15,13 +52,16 @@ from altcoin_agent.screener import (
     OISurgeDetector,
     Screener,
     SignalEvent,
+    SignalKind,
     VolumeSpikeDetector,
+    WashTradingDetector,
 )
 
 __all__ = [
     # screener
     "Screener",
     "SignalEvent",
+    "SignalKind",
     "Kline",
     "FundingSnapshot",
     "OISnapshot",
@@ -30,9 +70,43 @@ __all__ = [
     "FundingAnomalyDetector",
     "OISurgeDetector",
     "LiquidityPoolAnalyzer",
+    "WashTradingDetector",
     # ai_engine
     "DeepSeekEngine",
     "AIVerdict",
     "SocialPost",
     "EngineError",
+    # fuser
+    "ScoreFuser",
+    "FuserConfig",
+    "FusedSignal",
+    "Direction",
+    "RuleIndex",
+    # learning engine
+    "RuleStore",
+    "DynamicRule",
+    "HistoricalSlice",
+    "PostMortemReport",
+    "fetch_historical_slice",
+    "extract_candidate_features",
+    "run_post_mortem",
+    "synthesize_dump_slice",
+    # risk
+    "Side",
+    "Position",
+    "AccountState",
+    "ExchangeAdapter",
+    "ExecutionError",
+    "PositionSizer",
+    "DynamicLeverageConfig",
+    "RiskGate",
+    "RiskGateConfig",
+    "RiskDecision",
+    "TrailingStopFSM",
+    "TrailingState",
+    "Reconciler",
+    "CCXTExecutor",
+    "CCXTExchangeAdapter",
+    "ATRCalculator",
+    "build_ccxt_adapter",
 ]
