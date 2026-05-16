@@ -348,7 +348,15 @@ class FuserConfig:
     require_min_rule_score: float = 35.0
 
     # Learned-rule application
-    learned_min_samples: int = 3                # below this -> no effect
+    #
+    # Audit #18: ``learned_min_samples`` was 3, which gave a freshly-
+    # learnt rule a Laplace-shrunk hit_rate of (3+1)/(3+2) = 80% after
+    # only 3 samples — well within the noise floor for any financial
+    # time-series. We raise the default to 10 so a rule needs at least
+    # 7 wins out of 10 attempts (or equivalent) before it can move the
+    # final score by anything material. Operators that want the old,
+    # eager learning behaviour can drop this back via YAML.
+    learned_min_samples: int = 10               # below this -> no effect
     learned_reward_lift_cap: float = 0.20       # +20% max boost
     learned_penalty_lift_cap: float = 0.30      # -30% max penalty
     learned_overall_reward_cap: float = 1.30    # final reward never > 1.30x
