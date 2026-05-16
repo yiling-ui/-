@@ -63,6 +63,8 @@ from altcoin_agent.risk import (
     RiskDecision,
     RiskGate,
     RiskGateConfig,
+    RollingConfig,
+    RollingController,
     Side,
     TrailingState,
     TrailingStopFSM,
@@ -119,6 +121,25 @@ class AppConfig:
     rollover_anchor_utc_hour: int = 0
     rollover_poll_sec: float = 60.0
 
+    # ------------------------------------------------------------------ #
+    # Rolling positions (滚仓 / pyramid-add).
+    #
+    # Default OFF: enabling this is a deliberate operator decision
+    # because it adds same-side exposure to a winning position and
+    # therefore both the upside AND the path-dependent downside scale
+    # with each new leg. See .kiro/specs/.../rolling-positions.md for
+    # the full risk model.
+    # ------------------------------------------------------------------ #
+    rolling_enabled: bool = False
+    rolling_trigger_r_levels: tuple[float, ...] = (1.5, 3.0, 5.0)
+    rolling_unrealized_pnl_ratio: float = 0.5
+    rolling_leg_stop_pct: float = 0.025
+    rolling_max_legs_per_symbol: int = 3
+    rolling_min_interval_sec: int = 60
+    rolling_auto_disable_on_failure: bool = True
+    rolling_require_strategy_min_score: float = 85.0
+    rolling_require_min_rule_score: float = 35.0
+
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
         try:
@@ -155,6 +176,33 @@ class AppConfig:
             ),
             rollover_poll_sec=float(
                 d.get("rollover_poll_sec", 60.0),
+            ),
+            rolling_enabled=bool(d.get("rolling_enabled", False)),
+            rolling_trigger_r_levels=tuple(
+                float(x) for x in d.get(
+                    "rolling_trigger_r_levels", (1.5, 3.0, 5.0)
+                )
+            ),
+            rolling_unrealized_pnl_ratio=float(
+                d.get("rolling_unrealized_pnl_ratio", 0.5),
+            ),
+            rolling_leg_stop_pct=float(
+                d.get("rolling_leg_stop_pct", 0.025),
+            ),
+            rolling_max_legs_per_symbol=int(
+                d.get("rolling_max_legs_per_symbol", 3),
+            ),
+            rolling_min_interval_sec=int(
+                d.get("rolling_min_interval_sec", 60),
+            ),
+            rolling_auto_disable_on_failure=bool(
+                d.get("rolling_auto_disable_on_failure", True),
+            ),
+            rolling_require_strategy_min_score=float(
+                d.get("rolling_require_strategy_min_score", 85.0),
+            ),
+            rolling_require_min_rule_score=float(
+                d.get("rolling_require_min_rule_score", 35.0),
             ),
         )
 
@@ -374,13 +422,23 @@ class _Tracked:
 
 @dataclass
 class TrailingController:
-    """Per-symbol trailing FSM state machine."""
+    """Per-symbol trailing FSM state machine.
+
+    Optionally also drives the rolling-positions controller on each
+    kline tick: after the FSM is given the chance to tighten the stop,
+    the rolling controller is consulted with the same live bar and may
+    add a new same-side leg if all gates pass. The rolling step is a
+    pure no-op when ``rolling`` is None or its ``cfg.enabled`` is False.
+    """
 
     fsm: TrailingStopFSM
     atr: ATRCalculator
     executor: CCXTExecutor
     account: AccountState
     health: HealthState
+    rolling: RollingController | None = None
+    rolling_top5_depth_usdt: float = 200_000.0
+    rolling_realized_vol_pct: float = 0.05
     _by_symbol: dict[str, _Tracked] = field(default_factory=dict)
 
     def attach(self, position: Position) -> None:
@@ -401,16 +459,50 @@ class TrailingController:
             current_state=tracked.state,
         )
         tracked.state = next_state
-        if new_stop is None:
-            return
-        ok = await self.executor.tighten_hard_stop(tracked.position, new_stop)
-        if ok:
-            logger.info("trailing %s: %s -> stop %s (atr=%.5f)",
-                        symbol, reason, new_stop, atr)
-        else:
-            logger.warning("trailing %s: tighten FAILED (%s); position may be naked",
-                           symbol, reason)
-            self.health.last_error = f"trailing tighten failed on {symbol}"
+        if new_stop is not None:
+            ok = await self.executor.tighten_hard_stop(tracked.position, new_stop)
+            if ok:
+                logger.info("trailing %s: %s -> stop %s (atr=%.5f)",
+                            symbol, reason, new_stop, atr)
+            else:
+                logger.warning(
+                    "trailing %s: tighten FAILED (%s); position may be naked",
+                    symbol, reason,
+                )
+                self.health.last_error = f"trailing tighten failed on {symbol}"
+
+        # Rolling-positions evaluation. We run it AFTER the trailing tick
+        # so that whatever the FSM just did to the stop is the baseline
+        # the rolling controller's gate sees. Any failure is logged but
+        # never escapes -- the trailing path is the safety-critical one
+        # and must not be blocked by the (optional) rolling path.
+        if self.rolling is not None and self.rolling.cfg.enabled:
+            try:
+                decision = await self.rolling.maybe_roll(
+                    position=tracked.position,
+                    account=self.account,
+                    top5_depth_usdt=self.rolling_top5_depth_usdt,
+                    realized_vol_pct=self.rolling_realized_vol_pct,
+                    now_ms=int(bar.ts),
+                )
+                if decision.fired:
+                    logger.info(
+                        "rolling %s: leg added at R=%.2f size=%.4f notional=%.2f",
+                        symbol,
+                        decision.next_threshold_r or 0.0,
+                        decision.new_leg_size or 0.0,
+                        decision.new_leg_notional or 0.0,
+                    )
+                elif decision.reason not in (
+                    "disabled", "no_next_threshold", "min_interval_active",
+                    "no_unrealised_pnl",
+                ):
+                    # Other reasons (gate rejected, strategy changed, etc.)
+                    # are interesting enough to log at debug.
+                    logger.debug("rolling %s: skipped (%s)", symbol, decision.reason)
+            except Exception as e:
+                logger.exception("rolling on_kline %s failed: %s", symbol, e)
+                self.health.last_error = f"rolling:{type(e).__name__}"
 
 
 # --------------------------------------------------------------------- #
@@ -437,6 +529,7 @@ class App:
     _llm_engine: DeepSeekEngine | None = None
     _post_mortem: DelayedPostMortemScheduler | None = None
     _llm_consultor: LLMConsultor | None = None
+    _rolling: RollingController | None = None
 
     async def run(self) -> None:
         self.state.started_at = time.time()
@@ -587,6 +680,81 @@ class App:
                 self.cfg.dynamic_rules_path,
             )
         fuser = ScoreFuser(sink=fused_sink, config=FuserConfig(**fuser_cfg_kwargs))
+
+        # ----- Rolling-positions controller (optional) -----
+        # Default OFF: rolling adds same-side exposure to a winning
+        # position, scaling both upside and the path-dependent downside
+        # with each new leg. It must be turned on deliberately.
+        # When enabled, it is driven from the trailing worker on every
+        # kline tick: see TrailingController.on_kline.
+        if self.cfg.rolling_enabled:
+            rolling_cfg = RollingConfig(
+                enabled=True,
+                trigger_r_levels=self.cfg.rolling_trigger_r_levels,
+                unrealized_pnl_ratio=self.cfg.rolling_unrealized_pnl_ratio,
+                leg_stop_pct=self.cfg.rolling_leg_stop_pct,
+                max_legs_per_symbol=self.cfg.rolling_max_legs_per_symbol,
+                min_interval_sec=self.cfg.rolling_min_interval_sec,
+                auto_disable_on_failure=(
+                    self.cfg.rolling_auto_disable_on_failure
+                ),
+                require_strategy_min_score=(
+                    self.cfg.rolling_require_strategy_min_score
+                ),
+                require_min_rule_score=(
+                    self.cfg.rolling_require_min_rule_score
+                ),
+            )
+
+            async def _rolling_quote(symbol: str) -> float:
+                # Reuse the same Bug #2 fail-closed live-quote path the
+                # entry hot path uses: tests can swap in
+                # ``app.quote_provider``, production uses the adapter.
+                return await self._get_live_quote(symbol)
+
+            async def _notify_roll(payload: dict[str, Any]) -> None:
+                # Push to dashboard + notifier; failures do not propagate.
+                with suppress(Exception):
+                    self.dashboard.push_signal({
+                        **payload, "kind": "rolling_leg_added",
+                    })
+                with suppress(Exception):
+                    if self.notifier is not None:
+                        await self.notifier.signal({
+                            "kind": "rolling_leg_added", **payload,
+                        })
+
+            async def _notify_roll_error(
+                msg: str, payload: dict[str, Any] | None = None,
+            ) -> None:
+                with suppress(Exception):
+                    if self.notifier is not None:
+                        await self.notifier.error(msg, payload=payload)
+                self.state.last_error = msg
+
+            self._rolling = RollingController(
+                cfg=rolling_cfg,
+                sizer=sizer,
+                gate=gate,
+                executor=executor,
+                fuser=fuser,
+                quote_provider=_rolling_quote,
+                notify_roll=_notify_roll,
+                notify_error=_notify_roll_error,
+            )
+            trailing.rolling = self._rolling
+            trailing.rolling_top5_depth_usdt = self.cfg.min_liquidity_usdt
+            logger.info(
+                "Rolling positions ENABLED: trigger_r=%s ratio=%.2f "
+                "leg_stop=%.3f max_legs=%d",
+                rolling_cfg.trigger_r_levels,
+                rolling_cfg.unrealized_pnl_ratio,
+                rolling_cfg.leg_stop_pct,
+                rolling_cfg.max_legs_per_symbol,
+            )
+        else:
+            self._rolling = None
+            logger.info("Rolling positions disabled (cfg.rolling_enabled=False)")
 
         # ----- LLM engine + online learning loop -----
         # The engine reads DEEPSEEK_API_KEY from env. If unset, we don't even
@@ -986,7 +1154,19 @@ class App:
                win — feeds the per-symbol cooldown.
             5. Detach the trailing FSM tracker (no more cancel/replace on a
                ghost position).
-            6. Push to dashboard, notify Telegram.
+            6. Reset rolling-controller state for this symbol so the next
+               position on the same symbol starts with a clean ladder.
+            7. Push to dashboard, notify Telegram.
+
+        Multi-leg correctness:
+            ``position.entry_price`` is leg 0's fill price; ``position.size``
+            is the legacy single-leg size. After a roll, the truth lives in
+            ``position.legs`` and is exposed via ``avg_entry_price`` /
+            ``total_size``. We use those here so the realised PnL credited
+            to the daily ledger reflects what actually closed -- otherwise
+            a 1.0 -> 1.10 leg-0 + 1.10 -> 1.10 leg-1 close would credit
+            extra phantom PnL (size_legacy * leg_0_delta) instead of the
+            true (total_size * weighted_delta).
 
         Failure modes are all logged and swallowed: by the time we get
         here the exchange has already done the close, our job is purely
@@ -1001,11 +1181,18 @@ class App:
         fill_price = position.current_stop
         r_unit = position.r_unit
 
+        # Multi-leg PnL: use weighted-avg entry and aggregate size so a
+        # rolled position's PnL reflects the whole book, not just leg 0.
+        # For V1.0 single-leg positions these properties degrade to the
+        # legacy ``entry_price`` / ``size`` so behaviour is unchanged.
+        avg_entry = position.avg_entry_price
+        total_size = position.total_size
+
         if position.side == Side.LONG:
-            price_delta = fill_price - position.entry_price
+            price_delta = fill_price - avg_entry
         else:
-            price_delta = position.entry_price - fill_price
-        realized_pnl_usdt = price_delta * position.size
+            price_delta = avg_entry - fill_price
+        realized_pnl_usdt = price_delta * total_size
         realized_r = (price_delta / r_unit) if r_unit > 0 else 0.0
         is_loss = realized_pnl_usdt < 0
 
@@ -1025,27 +1212,49 @@ class App:
         # 5) detach trailing tracker
         trailing.detach(symbol)
 
+        # 6) Reset rolling controller's per-symbol bookkeeping so the
+        #    next position on this symbol starts with an empty
+        #    fired-thresholds set. Without this, residual state from a
+        #    prior position (e.g. {1.5} R already fired) would suppress
+        #    the first roll on the new one. Safe no-op when the
+        #    controller hasn't been wired (cfg.rolling.enabled=False).
+        rolling = getattr(self, "_rolling", None)
+        if rolling is not None:
+            with suppress(Exception):
+                rolling.reset_for_symbol(symbol)
+
+        # Note: ``account.open_positions.pop`` and ``position.closed=True``
+        # are already done by PositionWatcher before this callback runs;
+        # we don't redo them here.
+
         self.state.closed_positions += 1
         self.state.last_close_ts = time.time()
         self.state.open_positions = len(account.open_positions)
 
+        legs_info = (
+            f" legs={len(position.legs)}"
+            if position.legs and len(position.legs) > 1
+            else ""
+        )
         logger.info(
-            "CLOSED %s %s size=%.4f entry=%.6f fill=%.6f pnl=%.4f R=%.2f reason=%s",
-            position.side.value, symbol, position.size,
-            position.entry_price, fill_price,
-            realized_pnl_usdt, realized_r, reason,
+            "CLOSED %s %s size=%.4f avg_entry=%.6f fill=%.6f "
+            "pnl=%.4f R=%.2f reason=%s%s",
+            position.side.value, symbol, total_size,
+            avg_entry, fill_price,
+            realized_pnl_usdt, realized_r, reason, legs_info,
         )
 
         closed_payload = {
             "ts": int(time.time() * 1000),
             "symbol": symbol,
             "side": position.side.value,
-            "size": position.size,
-            "entry_price": position.entry_price,
+            "size": total_size,
+            "entry_price": avg_entry,
             "fill_price": fill_price,
             "realized_pnl_usdt": round(realized_pnl_usdt, 6),
             "realized_r": round(realized_r, 4),
             "reason": reason,
+            "num_legs": len(position.legs) if position.legs else 1,
         }
         with suppress(Exception):
             self.dashboard.push_close(closed_payload)
