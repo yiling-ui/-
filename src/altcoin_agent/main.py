@@ -50,6 +50,7 @@ from altcoin_agent.pipeline import (
     cookie_jar_from_env,
     proxy_config_from_env,
 )
+from altcoin_agent.price_tape import PriceTape, PriceTapeConfig
 from altcoin_agent.risk import (
     AccountState,
     ATRCalculator,
@@ -140,6 +141,33 @@ class AppConfig:
     rolling_require_strategy_min_score: float = 85.0
     rolling_require_min_rule_score: float = 35.0
 
+    # ------------------------------------------------------------------ #
+    # Low-latency hot-path knobs (for high-volatility altcoins).
+    #
+    # ``anti_chase_*`` and ``vol_kill_*`` configure the price-tape gate;
+    # see ``altcoin_agent.price_tape.PriceTapeConfig`` for the full
+    # rationale. Defaults are calibrated for typical Binance perp
+    # altcoin pump-and-dump behaviour — refuse to enter when the move
+    # has already run away from us, and refuse to enter while the tape
+    # is in a 60-second whipsaw cascade.
+    #
+    # ``telegram_fire_and_forget`` decouples Telegram I/O from the
+    # order placement hot path: when True, ``notifier.signal`` is
+    # spawned as a background task instead of awaited inline, saving
+    # 100–800 ms of HTTPS RTT before the venue order goes out.
+    #
+    # ``use_uvloop`` swaps in uvloop's event-loop policy at startup
+    # when available. Typically a 30–60% throughput improvement on the
+    # async hot path; safe to leave on if uvloop is installed.
+    # ------------------------------------------------------------------ #
+    anti_chase_window_ms: int = 30_000
+    anti_chase_max_move_pct: float = 0.025
+    vol_kill_window_ms: int = 60_000
+    vol_kill_range_pct: float = 0.08
+    price_tape_max_samples: int = 5_000
+    telegram_fire_and_forget: bool = True
+    use_uvloop: bool = True
+
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
         try:
@@ -204,6 +232,17 @@ class AppConfig:
             rolling_require_min_rule_score=float(
                 d.get("rolling_require_min_rule_score", 35.0),
             ),
+            anti_chase_window_ms=int(d.get("anti_chase_window_ms", 30_000)),
+            anti_chase_max_move_pct=float(
+                d.get("anti_chase_max_move_pct", 0.025)
+            ),
+            vol_kill_window_ms=int(d.get("vol_kill_window_ms", 60_000)),
+            vol_kill_range_pct=float(d.get("vol_kill_range_pct", 0.08)),
+            price_tape_max_samples=int(d.get("price_tape_max_samples", 5_000)),
+            telegram_fire_and_forget=bool(
+                d.get("telegram_fire_and_forget", True)
+            ),
+            use_uvloop=bool(d.get("use_uvloop", True)),
         )
 
 
@@ -530,6 +569,7 @@ class App:
     _post_mortem: DelayedPostMortemScheduler | None = None
     _llm_consultor: LLMConsultor | None = None
     _rolling: RollingController | None = None
+    _price_tape: PriceTape | None = None
 
     async def run(self) -> None:
         self.state.started_at = time.time()
@@ -557,6 +597,19 @@ class App:
             min_liquidity_usdt=self.cfg.min_liquidity_usdt,
         ))
         atr = ATRCalculator()
+        # Anti-chase / vol-kill price tape (low-latency hot-path defence).
+        # Fed by the screener's kline wrapper below and consulted by the
+        # risk gate before any networked check. See price_tape.py for
+        # the rationale.
+        self._price_tape = PriceTape(
+            cfg=PriceTapeConfig(
+                anti_chase_window_ms=self.cfg.anti_chase_window_ms,
+                anti_chase_max_move_pct=self.cfg.anti_chase_max_move_pct,
+                vol_kill_window_ms=self.cfg.vol_kill_window_ms,
+                vol_kill_range_pct=self.cfg.vol_kill_range_pct,
+                max_samples_per_symbol=self.cfg.price_tape_max_samples,
+            )
+        )
         account = AccountState(
             equity_usdt=self.cfg.initial_equity_usdt,
             starting_equity_today_usdt=self.cfg.initial_equity_usdt,
@@ -644,6 +697,11 @@ class App:
         original_on_oi = self._screener.on_oi
 
         async def on_kline_wrapper(exchange: str, symbol: str, bar: Kline) -> None:
+            # Feed the price tape on every WS kline update (including
+            # intra-bar). This is the data source for the anti-chase /
+            # vol-kill gates; missing it would make those gates no-ops.
+            if self._price_tape is not None:
+                self._price_tape.observe(symbol, bar.close, int(bar.ts))
             with suppress(asyncio.QueueFull):
                 kline_q.put_nowait((exchange, symbol, bar))
             await original_on_kline(exchange, symbol, bar)
@@ -667,7 +725,20 @@ class App:
             payload["ts_ms"] = int(time.time() * 1000)
             self.dashboard.push_signal(payload)
             logger.info("HIGH PRIORITY: %s", payload)
-            await self.notifier.signal(payload)
+            # Telegram notification is a 100–800 ms HTTPS round-trip.
+            # In altcoin pump scenarios that's enough time for the
+            # mark to drift past the SR-1 cap. When
+            # ``cfg.telegram_fire_and_forget`` is True (default) we
+            # spawn the notify as a background task so the order
+            # placement starts immediately. Failures are swallowed by
+            # the notifier itself.
+            if self.cfg.telegram_fire_and_forget:
+                asyncio.create_task(
+                    self._safe_notify_signal(payload),
+                    name="notify_signal_bg",
+                )
+            else:
+                await self.notifier.signal(payload)
             await self._handle_high_priority(
                 sig=sig, gate=gate, executor=executor,
                 trailing=trailing, account=account,
@@ -968,6 +1039,18 @@ class App:
         await self._stop_event.wait()
         await self._shutdown()
 
+    async def _safe_notify_signal(self, payload: dict[str, Any]) -> None:
+        """Telegram-notify the high-priority signal without raising.
+
+        Used as a fire-and-forget background task from ``fused_sink``
+        when ``cfg.telegram_fire_and_forget`` is True (default). Any
+        exception is logged and swallowed; we never want a failed
+        notification to crash the order pipeline."""
+        try:
+            await self.notifier.signal(payload)
+        except Exception as e:
+            logger.warning("notify_signal background task failed: %s", e)
+
     async def _get_live_quote(self, symbol: str) -> float:
         """Return a fresh mark/last price for ``symbol``.
 
@@ -1057,6 +1140,7 @@ class App:
             top5_depth_usdt=self.cfg.min_liquidity_usdt,
             realized_vol_pct=0.05,
             initial_stop=initial_stop,
+            price_tape=self._price_tape,
         )
         if not decision.approved:
             logger.info("Risk Gate REJECT %s: %s", sig.symbol, decision.reason)
@@ -1354,6 +1438,18 @@ def main() -> None:
         cfg.dry_run = False
     if os.getenv("DASHBOARD_ENABLED", "true").lower() in ("0", "false", "no"):
         cfg.dashboard_enabled = False
+
+    # uvloop: 30–60% throughput improvement on the asyncio hot path.
+    # Optional dependency; fall back to the stdlib loop if not
+    # installed. Disable via cfg.use_uvloop=False (e.g. for Windows or
+    # reproducibility-critical tests).
+    if cfg.use_uvloop:
+        try:
+            import uvloop  # type: ignore[import-not-found]
+            uvloop.install()
+            logger.info("uvloop event loop installed")
+        except ImportError:
+            logger.info("uvloop not installed; using stdlib asyncio loop")
 
     app = App(cfg=cfg)
     loop = asyncio.new_event_loop()
