@@ -42,6 +42,17 @@ from altcoin_agent.dashboard import DashboardState, make_dashboard_app
 from altcoin_agent.fuser import Direction, FusedSignal, FuserConfig, ScoreFuser
 from altcoin_agent.learning_engine import RuleStore
 from altcoin_agent.notifier import Notifier, build_default_notifier
+from altcoin_agent.observability import (
+    DeadLetterQueue,
+    DLQEntry,
+    MetricsRegistry,
+    bind_trace_id,
+    build_default_registry,
+)
+from altcoin_agent.observability.metrics import DefaultMetrics
+from altcoin_agent.observability.structured_log import (
+    configure_structured_logging,
+)
 from altcoin_agent.pipeline import (
     CandidateGate,
     DelayedPostMortemScheduler,
@@ -75,6 +86,7 @@ from altcoin_agent.risk import (
     RollingConfig,
     RollingController,
     Side,
+    SQLiteAccountStore,
     TrailingState,
     TrailingStopFSM,
     build_ccxt_adapter,
@@ -263,6 +275,50 @@ class AppConfig:
     decision_audit_log_path: str = "logs/decisions.jsonl"
 
     # ------------------------------------------------------------------ #
+    # Phase B.2 — observability (metrics + structured logs + DLQ).
+    #
+    # ``metrics_enabled`` toggles the Phase B.2.1 :class:`MetricsRegistry`.
+    # When True, ``/metrics`` returns BOTH the legacy hand-rolled gauges
+    # AND the full registry render (~30 metrics including histograms
+    # for order/LLM/persistence latency and counters with reject-reason
+    # / partial-fill labels).
+    #
+    # ``structured_logging_enabled`` swaps the root logger formatter to
+    # JSON and binds a ``trace_id`` per high-priority decision so the
+    # ~10-hop pipeline is grep-correlatable (screener -> fuser -> LLM ->
+    # gate -> executor -> trailing).
+    #
+    # ``dlq_enabled`` writes one JSONL line per unrecoverable failure
+    # (executor exceptions, quote/depth/vol unavailable, naked
+    # emergency-close, stop-replace failures) under
+    # ``dlq_path``. Failures are rotated like ``decision_audit_log_path``.
+    #
+    # All three default OFF so existing dry-run / integration tests
+    # keep their byte-for-byte log shapes; operators flip them on in
+    # ``app.yaml`` for production. Phase B.2 doesn't modify any
+    # behaviour visible to the trading hot path -- just adds
+    # side-channel observability.
+    # ------------------------------------------------------------------ #
+    metrics_enabled: bool = False
+    structured_logging_enabled: bool = False
+    dlq_enabled: bool = False
+    dlq_path: str = ".kiro/state/dlq/main.jsonl"
+
+    # ------------------------------------------------------------------ #
+    # Phase B.3 — state persistence backend.
+    #
+    # ``persistence_backend`` selects between the original JSON
+    # ``AccountPersistor`` (default, byte-for-byte unchanged) and the
+    # Phase B.3.1 :class:`SQLiteAccountStore`. The SQLite backend
+    # writes the same snapshot fields PLUS an append-only
+    # ``state_log`` table for postmortem reconstruction across days.
+    # ``account_persistence_sqlite_path`` is the SQLite file (WAL
+    # journal sits next to it).
+    # ------------------------------------------------------------------ #
+    persistence_backend: str = "json"  # "json" | "sqlite"
+    account_persistence_sqlite_path: str = ".kiro/state/account.sqlite3"
+
+    # ------------------------------------------------------------------ #
     # Phase A — opportunity-cost penalty pipeline.
     #
     # The miss-penalty worker runs once per UTC day and (a) audits the
@@ -438,6 +494,23 @@ class AppConfig:
             decision_audit_log_path=str(
                 d.get("decision_audit_log_path", "logs/decisions.jsonl"),
             ),
+            # Phase B.2 — observability.
+            metrics_enabled=bool(d.get("metrics_enabled", False)),
+            structured_logging_enabled=bool(
+                d.get("structured_logging_enabled", False),
+            ),
+            dlq_enabled=bool(d.get("dlq_enabled", False)),
+            dlq_path=str(d.get("dlq_path", ".kiro/state/dlq/main.jsonl")),
+            # Phase B.3 — persistence backend.
+            persistence_backend=str(
+                d.get("persistence_backend", "json"),
+            ),
+            account_persistence_sqlite_path=str(
+                d.get(
+                    "account_persistence_sqlite_path",
+                    ".kiro/state/account.sqlite3",
+                ),
+            ),
             # Phase A — miss-penalty pipeline.
             miss_penalty_enabled=bool(d.get("miss_penalty_enabled", False)),
             miss_penalty_state_dir=str(
@@ -508,7 +581,20 @@ class HealthState:
     last_error: str | None = None
 
 
-async def make_health_app(state: HealthState) -> web.Application:
+async def make_health_app(
+    state: HealthState,
+    *,
+    metrics_registry: Any = None,
+) -> web.Application:
+    """Build the healthz + /metrics aiohttp app.
+
+    Phase B.2.1 hook: when ``metrics_registry`` is a
+    :class:`altcoin_agent.observability.MetricsRegistry`, its rendered
+    Prometheus text is appended after the legacy hand-rolled gauges so
+    existing test-shape assertions (``altcoin_agent_up 1.0``,
+    ``altcoin_agent_high_priority_count 7``) keep matching while the
+    operator gets the full Phase B.2 metric set in the SAME scrape.
+    """
     async def healthz(_request: web.Request) -> web.Response:
         ok = (
             state.fuser_alive
@@ -586,8 +672,19 @@ async def make_health_app(state: HealthState) -> web.Application:
               "Total post-mortem learning passes scheduled after open")
         gauge("last_signal_ts", state.last_signal_ts,
               "Wall-clock ts of most-recent screener event")
+        text = "\n".join(lines) + "\n"
+        # Phase B.2.1: append the rich registry's Prometheus payload.
+        # Render failures must NEVER block the health endpoint, so we
+        # swallow exceptions and emit a comment line instead.
+        if metrics_registry is not None:
+            try:
+                extra = metrics_registry.render()
+                if extra:
+                    text += extra
+            except Exception as e:  # pragma: no cover - defensive
+                text += f"# RENDER_ERROR registry: {e}\n"
         return web.Response(
-            text="\n".join(lines) + "\n",
+            text=text,
             content_type="text/plain",
             charset="utf-8",
         )
@@ -1021,11 +1118,15 @@ class App:
     # construct it based on cfg.* flags. Tests can pre-populate these
     # to inject mocks before calling run().
     _persistor: AccountPersistor | None = None
+    _sqlite_store: SQLiteAccountStore | None = None
     _regime_filter: RegimeFilter | None = None
     _cluster_map: ClusterMap | None = None
     _cluster_cap_cfg: ClusterCapConfig | None = None
     _kill_switch: KillSwitchWatcher | None = None
     _decision_audit_log: DecisionAuditLog | None = None
+    # Phase B.2 — observability slots (None = feature off).
+    _metrics: DefaultMetrics | None = None
+    _dlq: DeadLetterQueue | None = None
     # Phase A — opportunity-cost penalty pipeline. Built by ``run`` when
     # ``cfg.miss_penalty_enabled`` is True; ``_handle_high_priority``
     # consults ``_reflection`` to honour the suspension window.
@@ -1042,6 +1143,46 @@ class App:
         if self.notifier is None:
             self.notifier = build_default_notifier()
         logger.info("Notifier: %s", self.notifier.name)
+
+        # ----- Phase B.2 — observability bootstrap -----
+        # Order matters: structured logging first so subsequent INFO
+        # lines emitted from the rest of run() are JSON; then metrics
+        # registry (consumed by the metrics endpoint and observed at
+        # mutation hooks); then DLQ. All three are opt-in; when off
+        # the daemon's behaviour is byte-for-byte identical to v1.0.
+        if self.cfg.structured_logging_enabled:
+            try:
+                configure_structured_logging(service="altcoin-agent")
+                logger.info(
+                    "structured logging enabled (JSON formatter active)",
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "structured logging setup failed (swallowed): %s", e,
+                )
+
+        if self.cfg.metrics_enabled and self._metrics is None:
+            try:
+                self._metrics = build_default_registry()
+                logger.info(
+                    "metrics registry enabled (~30 metrics under "
+                    "altcoin_agent_*)",
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "metrics registry setup failed (swallowed): %s", e,
+                )
+                self._metrics = None
+
+        if self.cfg.dlq_enabled and self._dlq is None:
+            try:
+                self._dlq = DeadLetterQueue(path=Path(self.cfg.dlq_path))
+                logger.info("DLQ enabled at %s", self.cfg.dlq_path)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "DLQ setup failed (swallowed): %s", e,
+                )
+                self._dlq = None
 
         # ----- adapter selection -----
         if self.cfg.dry_run:
@@ -1085,17 +1226,42 @@ class App:
         # equity baseline at the new equity level — that would erase
         # yesterday's drawdown). When restore fails, ``account`` keeps
         # its constructor defaults and we proceed cleanly.
+        #
+        # Phase B.3.1: ``cfg.persistence_backend`` selects between the
+        # JSON-file ``AccountPersistor`` and the SQLite-WAL
+        # ``SQLiteAccountStore``. Both expose ``save(account)`` /
+        # ``restore_into(account)`` with identical semantics so the
+        # change-listener hook below is backend-agnostic. When
+        # ``backend == "sqlite"`` the SQLite store is wired to BOTH
+        # ``self._sqlite_store`` (for tests + history queries) AND
+        # ``self._persistor`` (single var for the change listener).
         if self.cfg.account_persistence_enabled and self._persistor is None:
-            self._persistor = AccountPersistor(
-                path=Path(self.cfg.account_persistence_path),
-            )
+            backend = (self.cfg.persistence_backend or "json").lower()
+            if backend == "sqlite":
+                if self._sqlite_store is None:
+                    self._sqlite_store = SQLiteAccountStore(
+                        path=Path(self.cfg.account_persistence_sqlite_path),
+                    )
+                self._persistor = self._sqlite_store  # type: ignore[assignment]
+                logger.info(
+                    "AccountState persistence backend: sqlite (path=%s)",
+                    self.cfg.account_persistence_sqlite_path,
+                )
+            else:
+                self._persistor = AccountPersistor(
+                    path=Path(self.cfg.account_persistence_path),
+                )
+                if backend != "json":
+                    logger.warning(
+                        "unknown persistence_backend=%r; falling back to json",
+                        self.cfg.persistence_backend,
+                    )
         if self._persistor is not None:
             restored = self._persistor.restore_into(account)
             if restored:
                 logger.info(
-                    "AccountState restored from %s: equity=%.2f, "
+                    "AccountState restored: equity=%.2f, "
                     "today_pnl=%.2f, stops_today=%d, halted=%s",
-                    self._persistor.path,
                     account.equity_usdt,
                     account.realized_pnl_today_usdt,
                     account.daily_stoploss_hits,
@@ -1103,8 +1269,8 @@ class App:
                 )
             else:
                 logger.info(
-                    "AccountState persistence: no prior snapshot at %s "
-                    "(starting fresh)", self._persistor.path,
+                    "AccountState persistence: no prior snapshot "
+                    "(starting fresh)",
                 )
             # Phase B.1.3: hook the persistor into AccountState's
             # change-notification channel. From this point forward
@@ -1473,7 +1639,10 @@ class App:
         # non-loopback address without a token. Operators that need
         # remote access SSH-tunnel to 127.0.0.1:8081 or set a token in
         # their .env file.
-        health_app = await make_health_app(self.state)
+        health_app = await make_health_app(
+            self.state,
+            metrics_registry=self._metrics.registry if self._metrics else None,
+        )
         self._runner = web.AppRunner(health_app)
         await self._runner.setup()
         health_site = web.TCPSite(
@@ -1748,6 +1917,141 @@ class App:
             await self.notifier.signal(payload)
         except Exception as e:
             logger.warning("notify_signal background task failed: %s", e)
+
+    # ------------------------------------------------------------------ #
+    # Phase B.2 — reject-counter / DLQ helpers.
+    #
+    # Both side-channel observability paths are conditional: when
+    # ``self._metrics`` / ``self._dlq`` are None the calls are
+    # cheap no-ops and the daemon's behaviour is byte-for-byte
+    # identical to v1.0. We deliberately bucket reasons into a small
+    # set of canonical labels to prevent Prometheus label-cardinality
+    # explosions from per-symbol or per-error-class strings.
+    # ------------------------------------------------------------------ #
+
+    # Canonical reason labels for the orders_rejected_total counter.
+    # The free-form reason string still goes to the DLQ payload, but
+    # the metric carries a coarse bucket so cardinality stays bounded.
+    _REJECT_REASON_BUCKETS = (
+        "anti_chase", "vol_kill", "min_liquidity",
+        "consecutive_loss_cooldown", "daily_drawdown",
+        "max_concurrent_positions", "regime_filter", "cluster_cap",
+        "kill_switch", "reflection_mode_suspended",
+        "quote_unavailable", "depth_unavailable", "vol_unavailable",
+        "executor_exception",
+    )
+
+    @classmethod
+    def _bucket_reject_reason(cls, raw_reason: str) -> str:
+        """Map a free-form reject reason to one of the canonical
+        buckets. Falls back to ``"other"`` so the cardinality is
+        bounded at len(_REJECT_REASON_BUCKETS) + 1.
+        """
+        if not raw_reason:
+            return "other"
+        lower = raw_reason.lower()
+        for bucket in cls._REJECT_REASON_BUCKETS:
+            if bucket in lower:
+                return bucket
+        return "other"
+
+    def _record_rejection(
+        self,
+        *,
+        symbol: str,
+        reason: str,
+        kind: str = "gate_reject",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Bump the rejection counter and (optionally) write to DLQ.
+
+        Idempotent + side-effect-only: the caller has already done
+        ``self.state.orders_rejected += 1`` and pushed to the
+        dashboard ring buffer; this method only adds the Phase B.2
+        side-channel observations. Always swallows exceptions so a
+        flaky disk / metrics bug never blocks the trading hot path.
+        """
+        if self._metrics is not None:
+            try:
+                bucket = self._bucket_reject_reason(reason)
+                self._metrics.orders_rejected_total.inc(
+                    labels={"reason": bucket},
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "metrics orders_rejected_total inc failed: %s", e,
+                )
+        if self._dlq is not None:
+            try:
+                self._dlq.put(DLQEntry(
+                    kind=kind,
+                    symbol=symbol,
+                    reason=reason,
+                    payload=payload or {},
+                ))
+                if self._metrics is not None:
+                    with suppress(Exception):
+                        self._metrics.dlq_writes_total.inc(
+                            labels={"kind": kind},
+                        )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("DLQ write failed: %s", e)
+
+    def _record_order_placed(
+        self,
+        *,
+        symbol: str,
+        side: str,
+    ) -> None:
+        """Bump the per-symbol/side ``orders_placed_total`` counter.
+
+        Cardinality safeguard: ``Counter.inc`` already rejects new
+        label combinations beyond ``max_label_cardinality=500``, so a
+        screener mis-config that floods the counter with thousands of
+        symbols downgrades to "no new series", not a crash.
+        """
+        if self._metrics is None:
+            return
+        try:
+            self._metrics.orders_placed_total.inc(
+                labels={"symbol": symbol, "side": side},
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "metrics orders_placed_total inc failed: %s", e,
+            )
+
+    def _sync_account_gauges(self, account: AccountState) -> None:
+        """Refresh the gauges that mirror ``AccountState``.
+
+        Called after every state mutation that the operator might want
+        plotted (open positions, halt, drawdown). Never raises.
+        """
+        if self._metrics is None:
+            return
+        try:
+            self._metrics.open_positions.set(len(account.open_positions))
+            self._metrics.halt_engaged.set(
+                1.0 if account.global_trading_halted else 0.0,
+            )
+            self._metrics.cooldown_symbols.set(
+                len(account.cooldown_until_ts_ms),
+            )
+            self._metrics.daily_stoploss_hits.set(
+                float(account.daily_stoploss_hits),
+            )
+            self._metrics.daily_drawdown_pct.set(
+                float(account.daily_drawdown_pct),
+            )
+            if account.consecutive_losses:
+                self._metrics.consecutive_losses_max.set(
+                    float(max(account.consecutive_losses.values())),
+                )
+            else:
+                self._metrics.consecutive_losses_max.set(0.0)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("metrics sync_account_gauges failed: %s", e)
+
 
     # ------------------------------------------------------------------ #
     # Phase A — miss-penalty + reflection-mode wiring
@@ -2087,6 +2391,21 @@ class App:
             logger.warning("missing trigger_price on %s; skipping order", sig.symbol)
             return
 
+        # Phase B.2.2: bind a trace id for the duration of this
+        # decision. ``str(sig.ts)`` is what the audit log uses too,
+        # so a single grep on ``trace_id`` pulls every JSON line +
+        # every audit row associated with this signal. Bound at the
+        # top so the reflection-suspension path also gets it.
+        bind_trace_id(str(sig.ts))
+        # Phase B.2.1: count high-priority signals by direction. This
+        # is one of the gauges/counters the operator monitors to see
+        # "is the screener emitting at all?".
+        if self._metrics is not None:
+            with suppress(Exception):
+                self._metrics.high_priority_signals_total.inc(
+                    labels={"direction": sig.direction.value},
+                )
+
         # Phase A — reflection mode suspension.
         #
         # When the controller has paused the daemon (because the last
@@ -2106,6 +2425,10 @@ class App:
             reason = (
                 f"reflection_mode_suspended:final_score={sig.final_score:.1f}"
                 f"<{self.cfg.reflection_a_quadrant_bypass_score:.1f}"
+            )
+            self._record_rejection(
+                symbol=sig.symbol, reason=reason,
+                kind="reflection_mode_suspended",
             )
             if self._decision_audit_log is not None:
                 with suppress(Exception):
@@ -2161,6 +2484,12 @@ class App:
                 "reason": f"quote_unavailable:{type(e).__name__}",
             }
             self.dashboard.push_rejection(rej)
+            self._record_rejection(
+                symbol=sig.symbol,
+                reason=rej["reason"],
+                kind="quote_unavailable",
+                payload={"signal": sig.as_dict()},
+            )
             with suppress(Exception):
                 await self.notifier.rejected(rej)
             return
@@ -2201,6 +2530,12 @@ class App:
                 "reason": f"depth_unavailable:{type(e).__name__}",
             }
             self.dashboard.push_rejection(rej)
+            self._record_rejection(
+                symbol=sig.symbol,
+                reason=rej["reason"],
+                kind="depth_unavailable",
+                payload={"signal": sig.as_dict()},
+            )
             with suppress(Exception):
                 await self.notifier.rejected(rej)
             return
@@ -2238,6 +2573,12 @@ class App:
                     "reason": "vol_unavailable:cold_tape",
                 }
                 self.dashboard.push_rejection(rej)
+                self._record_rejection(
+                    symbol=sig.symbol,
+                    reason=rej["reason"],
+                    kind="vol_unavailable",
+                    payload={"signal": sig.as_dict()},
+                )
                 with suppress(Exception):
                     await self.notifier.rejected(rej)
                 return
@@ -2291,6 +2632,11 @@ class App:
             rej = {"ts": int(time.time() * 1000),
                    "symbol": sig.symbol, "reason": decision.reason}
             self.dashboard.push_rejection(rej)
+            self._record_rejection(
+                symbol=sig.symbol,
+                reason=str(decision.reason),
+                kind="gate_reject",
+            )
             with suppress(Exception):
                 await self.notifier.rejected(rej)
             return
@@ -2304,6 +2650,10 @@ class App:
             )
             self.state.orders_placed += 1
             self.state.open_positions = len(account.open_positions)
+            self._record_order_placed(
+                symbol=sig.symbol, side=position.side.value,
+            )
+            self._sync_account_gauges(account)
             trailing.attach(position)
             logger.info(
                 "OPENED %s %s size=%.4f lev=%.2f stop=%.6f",
@@ -2354,6 +2704,15 @@ class App:
             logger.exception("Executor failed for %s: %s", sig.symbol, e)
             self.state.last_error = f"executor:{type(e).__name__}"
             self.state.orders_rejected += 1
+            self._record_rejection(
+                symbol=sig.symbol,
+                reason=f"executor_exception:{type(e).__name__}:{e}",
+                kind="executor_exception",
+                payload={
+                    "signal": sig.as_dict(),
+                    "exc_type": type(e).__name__,
+                },
+            )
             with suppress(Exception):
                 await self.notifier.error(f"executor failed for {sig.symbol}: {e}")
 
