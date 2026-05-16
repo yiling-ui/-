@@ -61,6 +61,85 @@ class RegimeFilterConfig:
     # Hard cap on memory; ~1 sample/sec for an hour = 3600. We keep
     # twice that as headroom for noisy intra-bar updates.
     max_samples: int = 8_000
+    # Audit P2 #14: the smallest kline cadence the operator's screener
+    # is configured to push. If ``btc_window_ms`` is too short to fit
+    # ``min_samples`` *bars at this cadence*, the gate would be stuck
+    # in cold-tape forever. We default to 60s to match the 1m kline
+    # the rest of the daemon uses; operators that wire 5s/10s mark
+    # streams should override this so the validation reflects reality.
+    expected_sample_interval_ms: int = 60_000
+
+    def __post_init__(self) -> None:
+        """Validate the config so a misconfigured value doesn't silently
+        render the regime gate inert (or, just as bad, always-on for
+        a degenerate tape).
+
+        We raise ``ValueError`` for hard-impossible values (zero/negative
+        windows or sample counts) and for the specific case the audit
+        flagged: a window so short that it can't hold ``min_samples``
+        bars at the expected cadence. A warning-level log is emitted
+        for soft-suspicious values (negative thresholds) so the
+        operator notices on boot without the daemon crashing if they
+        deliberately set those to zero to disable a side.
+        """
+        if self.btc_window_ms <= 0:
+            raise ValueError(
+                f"RegimeFilterConfig.btc_window_ms must be > 0; "
+                f"got {self.btc_window_ms}"
+            )
+        if self.min_samples <= 0:
+            raise ValueError(
+                f"RegimeFilterConfig.min_samples must be > 0; "
+                f"got {self.min_samples}"
+            )
+        if self.max_samples < self.min_samples:
+            raise ValueError(
+                f"RegimeFilterConfig.max_samples ({self.max_samples}) must be "
+                f">= min_samples ({self.min_samples})"
+            )
+        if self.expected_sample_interval_ms <= 0:
+            raise ValueError(
+                "RegimeFilterConfig.expected_sample_interval_ms must be > 0; "
+                f"got {self.expected_sample_interval_ms}"
+            )
+        # Audit P2 #14: the killer combo — a 5-minute window that
+        # cannot possibly hold the default 10 samples of 1-minute
+        # bars. Without this check the filter looks "on" in the
+        # config dump but ``allow_direction`` is permanently
+        # cold-tape => forever fail-open.
+        #
+        # Capacity = floor(window / interval) + 1 because a stream
+        # at exactly ``interval`` cadence can fit samples at
+        # t=0, interval, 2*interval, ..., k*interval for k =
+        # floor(window/interval), giving k+1 samples within
+        # ``[0, window]``. Using just ``floor`` would over-reject
+        # boundary configs (e.g. ``window=60s, interval=60s,
+        # min_samples=2`` is fine: samples at t=0 and t=60s are 2
+        # samples in a 60s window).
+        capacity = (self.btc_window_ms // self.expected_sample_interval_ms) + 1
+        if capacity < self.min_samples:
+            raise ValueError(
+                "RegimeFilterConfig: btc_window_ms="
+                f"{self.btc_window_ms}ms can hold at most {capacity} "
+                f"samples at expected_sample_interval_ms="
+                f"{self.expected_sample_interval_ms}ms, but "
+                f"min_samples={self.min_samples}. The gate would be "
+                "permanently cold-tape and never engage. Either widen "
+                "the window, lower min_samples, or override "
+                "expected_sample_interval_ms to match a faster stream."
+            )
+        # Soft checks — log only, don't crash, since "0 = disable
+        # this side" is a reasonable operator intent.
+        if self.btc_drop_block_long_pct < 0 or self.btc_rip_block_short_pct < 0:
+            logger.warning(
+                "RegimeFilterConfig has negative threshold(s): "
+                "drop_block_long=%.4f rip_block_short=%.4f — these are "
+                "interpreted as fractions, not percentages, and "
+                "negative values invert the gate. Double-check your "
+                "config.",
+                self.btc_drop_block_long_pct,
+                self.btc_rip_block_short_pct,
+            )
 
 
 @dataclass
