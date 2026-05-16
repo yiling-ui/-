@@ -214,6 +214,48 @@ class PriceTape:
         directional = raw if side == Side.LONG else -raw
         return (directional > cap), directional
 
+    def realized_vol_pct(
+        self,
+        *,
+        symbol: str,
+        window_ms: int = 60_000,
+        now_ms: int | None = None,
+    ) -> float | None:
+        """Estimate realized volatility as ``(high - low) / mid`` over the
+        last ``window_ms``.
+
+        This is a deliberate Parkinson-style range estimator (cheap, no
+        return series needed) used by the risk gate to size a position
+        with a venue-realistic vol number for the actual symbol —
+        BTC vs PEPE differ by an order of magnitude here. Bug C4 fix:
+        ``main._handle_high_priority`` used to hard-code 0.05 (BTC-grade).
+
+        Returns ``None`` when the tape doesn't have enough samples in
+        the window. Callers MUST fail-closed in that case rather than
+        substitute a guess.
+        """
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        cutoff = now_ms - window_ms
+        buf = self._samples.get(symbol)
+        if buf is None or len(buf) < 2:
+            return None
+        hi: float | None = None
+        lo: float | None = None
+        n_in_window = 0
+        for ts, p in buf:
+            if ts < cutoff:
+                continue
+            n_in_window += 1
+            hi = p if hi is None else max(hi, p)
+            lo = p if lo is None else min(lo, p)
+        if hi is None or lo is None or n_in_window < 2:
+            return None
+        mid = (hi + lo) / 2.0
+        if mid <= 0:
+            return None
+        return (hi - lo) / mid
+
     def vol_kill_breach(
         self,
         *,
