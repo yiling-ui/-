@@ -7,6 +7,14 @@ Contract:
           + symbol cooldown + critical alert.
 
 Soft stops (in-process Python timers, etc.) are explicitly not allowed.
+
+Rolling positions:
+    ``add_leg`` extends an existing position with a new same-side market
+    order, then replaces the single resting STOP_MARKET so its size
+    reflects the new aggregate ``total_size``. The same fail-closed
+    posture as ``open`` applies: if we cannot resize the stop, we
+    EMERGENCY-CLOSE the entire position (legs are inseparable on the
+    venue), set the symbol cooldown, and raise.
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from altcoin_agent.risk.gate import RiskDecision
-from altcoin_agent.risk.state import AccountState, Position, Side
+from altcoin_agent.risk.state import AccountState, Position, PositionLeg, Side
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +162,126 @@ class CCXTExecutor:
             stop_order_id=str(stop_resp.get("id") or ""),
             trace_id=trace_id,
         )
+        # Rolling-positions bookkeeping: leg 0 is the original entry.
+        # Subsequent ``add_leg`` calls append; trailing/sizing always
+        # reads from ``legs`` when present.
+        pos.legs.append(PositionLeg(
+            leg_id=0, side=decision.side, size=decision.size,
+            entry_price=avg_price, margin_source="initial",
+        ))
         account.open_positions[symbol] = pos
         return pos
+
+    async def add_leg(
+        self,
+        *,
+        position: Position,
+        size: float,
+        current_price: float,
+        new_stop_for_full: float | None = None,
+        account: AccountState | None = None,
+        trigger_score: float | None = None,
+    ) -> PositionLeg:
+        """Append a new same-side leg to an open position.
+
+        Steps (parallel to ``open``):
+          1. market_order(side=position.side, size=new_leg_size).
+          2. Resize the resting STOP_MARKET to cover ``total_size``. If
+             ``new_stop_for_full`` is provided, also tighten to that price
+             (used when trailing has already moved past the original stop).
+             Otherwise keep ``position.current_stop`` and only resize.
+          3. On stop-replacement failure: emergency-close the ENTIRE
+             position (single venue-side stop covers all legs; we cannot
+             leave a partially-protected position).
+
+        The returned PositionLeg is also appended to ``position.legs``,
+        and ``position.size`` (the legacy field) is updated to the new
+        ``total_size`` so downstream code that hasn't been migrated to
+        the legs API still sees the right aggregate.
+
+        Raises ``ExecutionError`` on any unrecoverable failure. The
+        caller is expected to log + notify; the position has already
+        been emergency-closed in that case.
+        """
+        if position.closed:
+            raise ExecutionError("add_leg called on closed position")
+        if size <= 0:
+            raise ExecutionError(f"add_leg with non-positive size: {size}")
+        if account is None:
+            raise ExecutionError("add_leg requires account for cooldown")
+
+        old_size = position.total_size
+
+        # 1) market order on the SAME side as the existing position.
+        entry_resp = await self.adapter.market_order(
+            symbol=position.symbol,
+            side=position.side,
+            size=size,
+            price=current_price,
+            reduce_only=False,
+        )
+        avg_price = float(
+            entry_resp.get("average") or entry_resp.get("price") or current_price
+        )
+
+        # 2) Replace the resting stop so it covers the new aggregate size.
+        # We piggyback on tighten_hard_stop's cancel+place+restore-on-failure
+        # semantics, but pass through the EXISTING current_stop unless the
+        # caller asked for a different one. The new stop's size (which the
+        # venue actually cares about) is read from ``position.size``, so
+        # we update that BEFORE the call.
+        next_leg_id = (max((L.leg_id for L in position.legs), default=-1) + 1)
+        leg = PositionLeg(
+            leg_id=next_leg_id,
+            side=position.side,
+            size=size,
+            entry_price=avg_price,
+            margin_source="rolled_unrealized",
+            trigger_score=trigger_score,
+        )
+        position.legs.append(leg)
+        # Keep the legacy ``size`` field in sync. The trailing FSM and
+        # stop-placement code path read ``position.size`` directly.
+        position.size = old_size + size
+
+        target_stop = (
+            new_stop_for_full
+            if new_stop_for_full is not None
+            else position.current_stop
+        )
+        ok = await self.tighten_hard_stop(position, target_stop)
+        if not ok:
+            # CRITICAL: a leg is in but stop is now smaller than total
+            # exposure (or completely missing). Single venue-side stop
+            # cannot protect a partial position; emergency-close the
+            # whole thing.
+            logger.critical(
+                "add_leg: stop resize FAILED for %s — emergency-closing all "
+                "%d legs (total_size=%.6f)",
+                position.symbol, len(position.legs), position.size,
+            )
+            try:
+                await self.adapter.market_order(
+                    symbol=position.symbol,
+                    side=position.side.opposite,
+                    size=position.size,
+                    price=current_price,
+                    reduce_only=True,
+                )
+            except Exception as e:
+                logger.critical(
+                    "EMERGENCY CLOSE on add_leg also failed for %s: %s — "
+                    "manual intervention required",
+                    position.symbol, e,
+                )
+            account.set_cooldown(
+                position.symbol, self.stop_failure_cooldown_sec, now_ms_default(),
+            )
+            position.closed = True
+            raise ExecutionError(
+                f"add_leg_stop_resize_failed:{position.symbol}",
+            )
+        return leg
 
     async def tighten_hard_stop(
         self,

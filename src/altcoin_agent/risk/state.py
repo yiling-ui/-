@@ -17,8 +17,40 @@ class Side(str, Enum):
 
 
 @dataclass
+class PositionLeg:
+    """A single executed entry within a (possibly rolled) position.
+
+    Bug-rolling fix: a position is now a *bag of legs*, all sharing one
+    trailing stop. Leg 0 is always the original entry; legs 1+ are
+    rolled additions whose margin came from the position's unrealised
+    PnL at the moment of the roll.
+
+    Invariants:
+      * All legs share the same ``side`` (rolling never reverses direction).
+      * ``margin_source`` is "initial" for leg 0 and "rolled_unrealized"
+        for additions.
+      * ``size`` is in base units, exactly like ``Position.size``.
+    """
+
+    leg_id: int
+    side: Side
+    size: float
+    entry_price: float
+    entry_ts_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    margin_source: str = "initial"   # "initial" | "rolled_unrealized"
+    trigger_score: float | None = None  # FusedSignal.final_score at time of roll
+
+
+@dataclass
 class Position:
-    """A live position with all the bookkeeping the trailing FSM needs."""
+    """A live position with all the bookkeeping the trailing FSM needs.
+
+    Multi-leg support (rolling positions):
+      ``legs`` is the source of truth for size / avg entry once a roll
+      happens. When ``legs`` is empty (V1.0 path), ``size`` and
+      ``entry_price`` are used directly so all existing behaviour is
+      preserved verbatim.
+    """
 
     symbol: str
     exchange: str
@@ -32,11 +64,59 @@ class Position:
     opened_at_ts_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     trace_id: str | None = None
     closed: bool = False
+    legs: list[PositionLeg] = field(default_factory=list)
 
     @property
     def r_unit(self) -> float:
-        """1R distance — always positive."""
+        """1R distance — always positive.
+
+        Computed from the *original* entry / initial_stop because that is
+        what the trailing FSM keys its breakeven and trailing-armed
+        thresholds off. Adding rolled legs must not change what '1R from
+        the original setup' means.
+        """
         return abs(self.entry_price - self.initial_stop)
+
+    @property
+    def total_size(self) -> float:
+        """Sum of all leg sizes. For a V1.0 single-leg position
+        (``legs == []``) this returns ``self.size`` so callers that
+        haven't been adapted still see the right number."""
+        if not self.legs:
+            return self.size
+        return sum(L.size for L in self.legs)
+
+    @property
+    def avg_entry_price(self) -> float:
+        """Size-weighted average entry across all legs.
+
+        Used by the rolling controller to compute unrealised PnL for the
+        whole position. Falls back to ``entry_price`` when no legs are
+        recorded (V1.0 path)."""
+        if not self.legs:
+            return self.entry_price
+        total = sum(L.size for L in self.legs)
+        if total <= 0:
+            return self.entry_price
+        return sum(L.size * L.entry_price for L in self.legs) / total
+
+    @property
+    def num_rolled_legs(self) -> int:
+        """Number of *added* legs (excluding the original)."""
+        if not self.legs:
+            return 0
+        return max(0, len(self.legs) - 1)
+
+    def unrealised_pnl_usdt(self, mark_price: float) -> float:
+        """Unrealised PnL across all legs at ``mark_price``.
+
+        Sign matches conventional long/short: positive == in profit.
+        """
+        if mark_price <= 0:
+            return 0.0
+        if self.side == Side.LONG:
+            return (mark_price - self.avg_entry_price) * self.total_size
+        return (self.avg_entry_price - mark_price) * self.total_size
 
 
 @dataclass
