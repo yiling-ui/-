@@ -22,6 +22,16 @@ the audit explicitly says manual halts must be sticky by design.
 
 The reason string carries a marker (``KILL_SWITCH:``) so the release
 path can tell its own halts apart from ones it shouldn't touch.
+
+Audit P2 #17
+------------
+The constructor previously accepted any ``Path`` value, including
+the empty default ``Path()`` which resolves to ``Path(".")``. Since
+``os.path.exists(".")`` is unconditionally ``True``, an operator
+who forgot to set ``kill_switch_path`` in ``app.yaml`` would have
+the kill switch fire on every poll → permanent halt. We now reject
+empty / current-directory / root-directory paths at construction
+time.
 """
 
 from __future__ import annotations
@@ -39,6 +49,13 @@ logger = logging.getLogger(__name__)
 
 
 _KILL_SWITCH_PREFIX = "KILL_SWITCH:"
+
+# Audit P2 #17: paths that would make ``os.path.exists`` return True
+# unconditionally and turn the kill switch into a stuck-halted footgun.
+# We reject these at construction time.
+_FORBIDDEN_KILL_SWITCH_PATHS: frozenset[str] = frozenset({
+    "", ".", "/", "./",
+})
 
 
 @dataclass
@@ -64,6 +81,32 @@ class KillSwitchWatcher:
         on_halt: Callable[[str], Awaitable[None]] | None = None,
         on_release: Callable[[str], Awaitable[None]] | None = None,
     ):
+        # Audit P2 #17: validate the sentinel path before we ever
+        # poll. An empty / current-dir / root path always exists,
+        # which would engage the halt on the first poll and never
+        # let go — exactly the opposite of "operator-controlled".
+        # We only enforce this when the watcher is enabled; a
+        # disabled watcher is a no-op so the path doesn't matter.
+        if cfg.enabled:
+            raw = str(cfg.path).strip()
+            if raw in _FORBIDDEN_KILL_SWITCH_PATHS:
+                raise ValueError(
+                    "KillSwitchConfig.path must point to a sentinel "
+                    "file, not the current/root directory; got "
+                    f"{cfg.path!r}. Set kill_switch_path in app.yaml "
+                    "to e.g. '.kiro/state/HALT'."
+                )
+            # Reject paths that resolve to an existing directory.
+            # If the operator passes a directory by accident,
+            # ``os.path.exists`` would be True forever just like the
+            # empty-path case.
+            if cfg.path.is_dir():
+                raise ValueError(
+                    "KillSwitchConfig.path points to an existing "
+                    f"directory ({cfg.path!r}); the kill switch needs "
+                    "a file path. Pick something like "
+                    f"{cfg.path}/HALT instead."
+                )
         self.cfg = cfg
         self.account = account
         self.on_halt = on_halt
@@ -109,7 +152,8 @@ class KillSwitchWatcher:
                     logger.warning(
                         "kill switch on_halt notify swallowed: %s", e,
                     )
-        elif not present and self._engaged:
+            return
+        if not present and self._engaged:
             # Only release if the current halt reason came from us;
             # never undo a manual halt set by other code paths.
             cur_reason = self.account.halt_reason or ""
@@ -128,8 +172,18 @@ class KillSwitchWatcher:
                             "kill switch on_release notify swallowed: %s",
                             e,
                         )
+            # Audit P2 #18 regression case: when the file is removed
+            # but a manual halt is in place, we leave ``halt_reason``
+            # alone and just clear our engaged flag. The next file
+            # appearance will re-engage normally; meanwhile manual
+            # halts stay sticky.
             self._engaged = False
-        elif not present:
+            return
+        if not present:
             # File absent and we never engaged — nothing to do.
             return
-        # else: present and engaged — steady state.
+        # Audit P2 #16: explicit return for the steady-state branch
+        # (file present + already engaged). Without this, a future
+        # edit at the bottom of the function could accidentally run
+        # on every poll while the kill switch is held down.
+        return
