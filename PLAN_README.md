@@ -90,7 +90,8 @@ Phase B.5 + QUADRANT Phase 4-5（10 天）
 - ✅ Phase B.4 (回测引擎：matching engine + 滑点模型 + walk-forward + data_adapter) — feat/phase-b4-backtest-engine
 - ✅ Phase 4 (训练系统：rule_miner + walk-forward trainer + 80% 晋升门槛 + B.4.4 实盘/回测一致性 e2e) — feat/phase-4-trainer
 - ✅ Phase B.5 + QUADRANT Phase 5 部分 (LLMEngine 接 cache + budget_manager + LLMPreRater 后台 worker + QuadrantRiskFactory) — feat/phase-5-llm-prerate
-- ⏭️  下一步：把 LLMPreRater + QuadrantRiskFactory 接入 main.py（操作员真正打开 dry-run 之前最后一步）；30 天 dry-run；Phase B.6 OpenTelemetry trace
+- ✅ Phase 5 main.py 接入 (cfg flags + slots + 启停生命周期 + 整合测试) — feat/phase-5-mainpy-wiring
+- ⏭️  下一步：操作员把真实 ccxt 历史数据拉下来跑 walk-forward trainer 出 production_rules.json；30 天 dry-run；Phase B.6 OpenTelemetry trace；操作员手动改 dry_run: false 启用实盘
 
 ---
 
