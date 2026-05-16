@@ -320,8 +320,8 @@ Phase B.4: 回测引擎 (10 天) ← 最大块
 
 Phase B.5: LLM Pre-Rate (5 天)
   ├─ B.5.1: cache 实现                ✅ src/altcoin_agent/llm/cache.py (Phase 1-3 落地)
-  ├─ B.5.2: 后台 pre-rate worker       ⏭ Phase 4 / 5
-  └─ B.5.3: token budget 集成          ⏭ Phase 5（TokenBudgetManager 已建好，缺 ai_engine 接入）
+  ├─ B.5.2: 后台 pre-rate worker       ✅ src/altcoin_agent/llm/pre_rater.py — A 象限 + score>=70 队列模式，预算锁死自动丢弃
+  └─ B.5.3: token budget 集成          ✅ ai_engine.LLMEngine 增加 cache + budget_manager 参数；命中 0 token，FREEZE 模式合成 neutral verdict
 
 Phase B.6: OpenTelemetry trace (3 天)
   └─ B.6.1: 全链路 instrumentation
