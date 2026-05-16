@@ -250,6 +250,47 @@ class CCXTExchangeAdapter:
                 return price
         raise RuntimeError(f"no usable price in ticker for {symbol}: {t!r}")
 
+    async def fetch_top_depth_usdt(
+        self, symbol: str, *, levels: int = 5,
+    ) -> float:
+        """Estimate top-N order-book depth in USDT (sum of both sides).
+
+        Bug C4 fix: ``RiskGate.evaluate`` previously got this value
+        hard-coded to ``cfg.min_liquidity_usdt`` from the hot path,
+        which equates "we don't know" with "exactly the floor" —
+        SR-2's liquidity gate then approves every signal at the floor.
+
+        We sum ``price * size`` over the first ``levels`` rows of bids
+        and asks and return the total. Raises ``RuntimeError`` if the
+        venue doesn't return a usable book; the caller MUST fail-closed.
+        """
+        if not hasattr(self.client, "fetch_order_book"):
+            raise RuntimeError(
+                f"{self.exchange_name} client has no fetch_order_book",
+            )
+        ob = await self.client.fetch_order_book(  # type: ignore[attr-defined]
+            symbol, levels,
+        )
+        if not isinstance(ob, dict):
+            raise RuntimeError(f"unexpected order-book shape for {symbol}: {ob!r}")
+        total = 0.0
+        for side_key in ("bids", "asks"):
+            rows = ob.get(side_key) or []
+            for row in rows[:levels]:
+                # ccxt rows: [price, size, ...]
+                if not row or len(row) < 2:
+                    continue
+                try:
+                    price = float(row[0])
+                    size = float(row[1])
+                except (TypeError, ValueError):
+                    continue
+                if price > 0 and size > 0:
+                    total += price * size
+        if total <= 0:
+            raise RuntimeError(f"empty order book for {symbol}")
+        return total
+
     async def fetch_open_orders(self) -> list[dict[str, Any]]:
         raw = await self.client.fetch_open_orders()
         out: list[dict[str, Any]] = []

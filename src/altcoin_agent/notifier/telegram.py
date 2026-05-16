@@ -70,7 +70,17 @@ class NullNotifier:
 
 @dataclass
 class TelegramNotifier:
-    """Telegram bot notifier using sendMessage with HTML parse mode."""
+    """Telegram bot notifier using sendMessage with HTML parse mode.
+
+    Bug C2 fix: the bot token used to be baked into ``client.base_url``
+    as ``/bot{token}``. That meant any httpx exception (timeout, 5xx,
+    DNS failure) would carry the full URL in its ``repr`` and end up
+    in stdout / Sentry / log shippers — leaking the token to anyone
+    with log access. We now keep ``base_url=api_base`` and put the
+    token only in the request *path* (and request-time header), and
+    every error path runs ``_redact`` over the rendered exception
+    before it touches the logger.
+    """
 
     bot_token: str
     chat_id: str
@@ -82,25 +92,42 @@ class TelegramNotifier:
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
-                base_url=f"{self.api_base}/bot{self.bot_token}",
+                base_url=self.api_base,
                 timeout=self.timeout,
             )
         return self._client
 
+    def _redact(self, s: str) -> str:
+        """Strip the bot token from a string before logging.
+
+        We replace both the bare token and the ``/bot<token>`` URL
+        substring so anything httpx might emit (URL, repr of
+        Request/Response, traceback frames) is safe to log.
+        """
+        if not self.bot_token:
+            return s
+        return (s
+                .replace(f"/bot{self.bot_token}", "/bot***REDACTED***")
+                .replace(self.bot_token, "***REDACTED***"))
+
     async def _send(self, html: str) -> None:
         try:
             client = await self._get_client()
-            r = await client.post("/sendMessage", json={
-                "chat_id": self.chat_id,
-                "text": html,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            })
+            r = await client.post(
+                f"/bot{self.bot_token}/sendMessage",
+                json={
+                    "chat_id": self.chat_id,
+                    "text": html,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+            )
             if r.status_code >= 400:
                 logger.warning("Telegram non-2xx: %s %s",
-                               r.status_code, r.text[:200])
+                               r.status_code, self._redact(r.text[:200]))
         except Exception as e:
-            logger.warning("Telegram send failed (swallowed): %s", e)
+            logger.warning("Telegram send failed (swallowed): %s",
+                           self._redact(str(e)))
 
     async def aclose(self) -> None:
         if self._client is not None:
