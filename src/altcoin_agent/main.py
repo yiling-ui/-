@@ -38,7 +38,7 @@ from typing import Any
 from aiohttp import web
 
 from altcoin_agent.ai_engine import DeepSeekEngine
-from altcoin_agent.dashboard import DashboardState, install_dashboard
+from altcoin_agent.dashboard import DashboardState, make_dashboard_app
 from altcoin_agent.fuser import Direction, FusedSignal, FuserConfig, ScoreFuser
 from altcoin_agent.learning_engine import RuleStore
 from altcoin_agent.notifier import Notifier, build_default_notifier
@@ -100,6 +100,22 @@ class AppConfig:
     hedge_mode: bool = False
     min_liquidity_usdt: float = 200_000.0
     dashboard_enabled: bool = True
+    # Dashboard exposes positions/orders/rules and MUST NOT share the
+    # public 0.0.0.0 healthz bind. Defaults: dashboard on a separate
+    # port and bound to loopback. Operators that want remote access
+    # should either SSH-tunnel (``ssh -L``) or set ``dashboard_token``
+    # AND change ``dashboard_bind`` to a routable interface; the
+    # daemon will refuse to start on a non-loopback bind without a
+    # token (see ``App.run``). Bug C1 fix.
+    dashboard_bind: str = "127.0.0.1"
+    # 0 = "follow healthz_port + 1" (resolved at run time). Lets tests
+    # that only set ``healthz_port`` keep their two sites on adjacent
+    # ports without colliding across the suite.
+    dashboard_port: int = 0
+    dashboard_token: str = ""
+    # Healthz can stay on 0.0.0.0 because it returns no operational
+    # data; container probes need it reachable.
+    healthz_bind: str = "0.0.0.0"
     # Path to dynamic_rules.json. The dashboard always needs a concrete path,
     # while the LLM/post-mortem path resolution will fall through env vars or
     # the fuser default when the user leaves this on the default value.
@@ -168,6 +184,15 @@ class AppConfig:
     telegram_fire_and_forget: bool = True
     use_uvloop: bool = True
 
+    # Bug C4 fix: dry-run only. When the PriceTape doesn't have enough
+    # samples yet to compute realized vol (cold start, mocked screener,
+    # offline test), use this conservative default for sizing instead of
+    # rejecting the order. Calibrated for typical altcoin vol around
+    # half the vol-kill cap (3-4%), an order of magnitude above
+    # BTC-grade and safe to size against. LIVE mode never falls back —
+    # cold tape there is fail-closed.
+    dry_run_fallback_vol_pct: float = 0.04
+
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
         try:
@@ -188,6 +213,10 @@ class AppConfig:
             hedge_mode=bool(d.get("hedge_mode", False)),
             min_liquidity_usdt=float(d.get("min_liquidity_usdt", 200_000)),
             dashboard_enabled=bool(d.get("dashboard_enabled", True)),
+            dashboard_bind=str(d.get("dashboard_bind", "127.0.0.1")),
+            dashboard_port=int(d.get("dashboard_port", 0)),
+            dashboard_token=str(d.get("dashboard_token", "")),
+            healthz_bind=str(d.get("healthz_bind", "0.0.0.0")),
             dynamic_rules_path=str(d.get(
                 "dynamic_rules_path", ".kiro/steering/dynamic_rules.json")),
             llm_consult_cooldown_sec=int(d.get("llm_consult_cooldown_sec", 300)),
@@ -333,6 +362,12 @@ class DryRunExchangeAdapter:
         # (matching live-mode behaviour where a missing quote is fatal for
         # SR-1, not a silent passthrough).
         self._mark_prices: dict[str, float] = {}
+        # Bug C4 fix: parallel to ``_mark_prices`` for top-5 depth in
+        # USDT. Dry-run defaults to "infinite" depth so the SR-2
+        # liquidity gate doesn't reject every signal in test/dry mode;
+        # tests can override per-symbol with ``set_top_depth``.
+        self._top_depths: dict[str, float] = {}
+        self._default_top_depth_usdt: float = 1_000_000_000.0
 
     def _id(self) -> str:
         self._n += 1
@@ -401,6 +436,22 @@ class DryRunExchangeAdapter:
     # Test helper: pretend the exchange returns this mark price.
     def set_mark_price(self, symbol: str, price: float) -> None:
         self._mark_prices[symbol] = float(price)
+
+    async def fetch_top_depth_usdt(self, symbol: str, *, levels: int = 5) -> float:
+        """Return the test-supplied top-N depth, or the default infinite.
+
+        Bug C4 fix companion of ``fetch_ticker_price``. Tests can pin a
+        finite depth via ``set_top_depth`` to exercise the SR-2
+        liquidity gate; otherwise dry-run sees "infinite" depth so it
+        doesn't reject everything.
+        """
+        del levels  # we don't slice in dry-run
+        if symbol in self._top_depths:
+            return self._top_depths[symbol]
+        return self._default_top_depth_usdt
+
+    def set_top_depth(self, symbol: str, depth_usdt: float) -> None:
+        self._top_depths[symbol] = float(depth_usdt)
 
     # Test helper: pretend the exchange-side STOP_MARKET fired.
     def simulate_close(self, symbol: str) -> None:
@@ -560,9 +611,14 @@ class App:
     # exception) to exercise SR-1 without a network round-trip. When None,
     # ``_get_live_quote`` falls back to ``adapter.fetch_ticker_price``.
     quote_provider: Callable[[str], Awaitable[float]] | None = None
+    # Bug C4 fix hook: production calls the adapter's
+    # ``fetch_top_depth_usdt``; tests can inject a fixed depth (or an
+    # exception) without a network round-trip.
+    depth_provider: Callable[[str], Awaitable[float]] | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     _tasks: list[asyncio.Task] = field(default_factory=list)
     _runner: web.AppRunner | None = None
+    _dashboard_runner: web.AppRunner | None = None
     _screener: Screener | None = None
     _adapter: ExchangeAdapter | None = None
     _llm_engine: DeepSeekEngine | None = None
@@ -868,19 +924,64 @@ class App:
         else:
             self._llm_consultor = None
 
-        # ----- HTTP server (healthz + dashboard) -----
+        # ----- HTTP server (healthz + dashboard, separate apps) -----
+        # Healthz must stay reachable from container probes (0.0.0.0 by
+        # default) but it MUST NOT carry the dashboard or the JSON APIs:
+        # those expose positions, orders, and learnt rules. We therefore
+        # bind two separate aiohttp sites:
+        #
+        #   * healthz_app  -> healthz_bind:healthz_port (default 0.0.0.0:8080)
+        #     returns only liveness/uptime; no operational data.
+        #
+        #   * dashboard_app -> dashboard_bind:dashboard_port (default
+        #     127.0.0.1:8081). When ``dashboard_token`` is set, every
+        #     request must carry ``X-Auth-Token: <token>``.
+        #
+        # Bug C1 fail-closed: refuse to bind the dashboard on a
+        # non-loopback address without a token. Operators that need
+        # remote access SSH-tunnel to 127.0.0.1:8081 or set a token in
+        # their .env file.
         health_app = await make_health_app(self.state)
-        if self.cfg.dashboard_enabled:
-            install_dashboard(health_app, self.dashboard, mode_label=mode)
         self._runner = web.AppRunner(health_app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, "0.0.0.0", self.cfg.healthz_port)
-        await site.start()
-        logger.info("Health endpoint live: http://0.0.0.0:%d/healthz",
-                    self.cfg.healthz_port)
+        health_site = web.TCPSite(
+            self._runner, self.cfg.healthz_bind, self.cfg.healthz_port,
+        )
+        await health_site.start()
+        logger.info("Health endpoint live: http://%s:%d/healthz",
+                    self.cfg.healthz_bind, self.cfg.healthz_port)
+
         if self.cfg.dashboard_enabled:
-            logger.info("Dashboard live:        http://0.0.0.0:%d/dashboard",
-                        self.cfg.healthz_port)
+            token = (self.cfg.dashboard_token
+                     or os.getenv("DASHBOARD_TOKEN", "")).strip() or None
+            bind = self.cfg.dashboard_bind
+            is_loopback = bind in ("127.0.0.1", "localhost", "::1")
+            if not is_loopback and token is None:
+                # Fail-closed: do NOT publish positions/rules to the
+                # network without auth. Operators see the message and
+                # either tunnel to loopback or set DASHBOARD_TOKEN.
+                raise SystemExit(
+                    "Dashboard refuses to bind on a non-loopback address "
+                    f"({bind!r}) without a token. Set DASHBOARD_TOKEN= in "
+                    "the environment, or leave dashboard_bind=127.0.0.1 "
+                    "and use an SSH tunnel."
+                )
+            dashboard_app = make_dashboard_app(
+                self.dashboard, mode_label=mode, auth_token=token,
+            )
+            self._dashboard_runner = web.AppRunner(dashboard_app)
+            await self._dashboard_runner.setup()
+            dash_port = (self.cfg.dashboard_port
+                         or self.cfg.healthz_port + 1)
+            dash_site = web.TCPSite(
+                self._dashboard_runner, bind, dash_port,
+            )
+            await dash_site.start()
+            logger.info(
+                "Dashboard live:        http://%s:%d/dashboard  (auth=%s)",
+                bind, dash_port,
+                "token" if token else "none",
+            )
 
         # ----- workers -----
         async def fuse_worker() -> None:
@@ -1075,6 +1176,24 @@ class App:
             raise RuntimeError("adapter has no fetch_ticker_price")
         return float(await fetcher(symbol))
 
+    async def _fetch_top_depth_usdt(self, symbol: str) -> float:
+        """Return top-5 order-book depth in USDT for ``symbol``.
+
+        Bug C4 fix companion of ``_get_live_quote``. Resolution order:
+          1. ``self.depth_provider`` (test hook);
+          2. ``adapter.fetch_top_depth_usdt`` (live ccxt + dry-run helper);
+          3. raise -- caller fail-closes with ``depth_unavailable`` rather
+             than substituting ``cfg.min_liquidity_usdt`` and turning SR-2
+             into a no-op.
+        """
+        if self.depth_provider is not None:
+            return float(await self.depth_provider(symbol))
+        adapter = self._adapter
+        fetcher = getattr(adapter, "fetch_top_depth_usdt", None)
+        if fetcher is None:
+            raise RuntimeError("adapter has no fetch_top_depth_usdt")
+        return float(await fetcher(symbol))
+
     async def _handle_high_priority(
         self,
         *,
@@ -1133,12 +1252,84 @@ class App:
         else:
             initial_stop = sig.trigger_price * 1.05
 
+        # Bug C4 fix: the previous version hard-coded
+        # ``top5_depth_usdt = cfg.min_liquidity_usdt`` (i.e. "exactly the
+        # floor", which makes the SR-2 liquidity gate a no-op) and
+        # ``realized_vol_pct = 0.05`` (BTC-grade vol applied to symbols
+        # like PEPE that routinely print 30% intraday). We now pull both
+        # values from real sources:
+        #
+        #   * top-5 depth from the adapter's order book (sum of price*size
+        #     across both sides, levels=5).
+        #   * realized vol from the live PriceTape Parkinson estimator over
+        #     the last 60s.
+        #
+        # If either source can't produce a value (cold start, adapter
+        # error, no ticks yet), we fail-closed: skip the order. This is
+        # symmetric with the live-quote handling above and prevents the
+        # gate from being lied to.
+        try:
+            top5_depth_usdt = await self._fetch_top_depth_usdt(sig.symbol)
+        except Exception as e:
+            logger.warning(
+                "depth unavailable for %s (%s); aborting order",
+                sig.symbol, e,
+            )
+            self.state.orders_rejected += 1
+            self.state.last_error = f"depth_unavailable:{type(e).__name__}"
+            rej = {
+                "ts": int(time.time() * 1000),
+                "symbol": sig.symbol,
+                "reason": f"depth_unavailable:{type(e).__name__}",
+            }
+            self.dashboard.push_rejection(rej)
+            with suppress(Exception):
+                await self.notifier.rejected(rej)
+            return
+
+        realized_vol_pct: float | None = None
+        if self._price_tape is not None:
+            realized_vol_pct = self._price_tape.realized_vol_pct(
+                symbol=sig.symbol,
+                window_ms=self.cfg.vol_kill_window_ms,
+            )
+        if realized_vol_pct is None or realized_vol_pct <= 0:
+            # Cold tape: not enough live ticks yet. In LIVE mode this is
+            # fail-closed (do not size on a guess). In dry-run it's
+            # tolerable to fall back to a conservative default so the
+            # rest of the pipeline can be exercised end-to-end without a
+            # live screener — but we still log so a dry-run that's
+            # "cold for hours" is visible.
+            if self.cfg.dry_run:
+                realized_vol_pct = self.cfg.dry_run_fallback_vol_pct
+                logger.warning(
+                    "realized vol unavailable for %s (cold tape); "
+                    "dry-run fallback vol=%.4f",
+                    sig.symbol, realized_vol_pct,
+                )
+            else:
+                logger.warning(
+                    "realized vol unavailable for %s (cold tape); aborting order",
+                    sig.symbol,
+                )
+                self.state.orders_rejected += 1
+                self.state.last_error = "vol_unavailable:cold_tape"
+                rej = {
+                    "ts": int(time.time() * 1000),
+                    "symbol": sig.symbol,
+                    "reason": "vol_unavailable:cold_tape",
+                }
+                self.dashboard.push_rejection(rej)
+                with suppress(Exception):
+                    await self.notifier.rejected(rej)
+                return
+
         decision: RiskDecision = gate.evaluate(
             signal=sig,
             account=account,
             current_price=current_price,
-            top5_depth_usdt=self.cfg.min_liquidity_usdt,
-            realized_vol_pct=0.05,
+            top5_depth_usdt=top5_depth_usdt,
+            realized_vol_pct=realized_vol_pct,
             initial_stop=initial_stop,
             price_tape=self._price_tape,
         )
@@ -1377,6 +1568,9 @@ class App:
         if self._runner is not None:
             with suppress(Exception):
                 await self._runner.cleanup()
+        if self._dashboard_runner is not None:
+            with suppress(Exception):
+                await self._dashboard_runner.cleanup()
         # Close DeepSeek client if it was built.
         if self._llm_engine is not None:
             with suppress(Exception):
@@ -1412,6 +1606,50 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 
+# Bug C5 fix: V1.0 live-mode confirmation gate.
+#
+# ``config/app.yaml`` documents that this build is not yet certified for
+# unattended live trading. The previous code allowed any operator with a
+# ``DRY_RUN=0`` env var to flip to live (typo, copy-pasted CI script,
+# stale shell) and the daemon would happily start placing real orders.
+#
+# We require an explicit, non-default acknowledgement (the literal
+# string ``I_UNDERSTAND``) before live mode is allowed, and we leave a
+# loud audit log. ``paper_trade=True`` (testnet) is exempt because no
+# real funds are at stake. Tests bypass the gate by either keeping
+# ``dry_run=True`` (the default) or constructing ``App`` directly.
+LIVE_CONFIRM_TOKEN = "I_UNDERSTAND"
+LIVE_CONFIRM_ENV = "LIVE_CONFIRM"
+
+
+def enforce_live_mode_confirmation(cfg: AppConfig) -> None:
+    """Refuse to launch in live mode without the operator acknowledgement.
+
+    Raises ``SystemExit`` (exit code 3) when ``cfg.dry_run`` is False,
+    ``cfg.paper_trade`` is False, and ``LIVE_CONFIRM`` is not set to
+    ``I_UNDERSTAND`` in the environment. Otherwise returns silently.
+
+    The exception case is recorded with a critical-level log so the
+    operator can see exactly which knob is missing.
+    """
+    if cfg.dry_run or cfg.paper_trade:
+        return
+    confirm = os.getenv(LIVE_CONFIRM_ENV, "").strip()
+    if confirm == LIVE_CONFIRM_TOKEN:
+        logger.warning(
+            "LIVE MODE ACKNOWLEDGED via %s=%s — real orders will be placed",
+            LIVE_CONFIRM_ENV, LIVE_CONFIRM_TOKEN,
+        )
+        return
+    logger.critical(
+        "Refusing to start in LIVE mode without %s=%s. Either set the "
+        "env var to acknowledge real-money trading, or run with "
+        "DRY_RUN=1 / --dry-run / PAPER_TRADE=1 / --paper-trade.",
+        LIVE_CONFIRM_ENV, LIVE_CONFIRM_TOKEN,
+    )
+    raise SystemExit(3)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Altcoin Agent V1.0 daemon")
     parser.add_argument("--config", default="config/app.yaml",
@@ -1438,6 +1676,13 @@ def main() -> None:
         cfg.dry_run = False
     if os.getenv("DASHBOARD_ENABLED", "true").lower() in ("0", "false", "no"):
         cfg.dashboard_enabled = False
+
+    # Bug C5 fix: live-mode gate. ``app.yaml`` documents that V1.0
+    # refuses to start in live mode without an explicit operator
+    # acknowledgement; the previous code allowed it silently. Now we
+    # enforce it here, BEFORE the event loop is constructed, so an
+    # accidental ``DRY_RUN=0`` in a CI shell can't reach the venue.
+    enforce_live_mode_confirmation(cfg)
 
     # uvloop: 30–60% throughput improvement on the asyncio hot path.
     # Optional dependency; fall back to the stdlib loop if not
