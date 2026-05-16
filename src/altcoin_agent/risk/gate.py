@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass
 
 from altcoin_agent.fuser import Direction, FusedSignal
+from altcoin_agent.price_tape import PriceTape
 from altcoin_agent.risk.sizing import PositionSizer
 from altcoin_agent.risk.state import AccountState, Side
 
@@ -87,9 +88,18 @@ class RiskGate:
         realized_vol_pct: float,
         initial_stop: float,
         now_ms: int | None = None,
+        price_tape: PriceTape | None = None,
     ) -> RiskDecision:
         """Run all 9 checks. Returns an approved decision with sizing details
-        on success, or a rejection with a reason on the first failure."""
+        on success, or a rejection with a reason on the first failure.
+
+        ``price_tape`` is optional; when provided, two extra checks
+        (anti-chase, vol-kill) run BEFORE the networked ones so a
+        rejection saves a venue round-trip altogether. See
+        :class:`altcoin_agent.price_tape.PriceTape` for the rationale —
+        in altcoin pump-and-dump bursts, REST RTT is too slow to *catch
+        the top*; the only winning move is to refuse to chase.
+        """
         if now_ms is None:
             now_ms = int(time.time() * 1000)
 
@@ -105,6 +115,32 @@ class RiskGate:
             side = (
                 Side.LONG if signal.direction == Direction.LONG else Side.SHORT
             )
+
+            # 0a) anti-chase / vol-kill — local memory only, O(window).
+            #
+            # Run BEFORE the live-quote / order RTTs so a rejection here
+            # costs nothing on the venue side. These two checks are the
+            # only credible defence in a sub-500ms +5% pump scenario:
+            # we cannot catch the top, but we can refuse to enter on it.
+            if price_tape is not None:
+                breached, move = price_tape.anti_chase_breach(
+                    symbol=signal.symbol, side=side, now_ms=now_ms,
+                )
+                if breached:
+                    return RiskDecision(
+                        False,
+                        f"chase_too_late:{move:+.4f}>"
+                        f"{price_tape.cfg.anti_chase_max_move_pct:+.4f}",
+                    )
+                vol_breached, rng = price_tape.vol_kill_breach(
+                    symbol=signal.symbol, now_ms=now_ms,
+                )
+                if vol_breached:
+                    return RiskDecision(
+                        False,
+                        f"vol_kill_active:{rng:.4f}>"
+                        f"{price_tape.cfg.vol_kill_range_pct:.4f}",
+                    )
 
             # 1) global halt
             if account.global_trading_halted:
