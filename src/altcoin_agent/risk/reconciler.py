@@ -112,7 +112,18 @@ class Reconciler:
         return False
 
     async def _attach_emergency_stop(self, raw_position: dict) -> bool:
-        """Best-effort: place a wide protective stop on an orphan."""
+        """Best-effort: place a wide protective stop on an orphan.
+
+        Audit #17: the previous version always used 5% adverse from
+        entry. On a 10x leveraged orphan that is 50% of equity wiped
+        out before the stop fires; on a 25x position (Binance default
+        for altcoin perp users) it is 125% — i.e. liquidation before
+        stop. We now translate the equity-side guardrail (default
+        ``max_equity_loss_pct=0.30``) to a price distance scaled by
+        the venue-reported leverage. A position with no leverage info
+        (rare; most adapters always populate it) falls back to the
+        old 5% to keep behaviour conservative.
+        """
         try:
             symbol = str(raw_position.get("symbol") or "")
             side_str = str(raw_position.get("side") or "long").lower()
@@ -124,12 +135,25 @@ class Reconciler:
                 return False
             from altcoin_agent.risk.state import Side
             pos_side = Side.LONG if side_str == "long" else Side.SHORT
-            # 5% adverse stop -- a place-holder until human review.
+            # Stop distance = min(5% absolute, max_equity_loss_pct / leverage).
+            # On a 10x position with max_equity_loss=30%, that's 3% adverse;
+            # on 5x it's 6% (clamped to 5%); on no-leverage info we keep 5%.
+            max_equity_loss_pct = 0.30
+            absolute_cap_pct = 0.05
+            try:
+                lev = float(raw_position.get("leverage") or 0.0)
+            except (TypeError, ValueError):
+                lev = 0.0
+            if lev > 0:
+                lev_aware = max_equity_loss_pct / lev
+                stop_pct = min(absolute_cap_pct, lev_aware)
+            else:
+                stop_pct = absolute_cap_pct
             if pos_side == Side.LONG:
-                stop_price = entry * 0.95
+                stop_price = entry * (1.0 - stop_pct)
                 stop_side = Side.SHORT
             else:
-                stop_price = entry * 1.05
+                stop_price = entry * (1.0 + stop_pct)
                 stop_side = Side.LONG
             await self.adapter.place_stop_order(
                 symbol=symbol,
@@ -139,8 +163,9 @@ class Reconciler:
                 reduce_only=True,
             )
             logger.warning(
-                "Reconciler attached emergency stop on orphan %s %s @ %s",
-                symbol, side_str, stop_price,
+                "Reconciler attached emergency stop on orphan %s %s @ %s "
+                "(stop_pct=%.4f, leverage=%.2f)",
+                symbol, side_str, stop_price, stop_pct, lev,
             )
             return True
         except Exception as e:

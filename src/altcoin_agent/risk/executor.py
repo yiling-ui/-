@@ -74,6 +74,12 @@ class CCXTExecutor:
     exchange_name: str = "binance"
     place_stop_retries: int = 2
     stop_failure_cooldown_sec: int = 4 * 3600
+    # Audit #16: minimum acceptable fill ratio. Below this we treat
+    # the entry as a failed market order and emergency-close whatever
+    # did fill. 0.95 is conservative enough to tolerate normal
+    # rounding/lot-size truncation but tight enough to catch a real
+    # IOC partial fill on a thin book.
+    min_fill_ratio: float = 0.95
 
     async def open(
         self,
@@ -105,6 +111,56 @@ class CCXTExecutor:
         avg_price = float(
             entry_resp.get("average") or entry_resp.get("price") or current_price
         )
+
+        # Audit #16: partial-fill detection. ccxt returns ``filled`` on
+        # most venues; when the venue (or our adapter) does not, fall
+        # back to the order's ``amount`` so legacy adapters preserve
+        # current behaviour. A fill below ``min_fill_ratio`` of the
+        # requested size is treated as a failure: we emergency-close
+        # whatever did fill (using the actually-filled qty as the
+        # reduce_only size), set a cooldown, and raise. This keeps
+        # the position book honest in altcoin scenarios where the
+        # IOC market order can wipe one level and stop.
+        try:
+            filled_raw = entry_resp.get("filled")
+            if filled_raw is None:
+                # Fall back to the response's "amount" (full original
+                # size when missing -> ratio == 1.0).
+                filled_raw = entry_resp.get("amount", decision.size)
+            filled = abs(float(filled_raw))
+        except (TypeError, ValueError):
+            filled = float(decision.size)
+
+        fill_ratio = (
+            filled / decision.size if decision.size > 0 else 0.0
+        )
+        if fill_ratio < self.min_fill_ratio:
+            logger.critical(
+                "Partial fill on %s: requested=%.6f filled=%.6f "
+                "ratio=%.4f < %.4f — emergency closing the partial leg",
+                symbol, decision.size, filled, fill_ratio,
+                self.min_fill_ratio,
+            )
+            if filled > 0:
+                try:
+                    await self.adapter.market_order(
+                        symbol=symbol,
+                        side=decision.side.opposite,
+                        size=filled,
+                        price=current_price,
+                        reduce_only=True,
+                    )
+                except Exception as e:
+                    logger.critical(
+                        "EMERGENCY CLOSE of partial fill failed for %s: %s "
+                        "— manual intervention required", symbol, e,
+                    )
+            account.set_cooldown(
+                symbol, self.stop_failure_cooldown_sec, now_ms_default(),
+            )
+            raise ExecutionError(
+                f"partial_fill_below_threshold:{fill_ratio:.4f}",
+            )
 
         # 3) hard stop on the exchange — RETRY then fail-closed close.
         stop_side = decision.side.opposite

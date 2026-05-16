@@ -11,6 +11,17 @@ Sends structured cards for:
 Failure-mode contract: every notifier method swallows all errors after
 logging them. A flaky Telegram MUST NOT crash the trading loop.
 
+Rate limiting (audit #24):
+    Telegram's bot API caps a single bot at 30 msg/sec across the
+    whole API surface. During a fast pump-and-dump we may emit dozens
+    of SIGNAL / OPENED / CLOSED in a single second; the 31st request
+    onwards gets a 429 (and on the worst case the bot is throttled
+    for 60+ seconds). We use a token bucket sized to 28 msg/sec
+    (leaving 2 messages of headroom for ad-hoc /status replies if
+    a future maintenance bot shares the token) and *await* on the
+    bucket — failed sends still fail-open, but rate-limit-induced
+    sleeps protect the bot's reputation with the Telegram backend.
+
 Configuration:
     TG_ENABLED        = "true" to opt in
     TG_BOT_TOKEN      = bot token from @BotFather
@@ -20,14 +31,59 @@ Configuration:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------- #
+# Rate limiter
+# --------------------------------------------------------------------- #
+
+
+@dataclass
+class _TokenBucket:
+    """Async-aware token bucket for outbound Telegram messages.
+
+    Capacity = ``rate`` * 1 second of burst tolerance. ``acquire``
+    awaits until at least one token is available. Single-bucket per
+    notifier is fine: bot tokens are 1:1 with bots and the API limit
+    is per-bot.
+    """
+
+    rate_per_sec: float = 28.0   # 30 - 2 headroom
+    capacity: float = 28.0
+    _tokens: float = field(default=28.0)
+    _last_refill: float = field(default_factory=time.monotonic)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def __post_init__(self) -> None:
+        self._tokens = float(self.capacity)
+        self._last_refill = time.monotonic()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._last_refill)
+                self._last_refill = now
+                self._tokens = min(
+                    self.capacity, self._tokens + elapsed * self.rate_per_sec,
+                )
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                # Compute exact sleep until 1 full token will be there.
+                deficit = 1.0 - self._tokens
+                sleep_for = max(0.001, deficit / max(self.rate_per_sec, 1e-6))
+                await asyncio.sleep(sleep_for)
 
 
 @runtime_checkable
@@ -87,7 +143,17 @@ class TelegramNotifier:
     api_base: str = "https://api.telegram.org"
     name: str = "telegram"
     timeout: float = 5.0
+    rate_per_sec: float = 28.0
     _client: httpx.AsyncClient | None = None
+    _bucket: _TokenBucket | None = None
+
+    def _get_bucket(self) -> _TokenBucket:
+        if self._bucket is None:
+            self._bucket = _TokenBucket(
+                rate_per_sec=self.rate_per_sec,
+                capacity=self.rate_per_sec,
+            )
+        return self._bucket
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -111,6 +177,12 @@ class TelegramNotifier:
                 .replace(self.bot_token, "***REDACTED***"))
 
     async def _send(self, html: str) -> None:
+        # Audit #24: enforce 28 msg/s ceiling so the bot never gets
+        # 429'd by Telegram during a high-priority burst.
+        try:
+            await self._get_bucket().acquire()
+        except Exception as e:  # pragma: no cover — async cancellation
+            logger.warning("Telegram rate-limit acquire failed: %s", e)
         try:
             client = await self._get_client()
             r = await client.post(
