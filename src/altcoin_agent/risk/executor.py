@@ -15,12 +15,31 @@ Rolling positions:
     posture as ``open`` applies: if we cannot resize the stop, we
     EMERGENCY-CLOSE the entire position (legs are inseparable on the
     venue), set the symbol cooldown, and raise.
+
+Phase B.1 hardening (production-plan part B.1.1 + B.1.2):
+    * **clientOrderId idempotency**: every market / stop order is tagged
+      with a deterministic UUID before it goes to the venue. Retries on
+      transient errors reuse the SAME UUID, so the exchange dedupes a
+      double-submit instead of opening two parallel positions. ccxt
+      uses ``newClientOrderId`` (Binance) / ``clOrdId`` (OKX) /
+      ``client_id`` (Gate.io); the adapter normalises by accepting a
+      single ``client_order_id`` kwarg and emitting the right
+      vendor-specific param.
+    * **Market entry retry with ccxt error classification**: the entry
+      market_order is wrapped in an exponential-backoff retry that
+      distinguishes retriable (NetworkError / ExchangeNotAvailable /
+      RequestTimeout / DDoSProtection) from non-retriable
+      (InsufficientFunds / InvalidOrder / BadRequest /
+      AuthenticationError) failures. Non-retriable errors short-
+      circuit immediately so we don't waste retries on a clearly-
+      hopeless request.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -30,13 +49,112 @@ from altcoin_agent.risk.state import AccountState, Position, PositionLeg, Side
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------- #
+# Phase B.1.2 — ccxt error classification.
+#
+# ccxt is an optional dependency at test time (the FakeAdapter
+# fixtures don't import it), but a hard dependency at runtime via
+# CCXTExchangeAdapter. We import the exception classes lazily and
+# fall back to name-based checks so unit tests that raise plain
+# ``RuntimeError("simulated network failure")`` still exercise the
+# same code path.
+# ---------------------------------------------------------------- #
+
+
+def _build_ccxt_error_sets() -> tuple[tuple[type[Exception], ...], tuple[type[Exception], ...]]:
+    """Return ``(retriable, non_retriable)`` exception classes from ccxt.
+
+    Importing here (vs. module top) keeps the executor importable in
+    environments where ccxt is unavailable (e.g. some CI lanes) — the
+    function returns empty tuples in that case and the retry helper
+    falls back to the name-based heuristic in ``_classify_error``.
+    """
+    try:
+        import ccxt  # noqa: WPS433 — lazy on purpose
+    except ImportError:  # pragma: no cover
+        return (), ()
+    retriable: list[type[Exception]] = []
+    non_retriable: list[type[Exception]] = []
+    for name in (
+        "NetworkError", "RequestTimeout", "ExchangeNotAvailable",
+        "DDoSProtection", "RateLimitExceeded",
+    ):
+        klass = getattr(ccxt, name, None)
+        if isinstance(klass, type) and issubclass(klass, Exception):
+            retriable.append(klass)
+    for name in (
+        "InsufficientFunds", "InvalidOrder", "BadRequest",
+        "AuthenticationError", "PermissionDenied",
+        "ArgumentsRequired",
+    ):
+        klass = getattr(ccxt, name, None)
+        if isinstance(klass, type) and issubclass(klass, Exception):
+            non_retriable.append(klass)
+    return tuple(retriable), tuple(non_retriable)
+
+
+_RETRIABLE_CCXT_ERRORS, _NON_RETRIABLE_CCXT_ERRORS = _build_ccxt_error_sets()
+
+# Name-based fallback. Tests raise vanilla ``RuntimeError(...)`` with
+# a descriptive message; we let the message decide whether to retry.
+# The substrings here intentionally lean conservative: ambiguous
+# cases stay retriable so a flaky network never costs us a fill.
+_RETRIABLE_MSG_HINTS: tuple[str, ...] = (
+    "timeout", "timed out", "connection", "temporarily", "503",
+    "502", "504", "429", "ddos", "rate limit", "rate-limit",
+    "unavailable", "network", "ssl",
+)
+_NON_RETRIABLE_MSG_HINTS: tuple[str, ...] = (
+    "insufficient", "invalid order", "invalid amount",
+    "invalid quantity", "min notional", "lot size", "filter failure",
+    "bad request", "authentication", "signature", "permission",
+)
+
+
+def _classify_error(err: Exception) -> bool:
+    """Return True iff ``err`` should be retried.
+
+    Order of precedence:
+      1. Class match against ccxt non-retriable -> False.
+      2. Class match against ccxt retriable     -> True.
+      3. Message-substring heuristic.
+      4. Default conservative: True (flaky network bias).
+    """
+    if _NON_RETRIABLE_CCXT_ERRORS and isinstance(err, _NON_RETRIABLE_CCXT_ERRORS):
+        return False
+    if _RETRIABLE_CCXT_ERRORS and isinstance(err, _RETRIABLE_CCXT_ERRORS):
+        return True
+    msg = str(err).lower()
+    for hint in _NON_RETRIABLE_MSG_HINTS:
+        if hint in msg:
+            return False
+    for hint in _RETRIABLE_MSG_HINTS:
+        if hint in msg:
+            return True
+    # Unknown error class + no message hint: lean retriable. The
+    # caller bounds the attempt count anyway, so the worst case is
+    # ``retries+1`` repeated failures for a non-transient bug; the
+    # alternative (lean non-retriable) would silently drop genuine
+    # network blips on first try.
+    return True
+
+
 class ExecutionError(RuntimeError):
     pass
 
 
 @runtime_checkable
 class ExchangeAdapter(Protocol):
-    """Minimal interface the executor needs. ccxt-compatible by design."""
+    """Minimal interface the executor needs. ccxt-compatible by design.
+
+    Phase B.1.1: ``client_order_id`` is an optional kwarg on every
+    order-creating method. The executor generates a UUID for each
+    logical order (entry, leg, stop, emergency-close) and reuses it
+    across retries; the adapter forwards it to the venue's
+    idempotency mechanism (``newClientOrderId`` on Binance, etc.).
+    Adapters / fakes that don't care about idempotency may ignore
+    the kwarg — it's a hint, not a contract for behavioural change.
+    """
 
     async def market_order(
         self,
@@ -46,6 +164,7 @@ class ExchangeAdapter(Protocol):
         *,
         price: float | None = None,
         reduce_only: bool = False,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def place_stop_order(
@@ -55,6 +174,7 @@ class ExchangeAdapter(Protocol):
         size: float,
         stop_price: float,
         reduce_only: bool = True,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
@@ -73,6 +193,20 @@ class CCXTExecutor:
     adapter: ExchangeAdapter
     exchange_name: str = "binance"
     place_stop_retries: int = 2
+    # Phase B.1.2 — market-entry retries. Mirrors the existing
+    # ``place_stop_retries`` semantics: ``place_entry_retries=2`` means
+    # 1 initial try + 2 retries = 3 attempts total. Each retry reuses
+    # the same client_order_id (Phase B.1.1) so the venue dedupes if
+    # the original request actually went through but the response
+    # was lost. Backoff: ``entry_retry_base_delay_sec * 2**attempt``.
+    place_entry_retries: int = 2
+    entry_retry_base_delay_sec: float = 0.5
+    stop_retry_base_delay_sec: float = 0.5
+    # Optional prefix for client_order_id values — useful for
+    # tagging orders by daemon instance / strategy version when
+    # post-mortem-ing a venue audit log. Kept short (<10 chars) so
+    # we don't blow Binance's 36-byte newClientOrderId limit.
+    client_order_id_prefix: str = "alt"
     stop_failure_cooldown_sec: int = 4 * 3600
     # Audit #16: minimum acceptable fill ratio. Below this we treat
     # the entry as a failed market order and emergency-close whatever
@@ -80,6 +214,94 @@ class CCXTExecutor:
     # rounding/lot-size truncation but tight enough to catch a real
     # IOC partial fill on a thin book.
     min_fill_ratio: float = 0.95
+
+    # ------------------------------------------------------------------ #
+    # Phase B.1.1 helpers — client_order_id lifecycle
+    # ------------------------------------------------------------------ #
+
+    def _new_client_order_id(self, kind: str) -> str:
+        """Generate a new idempotency token for a logical order.
+
+        Format: ``{prefix}{kind}{uuid8}``. Total length capped at
+        ~22 chars so Binance's 36-byte newClientOrderId limit is
+        always respected, and ``kind`` (e.g. "e" for entry, "s" for
+        stop, "c" for close, "l" for add_leg) helps when reading
+        venue order history. UUID is shortened to 8 hex chars; with
+        the daemon-level prefix collisions are astronomically
+        unlikely (~1.8e19 namespace before birthday-paradox bias).
+        """
+        token = uuid.uuid4().hex[:12]
+        # Sanitise prefix: ccxt restricts the charset on most venues
+        # to ``[A-Za-z0-9_-]``. We strip everything else.
+        safe_prefix = "".join(
+            c for c in self.client_order_id_prefix if c.isalnum() or c in "_-"
+        )[:8]
+        return f"{safe_prefix}-{kind}-{token}"
+
+    async def _market_order_with_retry(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        size: float,
+        price: float | None,
+        reduce_only: bool,
+        client_order_id: str,
+        retries: int,
+        op_label: str,
+    ) -> dict[str, Any]:
+        """Wrap ``adapter.market_order`` in idempotent retry.
+
+        The same ``client_order_id`` is sent on every attempt — if the
+        venue accepted the original request but our process didn't
+        receive the response, the retry is deduped server-side and
+        we get the original order back. ccxt error classes are
+        consulted to short-circuit on non-retriable failures
+        (InsufficientFunds, InvalidOrder, etc.) so we don't waste
+        retries on a clearly-hopeless request.
+
+        Raises the LAST encountered exception when all attempts
+        exhausted, or the FIRST non-retriable exception immediately.
+        """
+        attempts = retries + 1
+        last_err: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                resp = await self.adapter.market_order(
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    price=price,
+                    reduce_only=reduce_only,
+                    client_order_id=client_order_id,
+                )
+                if attempt > 0:
+                    logger.info(
+                        "%s succeeded on retry %d/%d (client_order_id=%s)",
+                        op_label, attempt, retries, client_order_id,
+                    )
+                return resp
+            except Exception as e:
+                last_err = e
+                retriable = _classify_error(e)
+                logger.warning(
+                    "%s attempt %d/%d failed (retriable=%s, "
+                    "client_order_id=%s): %s",
+                    op_label, attempt + 1, attempts, retriable,
+                    client_order_id, e,
+                )
+                if not retriable:
+                    # Don't burn retries on InsufficientFunds /
+                    # InvalidOrder / BadRequest. Fail-fast.
+                    raise
+                if attempt == attempts - 1:
+                    break
+                await asyncio.sleep(
+                    self.entry_retry_base_delay_sec * (2 ** attempt),
+                )
+        # All retriable attempts exhausted.
+        assert last_err is not None
+        raise last_err
 
     async def open(
         self,
@@ -100,13 +322,25 @@ class CCXTExecutor:
         # 1) leverage
         await self.adapter.set_leverage(symbol, decision.leverage)
 
-        # 2) market entry
-        entry_resp = await self.adapter.market_order(
+        # 2) market entry — Phase B.1.1 + B.1.2.
+        # Generate a single idempotency token for the entry; reuse it
+        # on every retry. ``_market_order_with_retry`` distinguishes
+        # retriable network/transient failures from non-retriable
+        # client errors (insufficient funds, invalid order). On the
+        # happy path this is a single call; on a flaky network it
+        # retries with exponential backoff; on an InvalidOrder it
+        # raises immediately so we don't burn retries on a hopeless
+        # request.
+        entry_coid = self._new_client_order_id("e")
+        entry_resp = await self._market_order_with_retry(
             symbol=symbol,
             side=decision.side,
             size=decision.size,
             price=current_price,
             reduce_only=False,
+            client_order_id=entry_coid,
+            retries=self.place_entry_retries,
+            op_label=f"entry {symbol} {decision.side.value}",
         )
         avg_price = float(
             entry_resp.get("average") or entry_resp.get("price") or current_price
@@ -143,12 +377,16 @@ class CCXTExecutor:
             )
             if filled > 0:
                 try:
+                    # Phase B.1.1: tag the emergency close with its
+                    # own client_order_id so a flaky retry doesn't
+                    # double-close the (already tiny) partial leg.
                     await self.adapter.market_order(
                         symbol=symbol,
                         side=decision.side.opposite,
                         size=filled,
                         price=current_price,
                         reduce_only=True,
+                        client_order_id=self._new_client_order_id("c"),
                     )
                 except Exception as e:
                     logger.critical(
@@ -173,7 +411,16 @@ class CCXTExecutor:
         actual_size = filled if filled > 0 else float(decision.size)
 
         # 3) hard stop on the exchange — RETRY then fail-closed close.
+        # Phase B.1.1: same idempotency model as entry. The stop's
+        # client_order_id is generated once here and reused on each
+        # retry so the venue dedupes if a flaky response masked a
+        # successful first attempt. Without this, a network blip
+        # between attempts 1 and 2 could leave us with TWO resting
+        # STOP_MARKET orders covering the same position; reduce_only
+        # protects from negative size, but the second stop would
+        # remain dangling and silently consume an order slot.
         stop_side = decision.side.opposite
+        stop_coid = self._new_client_order_id("s")
         stop_resp: dict[str, Any] | None = None
         last_err: Exception | None = None
         for attempt in range(self.place_stop_retries + 1):
@@ -184,14 +431,23 @@ class CCXTExecutor:
                     size=actual_size,
                     stop_price=decision.initial_stop,
                     reduce_only=True,
+                    client_order_id=stop_coid,
                 )
                 break
             except Exception as e:
                 last_err = e
+                retriable = _classify_error(e)
                 logger.warning(
-                    "stop placement attempt %d failed: %s", attempt + 1, e,
+                    "stop placement attempt %d failed (retriable=%s): %s",
+                    attempt + 1, retriable, e,
                 )
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                if not retriable:
+                    # InvalidOrder (e.g. stop price on wrong side of
+                    # mark) won't get better with another attempt.
+                    break
+                await asyncio.sleep(
+                    self.stop_retry_base_delay_sec * (2 ** attempt),
+                )
 
         if stop_resp is None:
             # CRITICAL: we have an open exposure with no hard stop.
@@ -200,12 +456,14 @@ class CCXTExecutor:
                 symbol, self.place_stop_retries + 1, last_err,
             )
             try:
+                # Phase B.1.1: idempotent emergency close.
                 await self.adapter.market_order(
                     symbol=symbol,
                     side=stop_side,
                     size=actual_size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=self._new_client_order_id("c"),
                 )
             except Exception as e:
                 logger.critical(
@@ -282,12 +540,20 @@ class CCXTExecutor:
         old_size = position.total_size
 
         # 1) market order on the SAME side as the existing position.
-        entry_resp = await self.adapter.market_order(
+        # Phase B.1.1 + B.1.2: idempotent + retried, same as ``open``.
+        # add_leg uses a different "kind" letter (``l``) in the
+        # client_order_id so post-mortem ops can tell rolling adds
+        # apart from initial entries in the venue's order history.
+        leg_coid = self._new_client_order_id("l")
+        entry_resp = await self._market_order_with_retry(
             symbol=position.symbol,
             side=position.side,
             size=size,
             price=current_price,
             reduce_only=False,
+            client_order_id=leg_coid,
+            retries=self.place_entry_retries,
+            op_label=f"add_leg {position.symbol} {position.side.value}",
         )
         avg_price = float(
             entry_resp.get("average") or entry_resp.get("price") or current_price
@@ -321,12 +587,14 @@ class CCXTExecutor:
                 actual_leg_size / max(size, 1e-9),
             )
             try:
+                # Phase B.1.1: idempotent close of the partial leg.
                 await self.adapter.market_order(
                     symbol=position.symbol,
                     side=position.side.opposite,
                     size=actual_leg_size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=self._new_client_order_id("c"),
                 )
             except Exception as e:
                 logger.critical(
@@ -378,12 +646,15 @@ class CCXTExecutor:
                 position.symbol, len(position.legs), position.size,
             )
             try:
+                # Phase B.1.1: idempotent emergency close of the
+                # whole multi-leg position.
                 await self.adapter.market_order(
                     symbol=position.symbol,
                     side=position.side.opposite,
                     size=position.size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=self._new_client_order_id("c"),
                 )
             except Exception as e:
                 logger.critical(
@@ -428,6 +699,7 @@ class CCXTExecutor:
                 size=position.size,
                 stop_price=new_stop,
                 reduce_only=True,
+                client_order_id=self._new_client_order_id("s"),
             )
             position.current_stop = new_stop
             position.stop_order_id = str(new_resp.get("id") or "")
@@ -443,6 +715,7 @@ class CCXTExecutor:
                     size=position.size,
                     stop_price=old_stop,
                     reduce_only=True,
+                    client_order_id=self._new_client_order_id("s"),
                 )
                 position.stop_order_id = str(restored.get("id") or "")
                 logger.warning("restored old stop @ %s on %s after replace failure",
