@@ -313,15 +313,15 @@ Phase B.3: 状态层升级 (3 天)
   └─ B.3.1: SQLite WAL 替代 JSON
 
 Phase B.4: 回测引擎 (10 天) ← 最大块
-  ├─ B.4.1: data_adapter
-  ├─ B.4.2: matching_engine + slippage
-  ├─ B.4.3: runner + walk_forward
-  └─ B.4.4: 实盘/回测一致性验证
+  ├─ B.4.1: data_adapter             ✅ src/altcoin_agent/backtest/data_adapter.py
+  ├─ B.4.2: matching_engine + slippage  ✅ matching_engine.py + slippage_model.py
+  ├─ B.4.3: runner + walk_forward    ✅ runner.py (Phase 1-3) + walk_forward.py
+  └─ B.4.4: 实盘/回测一致性验证      ⏭ 等 Phase 4 trainer 接入后跑
 
 Phase B.5: LLM Pre-Rate (5 天)
-  ├─ B.5.1: cache 实现
-  ├─ B.5.2: 后台 pre-rate worker
-  └─ B.5.3: token budget 集成
+  ├─ B.5.1: cache 实现                ✅ src/altcoin_agent/llm/cache.py (Phase 1-3 落地)
+  ├─ B.5.2: 后台 pre-rate worker       ⏭ Phase 4 / 5
+  └─ B.5.3: token budget 集成          ⏭ Phase 5（TokenBudgetManager 已建好，缺 ai_engine 接入）
 
 Phase B.6: OpenTelemetry trace (3 天)
   └─ B.6.1: 全链路 instrumentation
