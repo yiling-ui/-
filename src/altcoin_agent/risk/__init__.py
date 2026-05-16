@@ -24,19 +24,40 @@ Public surface:
         RollingController,
         RollingConfig,
         RollDecision,
+        # Audit batch 2 — safety hardening
+        RegimeFilter,
+        RegimeFilterConfig,
+        ClusterMap,
+        ClusterCapConfig,
+        AccountPersistor,
+        DecisionAuditLog,
+        KillSwitchConfig,
+        KillSwitchWatcher,
     )
 """
 
 from altcoin_agent.risk.atr import ATRCalculator
+from altcoin_agent.risk.audit_log import DecisionAuditLog
 from altcoin_agent.risk.ccxt_adapter import CCXTExchangeAdapter, build_ccxt_adapter
+from altcoin_agent.risk.cluster import (
+    ClusterCapConfig,
+    ClusterMap,
+    cap_breached,
+)
 from altcoin_agent.risk.executor import (
     CCXTExecutor,
     ExchangeAdapter,
     ExecutionError,
 )
 from altcoin_agent.risk.gate import RiskDecision, RiskGate, RiskGateConfig
+from altcoin_agent.risk.kill_switch import (
+    KillSwitchConfig,
+    KillSwitchWatcher,
+)
+from altcoin_agent.risk.persistence import AccountPersistor
 from altcoin_agent.risk.position_watcher import CloseCallback, PositionWatcher
 from altcoin_agent.risk.reconciler import Reconciler, ReconcilerReport
+from altcoin_agent.risk.regime_filter import RegimeFilter, RegimeFilterConfig
 from altcoin_agent.risk.rolling import (
     RollDecision,
     RollingConfig,
@@ -47,20 +68,28 @@ from altcoin_agent.risk.state import AccountState, Position, PositionLeg, Side
 from altcoin_agent.risk.trailing import TrailingState, TrailingStopFSM
 
 __all__ = [
+    "AccountPersistor",
     "AccountState",
     "ATRCalculator",
     "CCXTExchangeAdapter",
     "CCXTExecutor",
     "CloseCallback",
+    "ClusterCapConfig",
+    "ClusterMap",
+    "DecisionAuditLog",
     "DynamicLeverageConfig",
     "ExchangeAdapter",
     "ExecutionError",
+    "KillSwitchConfig",
+    "KillSwitchWatcher",
     "Position",
     "PositionLeg",
     "PositionSizer",
     "PositionWatcher",
     "Reconciler",
     "ReconcilerReport",
+    "RegimeFilter",
+    "RegimeFilterConfig",
     "RiskDecision",
     "RiskGate",
     "RiskGateConfig",
@@ -71,4 +100,5 @@ __all__ = [
     "TrailingState",
     "TrailingStopFSM",
     "build_ccxt_adapter",
+    "cap_breached",
 ]

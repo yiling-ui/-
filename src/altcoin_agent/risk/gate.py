@@ -19,6 +19,23 @@ Per architect call SR-1, the slippage threshold is asymmetric:
 moves IN OUR FAVOUR are NEVER abort reasons. Only adverse drift counts.
 The threshold itself shrinks with leverage:
     max_slippage = base_slippage / sqrt(leverage / 5)
+
+Audit batch 2 additions
+-----------------------
+Two optional gates run BEFORE any networked check (mirroring the
+PriceTape anti-chase / vol-kill design):
+
+  * BTC regime gate (audit #10): when the configured RegimeFilter
+    reports BTC is dropping fast we block LONG entries; when BTC is
+    ripping we block SHORT entries. Keeps the strategy from getting
+    crushed by market beta in a fast tape.
+
+  * Symbol cluster cap (audit #11): correlated symbols (PEPE / WIF /
+    FLOKI ...) effectively count as the same trade. We enforce a
+    per-cluster maximum on top of the global ``max_concurrent_positions``.
+
+Both are no-ops when the relevant kwargs are omitted, so existing
+callers and tests keep working unchanged.
 """
 
 from __future__ import annotations
@@ -30,6 +47,12 @@ from dataclasses import dataclass
 
 from altcoin_agent.fuser import Direction, FusedSignal
 from altcoin_agent.price_tape import PriceTape
+from altcoin_agent.risk.cluster import (
+    ClusterCapConfig,
+    ClusterMap,
+    cap_breached,
+)
+from altcoin_agent.risk.regime_filter import RegimeFilter
 from altcoin_agent.risk.sizing import PositionSizer
 from altcoin_agent.risk.state import AccountState, Side
 
@@ -89,6 +112,9 @@ class RiskGate:
         initial_stop: float,
         now_ms: int | None = None,
         price_tape: PriceTape | None = None,
+        regime_filter: RegimeFilter | None = None,
+        cluster_map: ClusterMap | None = None,
+        cluster_cap_cfg: ClusterCapConfig | None = None,
     ) -> RiskDecision:
         """Run all 9 checks. Returns an approved decision with sizing details
         on success, or a rejection with a reason on the first failure.
@@ -99,6 +125,17 @@ class RiskGate:
         :class:`altcoin_agent.price_tape.PriceTape` for the rationale —
         in altcoin pump-and-dump bursts, REST RTT is too slow to *catch
         the top*; the only winning move is to refuse to chase.
+
+        ``regime_filter`` (audit #10): when present, blocks LONG when
+        BTC is in fast drawdown and SHORT when BTC is ripping.
+
+        ``cluster_map`` + ``cluster_cap_cfg`` (audit #11): when both
+        present, blocks any signal that would push the symbol's cluster
+        (e.g. ``meme``) past the configured cap.
+
+        All three optional checks fail-OPEN when their inputs are
+        missing or stale, so existing callers and dry-run tests keep
+        working unchanged.
         """
         if now_ms is None:
             now_ms = int(time.time() * 1000)
@@ -141,6 +178,33 @@ class RiskGate:
                         f"vol_kill_active:{rng:.4f}>"
                         f"{price_tape.cfg.vol_kill_range_pct:.4f}",
                     )
+
+            # 0b) BTC market-regime gate (audit #10).
+            #
+            # Blocks LONG when BTC is dropping fast, SHORT when BTC is
+            # ripping. Cold tape -> fail-open (won't reject every
+            # signal during the first 10 BTC bars after boot).
+            if regime_filter is not None:
+                allowed, reason = regime_filter.allow_direction(
+                    direction=signal.direction.value, now_ms=now_ms,
+                )
+                if not allowed:
+                    return RiskDecision(False, reason)
+
+            # 0c) Symbol-cluster cap (audit #11).
+            #
+            # Prevents the daemon from being SHORT all three of
+            # PEPE/WIF/FLOKI simultaneously: those are one trade,
+            # not three. Counting includes the proposed symbol.
+            if cluster_map is not None and cluster_cap_cfg is not None:
+                breached, reason = cap_breached(
+                    proposed_symbol=signal.symbol,
+                    open_symbols=list(account.open_positions.keys()),
+                    cluster_map=cluster_map,
+                    cap_cfg=cluster_cap_cfg,
+                )
+                if breached:
+                    return RiskDecision(False, reason)
 
             # 1) global halt
             if account.global_trading_halted:

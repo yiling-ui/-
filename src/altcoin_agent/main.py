@@ -328,8 +328,65 @@ async def make_health_app(state: HealthState) -> web.Application:
         }
         return web.json_response(body, status=200 if ok else 503)
 
+    async def metrics(_request: web.Request) -> web.Response:
+        # Audit #23: minimal Prometheus text-format exporter. We bind
+        # the same fields we already publish via /healthz so operators
+        # can plot SLOs without bringing in a heavy client library.
+        # All metrics are gauges (counters that only increase are also
+        # valid gauges); no labels for V1 simplicity. Follow-up PR can
+        # add per-symbol labels once the cardinality budget is set.
+        lines: list[str] = []
+
+        def gauge(name: str, value: float, help_text: str) -> None:
+            lines.append(f"# HELP altcoin_agent_{name} {help_text}")
+            lines.append(f"# TYPE altcoin_agent_{name} gauge")
+            lines.append(f"altcoin_agent_{name} {value}")
+
+        gauge("up", 1.0 if (
+            state.fuser_alive and state.screener_alive
+            and state.reconciliation_complete
+        ) else 0.0, "1 if all subsystems alive AND reconciled")
+        gauge("uptime_sec",
+              round(time.time() - state.started_at, 1),
+              "Seconds since boot")
+        gauge("fuser_alive", 1.0 if state.fuser_alive else 0.0,
+              "1 if the fuser worker is running")
+        gauge("screener_alive", 1.0 if state.screener_alive else 0.0,
+              "1 if the screener worker is running")
+        gauge("reconciliation_complete",
+              1.0 if state.reconciliation_complete else 0.0,
+              "1 if startup reconciler completed successfully")
+        gauge("high_priority_count", state.high_priority_count,
+              "Total high-priority FusedSignals emitted")
+        gauge("rule_event_count", state.rule_event_count,
+              "Total raw screener events seen")
+        gauge("open_positions", state.open_positions,
+              "Currently open positions")
+        gauge("orders_placed", state.orders_placed,
+              "Total entry orders placed")
+        gauge("orders_rejected", state.orders_rejected,
+              "Total entries rejected by the gate or executor")
+        gauge("closed_positions", state.closed_positions,
+              "Total positions closed")
+        gauge("last_close_ts", state.last_close_ts,
+              "Wall-clock ts of most-recent close")
+        gauge("llm_consults", state.llm_consults,
+              "Total LLM consults that produced a verdict")
+        gauge("llm_consults_skipped", state.llm_consults_skipped,
+              "Total LLM consults skipped (no engine, dropped, error)")
+        gauge("post_mortems_scheduled", state.post_mortems_scheduled,
+              "Total post-mortem learning passes scheduled after open")
+        gauge("last_signal_ts", state.last_signal_ts,
+              "Wall-clock ts of most-recent screener event")
+        return web.Response(
+            text="\n".join(lines) + "\n",
+            content_type="text/plain",
+            charset="utf-8",
+        )
+
     app = web.Application()
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/metrics", metrics)
     return app
 
 
@@ -555,11 +612,56 @@ class TrailingController:
                 logger.info("trailing %s: %s -> stop %s (atr=%.5f)",
                             symbol, reason, new_stop, atr)
             else:
-                logger.warning(
-                    "trailing %s: tighten FAILED (%s); position may be naked",
-                    symbol, reason,
-                )
-                self.health.last_error = f"trailing tighten failed on {symbol}"
+                # Audit #15: tighten failed. The executor's
+                # ``tighten_hard_stop`` returns False in two materially
+                # different cases:
+                #   (a) replace failed but the OLD stop is back on the
+                #       book — the position is still protected, just at
+                #       a wider stop than the FSM wanted. We log a
+                #       warning and continue.
+                #   (b) replace failed AND the restore failed. The
+                #       position is **naked** (no resting stop) and
+                #       ``stop_order_id`` is None. SR-2 fail-closed
+                #       posture demands we close it now rather than
+                #       wait for the next bar; we emergency-close at
+                #       market and let the position-watcher fire the
+                #       close callback on its next poll.
+                if tracked.position.stop_order_id is None:
+                    logger.critical(
+                        "trailing %s: tighten FAILED and restore FAILED "
+                        "— position is NAKED, emergency-closing now",
+                        symbol,
+                    )
+                    self.health.last_error = (
+                        f"trailing naked emergency-close {symbol}"
+                    )
+                    try:
+                        await self.executor.adapter.market_order(
+                            symbol=symbol,
+                            side=tracked.position.side.opposite,
+                            size=tracked.position.total_size,
+                            price=bar.close,
+                            reduce_only=True,
+                        )
+                        tracked.position.closed = True
+                        # Bookkeeping: the position-watcher will pick this
+                        # up on its next poll; we don't pre-empt it here so
+                        # the close-callback path stays single-source.
+                    except Exception as e:
+                        logger.critical(
+                            "EMERGENCY CLOSE on naked trailing failed "
+                            "for %s: %s — manual intervention required",
+                            symbol, e,
+                        )
+                else:
+                    logger.warning(
+                        "trailing %s: tighten FAILED (%s); old stop "
+                        "restored, position still protected",
+                        symbol, reason,
+                    )
+                    self.health.last_error = (
+                        f"trailing tighten restored on {symbol}"
+                    )
 
         # Rolling-positions evaluation. We run it AFTER the trailing tick
         # so that whatever the FSM just did to the stop is the baseline
