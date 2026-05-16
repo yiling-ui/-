@@ -89,7 +89,8 @@ Phase B.5 + QUADRANT Phase 4-5（10 天）
 - ✅ QUADRANT Phase 1-3 (框架 + 历史数据 + PumpPhaseFSM + 回测 runner) — feat/quadrant-phase-1-3-scaffolding
 - ✅ Phase B.4 (回测引擎：matching engine + 滑点模型 + walk-forward + data_adapter) — feat/phase-b4-backtest-engine
 - ✅ Phase 4 (训练系统：rule_miner + walk-forward trainer + 80% 晋升门槛 + B.4.4 实盘/回测一致性 e2e) — feat/phase-4-trainer
-- ⏭️  下一步：Phase B.5 LLM Pre-Rate worker + ai_engine 接入（cache + token budget 已在 Phase 1-3 落地）+ QUADRANT Phase 5 实盘接入（SymbolProfile / ConfidenceGate / quadrant params 接入 RiskGate / Sizer / Fuser）
+- ✅ Phase B.5 + QUADRANT Phase 5 部分 (LLMEngine 接 cache + budget_manager + LLMPreRater 后台 worker + QuadrantRiskFactory) — feat/phase-5-llm-prerate
+- ⏭️  下一步：把 LLMPreRater + QuadrantRiskFactory 接入 main.py（操作员真正打开 dry-run 之前最后一步）；30 天 dry-run；Phase B.6 OpenTelemetry trace
 
 ---
 

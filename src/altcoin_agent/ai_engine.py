@@ -14,11 +14,37 @@ Design points (per requirements.md FR-C1..C4 and design.md §3.3):
 * Provider keys are read from <BACKEND>_API_KEY env vars, never config files.
 * Network IO is encapsulated in the LLMProvider, which is the single place
   to monkey-patch in tests.
+
+Phase 5 additions (B.5 LLM Pre-Rate / token budget integration)
+---------------------------------------------------------------
+``LLMEngine`` learned three optional collaborators that, when provided,
+implement the plan's "缓存优先 -> 预算优先 -> 真调用" hierarchy without
+disturbing the existing rule-only fallback path:
+
+* ``cache: LLMCache``       — keyed by ``(symbol, phase, social_hash)``.
+  Cache hits short-circuit the HTTP call entirely (and don't touch the
+  legacy ``budget``), which is the source of the plan's 60-80% token
+  savings. Misses fall through to the provider call and the result is
+  written back so the next ``judge`` for the same context returns 0ms.
+* ``budget_manager: TokenBudgetManager`` — replaces the legacy
+  per-process ``TokenBudget`` for callers ready to enforce the
+  quadrant / mode-tiered policy (FREE -> ECONOMY -> EMERGENCY ->
+  FREEZE). When ``can_call_llm`` rejects, we return a synthetic
+  neutral verdict instead of paying for a call we'd refuse to act on
+  anyway.
+* ``quadrant`` / ``signal_score`` — passed through to the budget
+  manager. Both default to None so callers without quadrant context
+  (e.g. unit tests, debugging consults) keep working unchanged.
+
+The legacy ``TokenBudget`` continues to count successful network
+calls so callers that didn't migrate to ``TokenBudgetManager`` still
+see the same exhaustion behaviour.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +55,8 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from altcoin_agent.llm.cache import LLMCache
+from altcoin_agent.llm.token_budget import TokenBudgetManager
 from altcoin_agent.llm_provider import (
     LLMProvider,
     OpenAICompatibleProvider,
@@ -244,12 +272,20 @@ class LLMEngine:
     By default (no provider passed), build one from env vars (LLM_PROVIDER,
     <backend>_API_KEY). For tests, inject a fake provider that satisfies
     ``LLMProvider``.
+
+    Phase 5 collaborators (all optional, default None for backward compat):
+
+      cache            : LLMCache for symbol+phase+social_hash dedupe
+      budget_manager   : quadrant/tier-aware monthly budget enforcer
+                         (replaces or augments the legacy ``budget`` counter)
     """
 
     provider: LLMProvider | None = None
     timeout: float = 8.0
     max_retries: int = 1
     budget: TokenBudget = field(default_factory=TokenBudget)
+    cache: LLMCache | None = None
+    budget_manager: TokenBudgetManager | None = None
 
     def __post_init__(self) -> None:
         if self.provider is None:
@@ -283,12 +319,62 @@ class LLMEngine:
         smc: SMCContext,
         posts: list[SocialPost],
         extra: dict[str, Any] | None = None,
+        # ---- Phase 5 additions: all optional, all backward-compat ----
+        quadrant: str | None = None,
+        signal_score: float | None = None,
+        phase: str | None = None,
     ) -> AIVerdict:
         if self.provider is None:
             raise EngineError(
                 "No LLM provider configured. Set LLM_PROVIDER and the matching "
                 "<BACKEND>_API_KEY env var."
             )
+
+        # ---- Layer 1: cache lookup ---- #
+        # The cache is keyed by (symbol, phase, social_hash). A hit
+        # returns the previous verdict in 0ms with zero tokens consumed.
+        # We skip caching when phase is None (legacy callers) so the
+        # behaviour for them is identical to pre-Phase-5.
+        cache_key: str | None = None
+        if self.cache is not None and phase is not None:
+            social_hash = _hash_posts(posts)
+            cache_key = LLMCache.make_key(symbol, phase, social_hash)
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                try:
+                    return AIVerdict.model_validate(cached)
+                except ValidationError as e:
+                    logger.warning(
+                        "LLMCache returned malformed verdict for %s; "
+                        "ignoring and falling through to LLM. Err=%s",
+                        cache_key, e.errors()[:2],
+                    )
+
+        # ---- Layer 2: tiered budget gate ---- #
+        # If a TokenBudgetManager is wired, ask it before paying. The
+        # legacy ``budget`` (per-process counter) still gets the
+        # "exhausted" check below as a backstop for callers that
+        # haven't migrated.
+        if self.budget_manager is not None:
+            quadrant_for_gate = quadrant or "D"  # most conservative
+            score_for_gate = (
+                float(signal_score) if signal_score is not None else 0.0
+            )
+            allowed, reason = self.budget_manager.can_call_llm(
+                quadrant=quadrant_for_gate, signal_score=score_for_gate,
+            )
+            if not allowed:
+                logger.info(
+                    "TokenBudgetManager rejected LLM call for %s "
+                    "(quadrant=%s score=%.1f reason=%s); returning neutral.",
+                    symbol, quadrant_for_gate, score_for_gate, reason,
+                )
+                return AIVerdict(
+                    intent="neutral", confidence_score=0,
+                    reason=f"budget_gate:{reason}",
+                    kol_intent="neutral", key_evidence=[],
+                )
+
         self.budget.assert_available()
 
         user_prompt = build_user_prompt(
@@ -310,6 +396,8 @@ class LLMEngine:
                     messages, timeout=self.timeout,
                 )
                 self.budget.add(used_tokens)
+                if self.budget_manager is not None:
+                    self.budget_manager.record_usage(used_tokens)
                 obj = parse_chat_json(raw)
                 # Normalize common drifts
                 if isinstance(obj.get("confidence_score"), str) and obj["confidence_score"].isdigit():
@@ -318,7 +406,17 @@ class LLMEngine:
                     obj["intent"] = obj["intent"].lower()
                 if isinstance(obj.get("kol_intent"), str):
                     obj["kol_intent"] = obj["kol_intent"].lower()
-                return AIVerdict.model_validate(obj)
+                verdict = AIVerdict.model_validate(obj)
+                # ---- Layer 1 write-back ---- #
+                if self.cache is not None and cache_key is not None:
+                    self.cache.put(
+                        symbol=symbol,
+                        phase=phase or "",
+                        social_hash=cache_key.split("|", 2)[2] if "|" in cache_key else "",
+                        verdict=verdict.model_dump(),
+                        tokens_estimate=used_tokens,
+                    )
+                return verdict
             except ValidationError as e:
                 last_err = f"json schema invalid: {e.errors()[:3]}"
                 logger.warning("LLM response failed validation (attempt %s): %s",
@@ -413,3 +511,33 @@ def _parse_verdict(raw: str) -> AIVerdict:
     if isinstance(obj.get("kol_intent"), str):
         obj["kol_intent"] = obj["kol_intent"].lower()
     return AIVerdict.model_validate(obj)
+
+
+def _hash_posts(posts: list[SocialPost]) -> str:
+    """Stable short fingerprint of the social-post bundle.
+
+    The cache key needs to differ when materially-new posts arrive but
+    stay identical for an unchanged bundle — even reordering must
+    produce the same hash so cosmetic ordering changes don't bust
+    the cache. We hash the sorted ``(author, ts, truncated_text)``
+    triples and take the first 16 hex chars, which gives 64 bits of
+    space — plenty for the bounded cache size (~1024 entries).
+
+    Empty post lists collapse to a fixed sentinel so two signals that
+    differ only in zero-post-vs-zero-post ordering still share a key.
+    """
+    if not posts:
+        return "empty"
+    triples = sorted(
+        (p.author or "", int(p.ts), (p.text or "")[:120])
+        for p in posts
+    )
+    h = hashlib.blake2b(digest_size=8)
+    for author, ts, text in triples:
+        h.update(author.encode("utf-8", "replace"))
+        h.update(b"\x1f")
+        h.update(str(ts).encode("ascii"))
+        h.update(b"\x1f")
+        h.update(text.encode("utf-8", "replace"))
+        h.update(b"\x1e")
+    return h.hexdigest()

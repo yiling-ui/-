@@ -69,6 +69,10 @@ from altcoin_agent.risk.pump_phase import (
     PumpPhase,
     PumpPhaseFSM,
 )
+from altcoin_agent.risk.quadrant_factory import (
+    QuadrantRiskBundle,
+    QuadrantRiskFactory,
+)
 from altcoin_agent.risk.reconciler import Reconciler, ReconcilerReport
 from altcoin_agent.risk.regime_filter import RegimeFilter, RegimeFilterConfig
 from altcoin_agent.risk.rolling import (
@@ -85,8 +89,10 @@ from altcoin_agent.risk.symbol_profile import (
     QuadrantParams,
     SymbolProfile,
     SymbolProfileStore,
-    classify as classify_quadrant,
     quadrant_params,
+)
+from altcoin_agent.risk.symbol_profile import (
+    classify as classify_quadrant,
 )
 from altcoin_agent.risk.trailing import TrailingState, TrailingStopFSM
 
@@ -121,6 +127,8 @@ __all__ = [
     "PumpPhaseFSM",
     "Quadrant",
     "QuadrantParams",
+    "QuadrantRiskBundle",
+    "QuadrantRiskFactory",
     "Reconciler",
     "ReconcilerReport",
     "RegimeFilter",
