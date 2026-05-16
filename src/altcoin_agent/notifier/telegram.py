@@ -69,8 +69,20 @@ class _TokenBucket:
         self._last_refill = time.monotonic()
 
     async def acquire(self) -> None:
-        async with self._lock:
-            while True:
+        # Audit (third pass) #5: previously we held the lock across
+        # ``await asyncio.sleep(...)``, which serialised every
+        # concurrent acquire — 30 racing senders would each wait for
+        # the previous one's sleep to finish, turning a 30-msg burst
+        # into ~1.1s of latency instead of the bucket's design intent
+        # (28 msgs immediate, 29th waits ~36ms). The fix is the
+        # standard "compute under lock, sleep outside" pattern: each
+        # iteration acquires the lock just long enough to refill +
+        # check + (on miss) compute the sleep horizon, then releases
+        # before sleeping. Concurrent coroutines therefore observe
+        # tokens being added by wall-clock during their own sleep
+        # rather than queuing behind one another.
+        while True:
+            async with self._lock:
                 now = time.monotonic()
                 elapsed = max(0.0, now - self._last_refill)
                 self._last_refill = now
@@ -83,7 +95,10 @@ class _TokenBucket:
                 # Compute exact sleep until 1 full token will be there.
                 deficit = 1.0 - self._tokens
                 sleep_for = max(0.001, deficit / max(self.rate_per_sec, 1e-6))
-                await asyncio.sleep(sleep_for)
+            # Lock released here; another coroutine may now refill /
+            # decrement under the same wall clock we're about to sleep
+            # over, which is exactly what we want — no serialisation.
+            await asyncio.sleep(sleep_for)
 
 
 @runtime_checkable

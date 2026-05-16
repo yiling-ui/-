@@ -140,10 +140,31 @@ class Reconciler:
             # on 5x it's 6% (clamped to 5%); on no-leverage info we keep 5%.
             max_equity_loss_pct = 0.30
             absolute_cap_pct = 0.05
-            try:
-                lev = float(raw_position.get("leverage") or 0.0)
-            except (TypeError, ValueError):
-                lev = 0.0
+            # Audit (third pass) #8: ccxt unifies many but not all
+            # ``fetch_positions`` fields. ``leverage`` is reliably
+            # present at the top level only on a subset of venues (and
+            # types: spot has no leverage; cross-margin has it under
+            # ``crossLeverage`` on some adapters). On Binance USDT-M
+            # and Bybit v5 the actual value lives under
+            # ``info.leverage``; OKX uses ``info.lever``. We probe all
+            # three so the leverage-aware stop actually fires in
+            # production (the previous code degraded to 5% on every
+            # real venue).
+            lev = 0.0
+            for candidate in (
+                raw_position.get("leverage"),
+                (raw_position.get("info") or {}).get("leverage"),
+                (raw_position.get("info") or {}).get("lever"),
+                (raw_position.get("info") or {}).get("crossLeverage"),
+            ):
+                if candidate is None:
+                    continue
+                try:
+                    lev = float(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if lev > 0:
+                    break
             if lev > 0:
                 lev_aware = max_equity_loss_pct / lev
                 stop_pct = min(absolute_cap_pct, lev_aware)

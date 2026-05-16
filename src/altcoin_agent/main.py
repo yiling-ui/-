@@ -52,15 +52,23 @@ from altcoin_agent.pipeline import (
 )
 from altcoin_agent.price_tape import PriceTape, PriceTapeConfig
 from altcoin_agent.risk import (
+    AccountPersistor,
     AccountState,
     ATRCalculator,
     CCXTExchangeAdapter,
     CCXTExecutor,
+    ClusterCapConfig,
+    ClusterMap,
+    DecisionAuditLog,
     ExchangeAdapter,
+    KillSwitchConfig,
+    KillSwitchWatcher,
     Position,
     PositionSizer,
     PositionWatcher,
     Reconciler,
+    RegimeFilter,
+    RegimeFilterConfig,
     RiskDecision,
     RiskGate,
     RiskGateConfig,
@@ -193,6 +201,50 @@ class AppConfig:
     # cold tape there is fail-closed.
     dry_run_fallback_vol_pct: float = 0.04
 
+    # ------------------------------------------------------------------ #
+    # Audit (third pass) #1: safety modules wiring.
+    #
+    # PR #21 introduced AccountPersistor / RegimeFilter / ClusterMap /
+    # KillSwitchWatcher / DecisionAuditLog as standalone modules but
+    # never wired them into ``App.run`` — they were dead code at
+    # runtime. The third audit pass flagged this as the most
+    # important finding. The knobs below let operators turn each
+    # capability on individually and tune the parameters; defaults are
+    # chosen to match the per-module intent (regime filter on,
+    # cluster cap on with one-per-cluster default, persistence on,
+    # audit log on, kill switch on with sentinel file path).
+    # ------------------------------------------------------------------ #
+    # AccountState persistence (audit #12)
+    account_persistence_enabled: bool = True
+    account_persistence_path: str = ".kiro/state/account.json"
+    # BTC market-regime gate (audit #10)
+    regime_filter_enabled: bool = True
+    regime_reference_symbol: str = "BTC/USDT:USDT"
+    regime_btc_window_ms: int = 60 * 60 * 1000      # 1h
+    regime_btc_drop_block_long_pct: float = 0.03    # 3% drop -> block LONG
+    regime_btc_rip_block_short_pct: float = 0.05    # 5% rip -> block SHORT
+    regime_min_samples: int = 10
+    # Symbol cluster cap (audit #11)
+    # Default OFF: most operators don't yet have a meaningful
+    # ``cluster_map`` populated, and a default-on cap with empty map
+    # would put every symbol in the ``other`` bucket, making the
+    # second concurrent position always rejected. Once an operator
+    # configures ``cluster_map`` in app.yaml they can flip this on.
+    cluster_cap_enabled: bool = False
+    cluster_max_per_cluster: int = 1
+    # Map of base-token -> cluster-name. Empty by default; everything
+    # falls into ``other``. Operators populate this in app.yaml so
+    # PEPE/WIF/FLOKI all map to ``meme`` and don't compete for the same
+    # cap as BTC/ETH/SOL.
+    cluster_map: dict[str, str] = field(default_factory=dict)
+    # Kill switch (audit #25)
+    kill_switch_enabled: bool = True
+    kill_switch_path: str = ".kiro/state/HALT"
+    kill_switch_poll_sec: float = 2.0
+    # Decision audit log (audit #28)
+    decision_audit_log_enabled: bool = True
+    decision_audit_log_path: str = "logs/decisions.jsonl"
+
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
         try:
@@ -272,6 +324,58 @@ class AppConfig:
                 d.get("telegram_fire_and_forget", True)
             ),
             use_uvloop=bool(d.get("use_uvloop", True)),
+            # Audit (third pass) #1: safety wiring.
+            account_persistence_enabled=bool(
+                d.get("account_persistence_enabled", True),
+            ),
+            account_persistence_path=str(
+                d.get(
+                    "account_persistence_path", ".kiro/state/account.json",
+                ),
+            ),
+            regime_filter_enabled=bool(
+                d.get("regime_filter_enabled", True),
+            ),
+            regime_reference_symbol=str(
+                d.get("regime_reference_symbol", "BTC/USDT:USDT"),
+            ),
+            regime_btc_window_ms=int(
+                d.get("regime_btc_window_ms", 60 * 60 * 1000),
+            ),
+            regime_btc_drop_block_long_pct=float(
+                d.get("regime_btc_drop_block_long_pct", 0.03),
+            ),
+            regime_btc_rip_block_short_pct=float(
+                d.get("regime_btc_rip_block_short_pct", 0.05),
+            ),
+            regime_min_samples=int(
+                d.get("regime_min_samples", 10),
+            ),
+            cluster_cap_enabled=bool(
+                d.get("cluster_cap_enabled", False),
+            ),
+            cluster_max_per_cluster=int(
+                d.get("cluster_max_per_cluster", 1),
+            ),
+            cluster_map={
+                str(k): str(v)
+                for k, v in (d.get("cluster_map") or {}).items()
+            },
+            kill_switch_enabled=bool(
+                d.get("kill_switch_enabled", True),
+            ),
+            kill_switch_path=str(
+                d.get("kill_switch_path", ".kiro/state/HALT"),
+            ),
+            kill_switch_poll_sec=float(
+                d.get("kill_switch_poll_sec", 2.0),
+            ),
+            decision_audit_log_enabled=bool(
+                d.get("decision_audit_log_enabled", True),
+            ),
+            decision_audit_log_path=str(
+                d.get("decision_audit_log_path", "logs/decisions.jsonl"),
+            ),
         )
 
 
@@ -576,6 +680,17 @@ class TrailingController:
     the rolling controller is consulted with the same live bar and may
     add a new same-side leg if all gates pass. The rolling step is a
     pure no-op when ``rolling`` is None or its ``cfg.enabled`` is False.
+
+    Audit (third pass) #2 fix: the rolling controller's depth + vol
+    inputs used to be hardcoded class attributes (200k USDT depth,
+    5% realised vol). That made the rolling SR-2 liquidity check a
+    permanent no-op (the threshold compared to itself) and let the
+    sizing path use BTC-grade vol on PEPE-grade alts. We now accept
+    optional async ``depth_provider`` / ``vol_provider`` callbacks
+    that the App wires to the same paths used by the entry hot path
+    (``CCXTExchangeAdapter.fetch_top_depth_usdt`` /
+    ``PriceTape.realized_vol_pct``). When None, we fall back to the
+    legacy fields so existing tests keep passing.
     """
 
     fsm: TrailingStopFSM
@@ -586,6 +701,11 @@ class TrailingController:
     rolling: RollingController | None = None
     rolling_top5_depth_usdt: float = 200_000.0
     rolling_realized_vol_pct: float = 0.05
+    # Optional async hooks. When set, evaluated *per kline tick* so
+    # the rolling gate sees the same live values the entry path used.
+    rolling_depth_provider: Callable[[str], Awaitable[float]] | None = None
+    rolling_vol_provider: Callable[[str], Awaitable[float | None]] | None = None
+    rolling_dry_run_fallback_vol_pct: float = 0.04
     _by_symbol: dict[str, _Tracked] = field(default_factory=dict)
 
     def attach(self, position: Position) -> None:
@@ -644,9 +764,22 @@ class TrailingController:
                             reduce_only=True,
                         )
                         tracked.position.closed = True
-                        # Bookkeeping: the position-watcher will pick this
-                        # up on its next poll; we don't pre-empt it here so
-                        # the close-callback path stays single-source.
+                        # Audit (third pass) #10: free up the concurrency
+                        # slot and engage the same 4h cooldown the
+                        # executor uses on stop-failure paths. Without
+                        # this, the symbol would still occupy a slot in
+                        # ``account.open_positions`` for up to
+                        # ``position_watcher_poll_sec`` (default 5s) —
+                        # long enough for a fresh high-priority signal
+                        # on the same symbol to be allowed in.
+                        # ``_on_position_close`` will see the entry was
+                        # already removed and just runs its bookkeeping.
+                        self.account.open_positions.pop(symbol, None)
+                        self.account.set_cooldown(
+                            symbol,
+                            self.executor.stop_failure_cooldown_sec,
+                            int(bar.ts),
+                        )
                     except Exception as e:
                         logger.critical(
                             "EMERGENCY CLOSE on naked trailing failed "
@@ -669,12 +802,49 @@ class TrailingController:
         # never escapes -- the trailing path is the safety-critical one
         # and must not be blocked by the (optional) rolling path.
         if self.rolling is not None and self.rolling.cfg.enabled:
+            # Audit (third pass) #2: pull live depth + vol per tick when
+            # providers are wired (production); fall back to legacy class
+            # attributes otherwise (existing tests). Failures in the
+            # providers degrade to legacy values rather than blocking
+            # the safety-critical trailing tick on a flaky network.
+            top5_depth_usdt = self.rolling_top5_depth_usdt
+            realized_vol_pct = self.rolling_realized_vol_pct
+            if self.rolling_depth_provider is not None:
+                try:
+                    top5_depth_usdt = float(
+                        await self.rolling_depth_provider(symbol)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "rolling depth_provider failed for %s (%s); "
+                        "skipping rolling tick this bar", symbol, e,
+                    )
+                    return
+            if self.rolling_vol_provider is not None:
+                try:
+                    vol = await self.rolling_vol_provider(symbol)
+                except Exception as e:
+                    logger.warning(
+                        "rolling vol_provider failed for %s (%s); "
+                        "skipping rolling tick this bar", symbol, e,
+                    )
+                    return
+                if vol is None or vol <= 0:
+                    # Cold tape: refuse to size a leg on a guess.
+                    # In dry-run we use the same conservative fallback
+                    # the entry path uses so end-to-end tests can run
+                    # without a live screener.
+                    realized_vol_pct = (
+                        self.rolling_dry_run_fallback_vol_pct
+                    )
+                else:
+                    realized_vol_pct = float(vol)
             try:
                 decision = await self.rolling.maybe_roll(
                     position=tracked.position,
                     account=self.account,
-                    top5_depth_usdt=self.rolling_top5_depth_usdt,
-                    realized_vol_pct=self.rolling_realized_vol_pct,
+                    top5_depth_usdt=top5_depth_usdt,
+                    realized_vol_pct=realized_vol_pct,
                     now_ms=int(bar.ts),
                 )
                 if decision.fired:
@@ -719,6 +889,15 @@ class App:
     depth_provider: Callable[[str], Awaitable[float]] | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     _tasks: list[asyncio.Task] = field(default_factory=list)
+    # Audit (third pass) #4: fire-and-forget tasks (e.g. Telegram
+    # notifications spawned from ``fused_sink`` when
+    # ``cfg.telegram_fire_and_forget=True``) MUST hold a strong reference
+    # somewhere or CPython 3.11+ may garbage-collect them mid-execution
+    # (the asyncio loop only holds weak refs). We track them in a set
+    # and wire ``add_done_callback(self._bg_tasks.discard)`` so completed
+    # tasks are reaped automatically. Shutdown awaits / cancels the
+    # remaining ones so we don't lose pending notifications on SIGTERM.
+    _bg_tasks: set[asyncio.Task] = field(default_factory=set)
     _runner: web.AppRunner | None = None
     _dashboard_runner: web.AppRunner | None = None
     _screener: Screener | None = None
@@ -728,6 +907,16 @@ class App:
     _llm_consultor: LLMConsultor | None = None
     _rolling: RollingController | None = None
     _price_tape: PriceTape | None = None
+    # Audit (third pass) #1: wiring slots for the safety modules
+    # introduced by PR #21. Each is None unless ``App.run`` decides to
+    # construct it based on cfg.* flags. Tests can pre-populate these
+    # to inject mocks before calling run().
+    _persistor: AccountPersistor | None = None
+    _regime_filter: RegimeFilter | None = None
+    _cluster_map: ClusterMap | None = None
+    _cluster_cap_cfg: ClusterCapConfig | None = None
+    _kill_switch: KillSwitchWatcher | None = None
+    _decision_audit_log: DecisionAuditLog | None = None
 
     async def run(self) -> None:
         self.state.started_at = time.time()
@@ -773,15 +962,84 @@ class App:
             starting_equity_today_usdt=self.cfg.initial_equity_usdt,
             rollover_anchor_utc_hour=self.cfg.rollover_anchor_utc_hour,
         )
+        # Audit (third pass) #1: AccountState persistence (audit #12).
+        # Restore from disk BEFORE the first ``maybe_roll_over_day`` call
+        # so that the day stamp loaded from disk is what drives the
+        # rollover decision (a 24h-restart should *not* re-stamp the
+        # equity baseline at the new equity level — that would erase
+        # yesterday's drawdown). When restore fails, ``account`` keeps
+        # its constructor defaults and we proceed cleanly.
+        if self.cfg.account_persistence_enabled and self._persistor is None:
+            self._persistor = AccountPersistor(
+                path=Path(self.cfg.account_persistence_path),
+            )
+        if self._persistor is not None:
+            restored = self._persistor.restore_into(account)
+            if restored:
+                logger.info(
+                    "AccountState restored from %s: equity=%.2f, "
+                    "today_pnl=%.2f, stops_today=%d, halted=%s",
+                    self._persistor.path,
+                    account.equity_usdt,
+                    account.realized_pnl_today_usdt,
+                    account.daily_stoploss_hits,
+                    account.global_trading_halted,
+                )
+            else:
+                logger.info(
+                    "AccountState persistence: no prior snapshot at %s "
+                    "(starting fresh)", self._persistor.path,
+                )
+
         # Bug #3 fix: stamp the boot day so the first real flip resets
         # daily counters cleanly. Without this, ``maybe_roll_over_day``
         # called from any path (the worker, the hot path) would treat
         # boot as a "first ever stamp" and never detect day 1 -> day 2.
         account.maybe_roll_over_day()
+        # Persist the (possibly rollover-touched) snapshot now so a
+        # later crash before any trade still recovers correctly.
+        if self._persistor is not None:
+            self._persistor.save(account)
 
         self.dashboard.health = self.state
         self.dashboard.account = account
         self.dashboard.rules_path = Path(self.cfg.dynamic_rules_path)
+
+        # Audit (third pass) #1: build the gate-side safety modules.
+        # All of them are optional kwargs to RiskGate.evaluate — when
+        # None the gate behaves exactly as before, so existing tests
+        # keep passing without modification. Tests can pre-populate
+        # ``self._regime_filter`` etc. before calling run() to inject
+        # custom configurations.
+        if self.cfg.regime_filter_enabled and self._regime_filter is None:
+            self._regime_filter = RegimeFilter(
+                cfg=RegimeFilterConfig(
+                    reference_symbol=self.cfg.regime_reference_symbol,
+                    btc_window_ms=self.cfg.regime_btc_window_ms,
+                    btc_drop_block_long_pct=(
+                        self.cfg.regime_btc_drop_block_long_pct
+                    ),
+                    btc_rip_block_short_pct=(
+                        self.cfg.regime_btc_rip_block_short_pct
+                    ),
+                    min_samples=self.cfg.regime_min_samples,
+                ),
+            )
+        if self.cfg.cluster_cap_enabled and self._cluster_map is None:
+            self._cluster_map = ClusterMap(
+                explicit={
+                    str(k).upper(): str(v)
+                    for k, v in self.cfg.cluster_map.items()
+                },
+            )
+            self._cluster_cap_cfg = ClusterCapConfig(
+                enabled=True,
+                max_per_cluster=self.cfg.cluster_max_per_cluster,
+            )
+        if self.cfg.decision_audit_log_enabled and self._decision_audit_log is None:
+            self._decision_audit_log = DecisionAuditLog(
+                path=Path(self.cfg.decision_audit_log_path),
+            )
 
         # ----- reconciler (SR-2) -----
         rec_report = await Reconciler(
@@ -860,6 +1118,12 @@ class App:
             # vol-kill gates; missing it would make those gates no-ops.
             if self._price_tape is not None:
                 self._price_tape.observe(symbol, bar.close, int(bar.ts))
+            # Audit (third pass) #1: feed the regime filter from the
+            # same stream. ``observe`` ignores non-reference symbols, so
+            # this fans out for free across whatever symbol set the
+            # screener is following.
+            if self._regime_filter is not None:
+                self._regime_filter.observe(symbol, bar.close, int(bar.ts))
             with suppress(asyncio.QueueFull):
                 kline_q.put_nowait((exchange, symbol, bar))
             await original_on_kline(exchange, symbol, bar)
@@ -891,10 +1155,14 @@ class App:
             # placement starts immediately. Failures are swallowed by
             # the notifier itself.
             if self.cfg.telegram_fire_and_forget:
-                asyncio.create_task(
+                # Audit (third pass) #4: keep a strong reference so
+                # CPython 3.11+ can't GC the task mid-flight.
+                bg = asyncio.create_task(
                     self._safe_notify_signal(payload),
                     name="notify_signal_bg",
                 )
+                self._bg_tasks.add(bg)
+                bg.add_done_callback(self._bg_tasks.discard)
             else:
                 await self.notifier.signal(payload)
             await self._handle_high_priority(
@@ -972,6 +1240,33 @@ class App:
                 notify_error=_notify_roll_error,
             )
             trailing.rolling = self._rolling
+            # Audit (third pass) #2: wire the same live depth + vol
+            # providers the entry hot path uses so the rolling SR-2
+            # liquidity gate isn't comparing the threshold to itself
+            # and the sizing path doesn't apply BTC-grade vol to alts.
+            # The dry-run vol fallback mirrors ``cfg.dry_run_fallback_vol_pct``
+            # so dry-run end-to-end tests stay deterministic.
+            async def _rolling_depth(sym: str) -> float:
+                return await self._fetch_top_depth_usdt(sym)
+
+            async def _rolling_vol(sym: str) -> float | None:
+                if self._price_tape is None:
+                    return None
+                return self._price_tape.realized_vol_pct(
+                    symbol=sym,
+                    window_ms=self.cfg.vol_kill_window_ms,
+                )
+
+            trailing.rolling_depth_provider = _rolling_depth
+            trailing.rolling_vol_provider = _rolling_vol
+            trailing.rolling_dry_run_fallback_vol_pct = (
+                self.cfg.dry_run_fallback_vol_pct
+            )
+            # Keep the legacy fields populated as a last-resort fallback
+            # if a provider raises. ``min_liquidity_usdt`` is the gate
+            # threshold so the legacy fallback is at least sane (it'll
+            # let the rolling gate's own SR-2 check enforce the bar)
+            # rather than the previous identity-equal placeholder.
             trailing.rolling_top5_depth_usdt = self.cfg.min_liquidity_usdt
             logger.info(
                 "Rolling positions ENABLED: trigger_r=%s ratio=%.2f "
@@ -1203,6 +1498,13 @@ class App:
                                 account.realized_pnl_today_usdt,
                                 account.daily_stoploss_hits,
                             )
+                            # Audit (third pass) #1: persist the new
+                            # day's stamp so a restart in the first
+                            # minute of UTC midnight doesn't replay
+                            # the rollover.
+                            if self._persistor is not None:
+                                with suppress(Exception):
+                                    self._persistor.save(account)
                             with suppress(Exception):
                                 await self.notifier.error(
                                     "daily rollover applied",
@@ -1238,6 +1540,55 @@ class App:
         self._tasks.append(asyncio.create_task(
             daily_rollover_worker(), name="daily_rollover_worker",
         ))
+
+        # Audit (third pass) #1 + #25: KillSwitchWatcher. Only built
+        # when enabled. Touches the sentinel file => account.halt(reason)
+        # so the gate's existing global-halt check refuses every entry
+        # (LIVE & paper). Removing the file releases the halt only if
+        # it came from the kill switch (manual halts stay sticky).
+        if self.cfg.kill_switch_enabled and self._kill_switch is None:
+            async def _ks_notify_halt(reason: str) -> None:
+                with suppress(Exception):
+                    if self.notifier is not None:
+                        await self.notifier.error(
+                            f"KILL SWITCH ENGAGED: {reason}",
+                            payload={"halt": True},
+                        )
+
+            async def _ks_notify_release(reason: str) -> None:
+                with suppress(Exception):
+                    if self.notifier is not None:
+                        await self.notifier.error(
+                            f"KILL SWITCH RELEASED: {reason}",
+                            payload={"halt": False},
+                        )
+
+            self._kill_switch = KillSwitchWatcher(
+                cfg=KillSwitchConfig(
+                    enabled=True,
+                    path=Path(self.cfg.kill_switch_path),
+                    poll_sec=self.cfg.kill_switch_poll_sec,
+                ),
+                account=account,
+                on_halt=_ks_notify_halt,
+                on_release=_ks_notify_release,
+            )
+            ks = self._kill_switch
+
+            async def kill_switch_worker() -> None:
+                try:
+                    await ks.run(self._stop_event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.exception("kill_switch_worker failed: %s", e)
+                    self.state.last_error = (
+                        f"kill_switch:{type(e).__name__}"
+                    )
+
+            self._tasks.append(asyncio.create_task(
+                kill_switch_worker(), name="kill_switch_worker",
+            ))
 
         await self._stop_event.wait()
         await self._shutdown()
@@ -1434,7 +1785,41 @@ class App:
             realized_vol_pct=realized_vol_pct,
             initial_stop=initial_stop,
             price_tape=self._price_tape,
+            # Audit (third pass) #1: pass the wired safety gates.
+            # When None (operator opted out via cfg), RiskGate skips
+            # them — same back-compat shape PR #21 already established.
+            regime_filter=self._regime_filter,
+            cluster_map=self._cluster_map,
+            cluster_cap_cfg=self._cluster_cap_cfg,
         )
+
+        # Audit (third pass) #1: every gate decision goes to the audit
+        # log (approved or rejected). This is the only place we can
+        # reconstruct *why* a trade fired (or didn't). Failures inside
+        # ``record_decision`` are swallowed by the log itself.
+        if self._decision_audit_log is not None:
+            with suppress(Exception):
+                self._decision_audit_log.record_decision(
+                    trace_id=str(sig.ts),
+                    symbol=sig.symbol,
+                    signal_kind=",".join(
+                        s.kind.value for s in sig.rule_signals
+                    ) or "fused",
+                    rule_score=float(sig.rule_score),
+                    final_score=float(sig.final_score),
+                    direction=sig.direction.value,
+                    approved=bool(decision.approved),
+                    reason=str(decision.reason),
+                    leverage=decision.leverage,
+                    size=decision.size,
+                    notional_usdt=decision.notional_usdt,
+                    current_price=float(current_price),
+                    top5_depth_usdt=float(top5_depth_usdt),
+                    realized_vol_pct=float(realized_vol_pct),
+                    initial_stop=float(initial_stop),
+                    max_slippage_used=decision.max_slippage_used,
+                )
+
         if not decision.approved:
             logger.info("Risk Gate REJECT %s: %s", sig.symbol, decision.reason)
             self.state.orders_rejected += 1
@@ -1600,6 +1985,13 @@ class App:
             with suppress(Exception):
                 rolling.reset_for_symbol(symbol)
 
+        # 7) Audit (third pass) #1: persist the post-close snapshot so a
+        # crash between this close and the next one doesn't lose the
+        # daily PnL credit / stoploss counter / consec-loss bump.
+        if self._persistor is not None:
+            with suppress(Exception):
+                self._persistor.save(account)
+
         # Note: ``account.open_positions.pop`` and ``position.closed=True``
         # are already done by PositionWatcher before this callback runs;
         # we don't redo them here.
@@ -1667,6 +2059,27 @@ class App:
             for t in self._tasks:
                 t.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        # Audit (third pass) #4: drain in-flight fire-and-forget tasks
+        # (Telegram notifications etc.) so we don't drop messages on
+        # SIGTERM. Cancel any that are still running after a short
+        # grace period — we already gave them the full
+        # graceful_timeout_sec via the workers above; another 2s is
+        # enough for HTTPS round-trips to finish.
+        if self._bg_tasks:
+            pending = list(self._bg_tasks)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Background task drain timeout; cancelling %d "
+                    "fire-and-forget task(s)", len(pending),
+                )
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         if self._runner is not None:
             with suppress(Exception):
                 await self._runner.cleanup()
