@@ -305,5 +305,73 @@ def install_dashboard(
     state: DashboardState,
     mode_label: str = "DRY-RUN",
 ) -> None:
-    """Install dashboard routes on an existing aiohttp app."""
+    """Install dashboard routes on an existing aiohttp app.
+
+    .. deprecated::
+        Mounting the dashboard on the same aiohttp app as ``/healthz`` is
+        unsafe: the healthz site has to bind ``0.0.0.0`` for container
+        probes, but that also exposes positions/orders/rules to anyone who
+        can reach the host. Use :func:`make_dashboard_app` to build a
+        separate app that can be bound to ``127.0.0.1`` (or to ``0.0.0.0``
+        only when ``DASHBOARD_TOKEN`` is set), kept in tree only so old
+        tests that already wired this in keep passing.
+    """
     app.add_routes(_build_routes(state, mode_label))
+
+
+# --------------------------------------------------------------------- #
+# Auth middleware + standalone dashboard app
+# --------------------------------------------------------------------- #
+
+
+_AUTH_HEADER = "X-Auth-Token"
+
+
+def _make_token_middleware(
+    expected_token: str,
+) -> web.middlewares._Middleware:  # type: ignore[name-defined]
+    """Constant-time bearer-style auth on every request.
+
+    Browsers can't easily set custom headers on cross-site GETs, but the
+    real attack surface here is unauthenticated access from anywhere on
+    the host's network. Requiring a header for every request blocks that
+    cleanly. We deliberately do NOT support ``?token=`` query strings so
+    the secret never lands in access logs.
+    """
+    import hmac
+
+    @web.middleware
+    async def middleware(
+        request: web.Request,
+        handler: Any,
+    ) -> web.StreamResponse:
+        provided = request.headers.get(_AUTH_HEADER, "")
+        if not hmac.compare_digest(provided, expected_token):
+            # Generic 401 — no body — so a probe can't tell whether the
+            # endpoint exists. The header name is documented for ops.
+            return web.Response(status=401, text="unauthorized\n")
+        return await handler(request)
+
+    return middleware
+
+
+def make_dashboard_app(
+    state: DashboardState,
+    *,
+    mode_label: str = "DRY-RUN",
+    auth_token: str | None = None,
+) -> web.Application:
+    """Build a STANDALONE aiohttp app for the dashboard + JSON APIs.
+
+    The caller is expected to bind it on a separate ``TCPSite`` from
+    ``/healthz``. ``auth_token``, when set, enables the
+    ``X-Auth-Token`` header check on every route. When ``auth_token`` is
+    None the app stays open — the caller MUST refuse to bind it on a
+    non-loopback address in that mode (see ``main.App.run``).
+    """
+    middlewares: list[Any] = []
+    if auth_token:
+        middlewares.append(_make_token_middleware(auth_token))
+    app = web.Application(middlewares=middlewares)
+    app.add_routes(_build_routes(state, mode_label))
+    return app
