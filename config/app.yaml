@@ -18,9 +18,14 @@ graceful_timeout_sec: 30
 initial_equity_usdt: 10000
 
 # Dry-run is the default. ALWAYS run a fresh deploy with dry_run: true for
-# at least 24 hours before flipping to false. main.py refuses to start
-# with dry_run: false in V1.0 because the live exchange adapter is not
-# yet wired into main.py.
+# at least 24 hours before flipping to false.
+#
+# Live-mode acknowledgement (Bug C5 fix): when dry_run is false AND
+# paper_trade is false, main.py now requires the LIVE_CONFIRM environment
+# variable to be set to the literal string "I_UNDERSTAND" — otherwise it
+# refuses to start with exit code 3. This guards against accidental
+# DRY_RUN=0 from a stale shell or CI script. paper_trade against a venue
+# testnet is exempt because no real funds are at stake.
 dry_run: true
 
 # ----- LLM + self-evolution knobs (optional) -----

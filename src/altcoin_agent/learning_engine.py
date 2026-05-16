@@ -798,28 +798,30 @@ async def post_mortem_via_deepseek(
     )
 
     try:
-        client = await engine._get_client()  # type: ignore[attr-defined]
-        body = {
-            "model": engine.model,
-            "messages": [
-                {"role": "system",
-                 "content": ("You are a quantitative post-mortem analyst. You pick from a "
-                             "closed list of features and never invent new ones. Output "
-                             "STRICT JSON only.")},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.1,
-            "response_format": {"type": "json_object"},
-            "stream": False,
-        }
-        resp = await client.post(
-            "/v1/chat/completions",
-            headers={"Authorization": f"Bearer {engine.api_key}"},
-            json=body,
+        # Bug C3 fix: route the call through the engine's LLMProvider
+        # contract instead of grabbing private attributes off the
+        # engine. The original code did ``engine._get_client()`` and
+        # ``engine.api_key``, but those exist on OpenAICompatibleProvider,
+        # NOT on LLMEngine/DeepSeekEngine — the call site raised
+        # AttributeError on every post-mortem and the except clause
+        # below didn't catch AttributeError either. Net effect: every
+        # online post-mortem silently fell through to the heuristic
+        # fallback instead of consulting the LLM. We now use the
+        # engine's public chat-with-budget path.
+        if engine.provider is None:
+            raise EngineError("engine has no LLMProvider configured")
+        messages = [
+            {"role": "system",
+             "content": ("You are a quantitative post-mortem analyst. You pick from a "
+                         "closed list of features and never invent new ones. Output "
+                         "STRICT JSON only.")},
+            {"role": "user", "content": user},
+        ]
+        engine.budget.assert_available()
+        content, used = await engine.provider.chat_json(
+            messages, timeout=engine.timeout,
         )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        engine.budget.add(int(resp.json().get("usage", {}).get("total_tokens", 0)))
+        engine.budget.add(used)
         parsed = json.loads(content)
         picks: list[PostMortemPick] = []
         for raw in parsed.get("picks", [])[:2]:
@@ -839,8 +841,9 @@ async def post_mortem_via_deepseek(
         if picks:
             return picks
         logger.warning("LLM returned no valid picks; using fallback")
-    except (EngineError, httpx.HTTPError, json.JSONDecodeError, KeyError) as e:
-        logger.warning("DeepSeek post-mortem failed (%s) — falling back to heuristic", e)
+    except (EngineError, httpx.HTTPError, json.JSONDecodeError, KeyError,
+            AttributeError) as e:
+        logger.warning("LLM post-mortem failed (%s) — falling back to heuristic", e)
 
     return _fallback_pick(candidates, result)
 
@@ -945,12 +948,12 @@ async def run_post_mortem(
     result = compute_event_result(s, expected_direction=expected_direction)
     candidates = extract_candidate_features(s, result)
 
-    if engine is not None and engine.api_key:
+    if engine is not None and engine.provider is not None:
         picks = await post_mortem_via_deepseek(
             engine=engine, symbol=symbol, candidates=candidates, result=result,
         )
     else:
-        logger.info("No DeepSeek engine available; using heuristic fallback")
+        logger.info("No LLM engine/provider available; using heuristic fallback")
         picks = _fallback_pick(candidates, result)
 
     updated: list[DynamicRule] = []
