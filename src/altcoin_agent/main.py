@@ -79,6 +79,23 @@ from altcoin_agent.risk import (
     TrailingStopFSM,
     build_ccxt_adapter,
 )
+from altcoin_agent.risk.miss_penalty_engine import (
+    MissPenaltyConfig,
+    MissPenaltyEngine,
+    make_ccxt_kline_fetcher,
+)
+from altcoin_agent.risk.reflection_mode import (
+    ReflectionConfig,
+    ReflectionModeController,
+)
+from altcoin_agent.risk.reject_reason_scorer import (
+    RejectReasonScorer,
+    RejectReasonScorerConfig,
+)
+from altcoin_agent.risk.threshold_auto_tuner import (
+    ThresholdAutoTuner,
+    ThresholdAutoTunerConfig,
+)
 from altcoin_agent.screener import (
     FundingSnapshot,
     Kline,
@@ -245,6 +262,51 @@ class AppConfig:
     decision_audit_log_enabled: bool = True
     decision_audit_log_path: str = "logs/decisions.jsonl"
 
+    # ------------------------------------------------------------------ #
+    # Phase A — opportunity-cost penalty pipeline.
+    #
+    # The miss-penalty worker runs once per UTC day and (a) audits the
+    # last 48h of rejected decisions to find missed pumps, (b)
+    # recomputes the +1 / -3 reject-reason scores. The threshold tuner
+    # runs once per UTC week (Sunday) and emits override proposals.
+    # The reflection-mode controller is checked daily after the
+    # audit; when it fires the daemon enters a 24h suspension window
+    # and Telegram pings the operator with a markdown report.
+    #
+    # Defaults align with MISS_PENALTY_AND_PRODUCTION_PLAN.md§A.2 —
+    # 7-day window, miss>=3 AND trades<2 -> reflection.
+    #
+    # Default OFF: while the audit log isn't yet a week old, the cron
+    # would always classify recent rejections as ``insufficient_data``
+    # and never cross the trigger threshold. Operators flip this on
+    # in app.yaml after a week of dry-run rejections has accumulated.
+    # ------------------------------------------------------------------ #
+    miss_penalty_enabled: bool = False
+    miss_penalty_state_dir: str = ".kiro/state/miss_penalty"
+    miss_penalty_run_at_utc_hour: int = 2  # 02:00 UTC, off-peak
+    miss_penalty_poll_sec: float = 5 * 60.0  # check every 5 min
+    miss_penalty_lookback_hours: int = 48
+    # 24h forward window before a rejection becomes "auditable".
+    miss_penalty_forward_window_sec: int = 24 * 3600
+    # Reflection-mode trigger.
+    reflection_window_days: int = 7
+    reflection_miss_threshold: int = 3
+    reflection_trade_threshold: int = 2
+    reflection_suspension_hours: int = 24
+    # A-quadrant bypass: signals with final_score >= this STILL go
+    # through even when reflection is suspending the daemon.
+    reflection_a_quadrant_bypass_score: float = 95.0
+    reflection_reports_dir: str = ".kiro/state/reflection_reports"
+    # When True, the reflection report calls into the existing
+    # DeepSeek engine (re-using its token budget). When False, only
+    # the deterministic fallback summary is written -- safer for
+    # first-week dry-runs where token budgets aren't dialled in yet.
+    reflection_use_llm: bool = False
+    # Threshold tuner runs only on the UTC weekday matching this number.
+    # 6 == Sunday (Python's date.weekday(): Mon=0..Sun=6). Daily audit
+    # still runs every day; only the proposal step is gated.
+    threshold_tuner_run_on_weekday: int = 6
+
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
         try:
@@ -375,6 +437,48 @@ class AppConfig:
             ),
             decision_audit_log_path=str(
                 d.get("decision_audit_log_path", "logs/decisions.jsonl"),
+            ),
+            # Phase A — miss-penalty pipeline.
+            miss_penalty_enabled=bool(d.get("miss_penalty_enabled", False)),
+            miss_penalty_state_dir=str(
+                d.get("miss_penalty_state_dir", ".kiro/state/miss_penalty"),
+            ),
+            miss_penalty_run_at_utc_hour=int(
+                d.get("miss_penalty_run_at_utc_hour", 2),
+            ),
+            miss_penalty_poll_sec=float(
+                d.get("miss_penalty_poll_sec", 5 * 60.0),
+            ),
+            miss_penalty_lookback_hours=int(
+                d.get("miss_penalty_lookback_hours", 48),
+            ),
+            miss_penalty_forward_window_sec=int(
+                d.get("miss_penalty_forward_window_sec", 24 * 3600),
+            ),
+            reflection_window_days=int(
+                d.get("reflection_window_days", 7),
+            ),
+            reflection_miss_threshold=int(
+                d.get("reflection_miss_threshold", 3),
+            ),
+            reflection_trade_threshold=int(
+                d.get("reflection_trade_threshold", 2),
+            ),
+            reflection_suspension_hours=int(
+                d.get("reflection_suspension_hours", 24),
+            ),
+            reflection_a_quadrant_bypass_score=float(
+                d.get("reflection_a_quadrant_bypass_score", 95.0),
+            ),
+            reflection_reports_dir=str(
+                d.get(
+                    "reflection_reports_dir",
+                    ".kiro/state/reflection_reports",
+                ),
+            ),
+            reflection_use_llm=bool(d.get("reflection_use_llm", False)),
+            threshold_tuner_run_on_weekday=int(
+                d.get("threshold_tuner_run_on_weekday", 6),
             ),
         )
 
@@ -922,6 +1026,13 @@ class App:
     _cluster_cap_cfg: ClusterCapConfig | None = None
     _kill_switch: KillSwitchWatcher | None = None
     _decision_audit_log: DecisionAuditLog | None = None
+    # Phase A — opportunity-cost penalty pipeline. Built by ``run`` when
+    # ``cfg.miss_penalty_enabled`` is True; ``_handle_high_priority``
+    # consults ``_reflection`` to honour the suspension window.
+    _miss_penalty: MissPenaltyEngine | None = None
+    _reject_scorer: RejectReasonScorer | None = None
+    _threshold_tuner: ThresholdAutoTuner | None = None
+    _reflection: ReflectionModeController | None = None
 
     async def run(self) -> None:
         self.state.started_at = time.time()
@@ -1056,6 +1167,14 @@ class App:
             self._decision_audit_log = DecisionAuditLog(
                 path=Path(self.cfg.decision_audit_log_path),
             )
+
+        # Phase A — miss-penalty + reflection-mode pipeline. Default
+        # OFF; operator opts in via ``miss_penalty_enabled`` once the
+        # decision-log file has at least 24h of rejections to audit.
+        # All four objects share the same state directory so the
+        # operator only has to back up one folder.
+        if self.cfg.miss_penalty_enabled and self._reflection is None:
+            self._wire_miss_penalty_pipeline()
 
         # ----- reconciler (SR-2) -----
         rec_report = await Reconciler(
@@ -1557,6 +1676,15 @@ class App:
             daily_rollover_worker(), name="daily_rollover_worker",
         ))
 
+        # Phase A — daily miss-penalty audit + reflection trigger.
+        # Default OFF (cfg.miss_penalty_enabled) so existing dry-run
+        # tests don't grow a new background task they didn't ask for.
+        if self._reflection is not None:
+            self._tasks.append(asyncio.create_task(
+                self._miss_penalty_worker(account),
+                name="miss_penalty_worker",
+            ))
+
         # Audit (third pass) #1 + #25: KillSwitchWatcher. Only built
         # when enabled. Touches the sentinel file => account.halt(reason)
         # so the gate's existing global-halt check refuses every entry
@@ -1621,6 +1749,285 @@ class App:
         except Exception as e:
             logger.warning("notify_signal background task failed: %s", e)
 
+    # ------------------------------------------------------------------ #
+    # Phase A — miss-penalty + reflection-mode wiring
+    # ------------------------------------------------------------------ #
+
+    def _wire_miss_penalty_pipeline(self) -> None:
+        """Construct the four miss-penalty actors when enabled.
+
+        Called once from ``run`` after the decision audit log has been
+        materialised. The kline-fetcher is plumbed lazily (it needs
+        the live ccxt client which is only available on the
+        :class:`CCXTExchangeAdapter` -- in dry-run we use an empty
+        no-op fetcher so the audit logs ``insufficient_data`` rather
+        than crashing).
+        """
+        state_dir = self.cfg.miss_penalty_state_dir
+        decisions_log = Path(self.cfg.decision_audit_log_path)
+        missed_path = Path(state_dir) / "missed_opportunities.jsonl"
+
+        # Audit engine.
+        miss_cfg = MissPenaltyConfig(
+            forward_window_sec=self.cfg.miss_penalty_forward_window_sec,
+            state_dir=state_dir,
+        )
+        self._miss_penalty = MissPenaltyEngine(
+            decisions_log_path=decisions_log,
+            kline_fetcher=self._build_kline_fetcher(),
+            config=miss_cfg,
+        )
+
+        # Reject-reason scorer.
+        self._reject_scorer = RejectReasonScorer(
+            decisions_log_path=decisions_log,
+            missed_opportunities_path=missed_path,
+            config=RejectReasonScorerConfig(
+                state_path=str(
+                    Path(state_dir) / "reject_reason_scores.json",
+                ),
+            ),
+        )
+
+        # Threshold tuner.
+        self._threshold_tuner = ThresholdAutoTuner(
+            scorer=self._reject_scorer,
+            config=ThresholdAutoTunerConfig(
+                overrides_state_path=str(
+                    Path(state_dir) / "threshold_overrides.json",
+                ),
+            ),
+        )
+
+        # Reflection controller. The Telegram callback re-uses the
+        # existing ``error`` channel so the operator gets the alert
+        # through the same chat as kill-switch + rollover events.
+        async def _telegram_callback(payload: dict[str, Any]) -> None:
+            with suppress(Exception):
+                if self.notifier is not None:
+                    await self.notifier.error(
+                        payload.get("title", "策略反思报告"),
+                        payload=payload,
+                    )
+
+        self._reflection = ReflectionModeController(
+            config=ReflectionConfig(
+                window_sec=self.cfg.reflection_window_days * 24 * 3600,
+                miss_threshold=self.cfg.reflection_miss_threshold,
+                trade_threshold=self.cfg.reflection_trade_threshold,
+                suspension_sec=self.cfg.reflection_suspension_hours * 3600,
+                a_quadrant_bypass_score=(
+                    self.cfg.reflection_a_quadrant_bypass_score
+                ),
+                state_path=str(
+                    Path(state_dir) / "reflection_state.json",
+                ),
+                reports_dir=self.cfg.reflection_reports_dir,
+            ),
+            llm_caller=self._build_reflection_llm_caller(),
+            notifier=_telegram_callback,
+        )
+
+    def _build_kline_fetcher(self):
+        """Pick the right :type:`KlineFetcher` for the active adapter.
+
+        For ``CCXTExchangeAdapter`` we re-use the same client the
+        executor talks to (rate-limit / proxy / auth shared). For the
+        in-process ``DryRunExchangeAdapter`` we return a no-op fetcher
+        so the audit silently records ``insufficient_data`` -- a real
+        backtest path would inject a fixture fetcher via
+        ``self._miss_penalty = MissPenaltyEngine(...)`` before run().
+        """
+        adapter = self._adapter
+        client = getattr(adapter, "client", None)
+        if client is not None and hasattr(client, "fetch_ohlcv"):
+            return make_ccxt_kline_fetcher(client)
+
+        async def _empty(_symbol: str, _since: int, _until: int):
+            return []
+
+        return _empty
+
+    def _build_reflection_llm_caller(self):
+        """Return an :type:`LLMCaller` that calls into the existing
+        DeepSeek engine, or None when the operator hasn't opted in.
+
+        Token budget: a single reflection prompt is ~3K tokens. With
+        the trigger cooldown of 24h, max usage is ~90K/month --
+        within the operator's training token budget per
+        ``QUADRANT_STRATEGY_PLAN.md§6.1``.
+        """
+        if not self.cfg.reflection_use_llm:
+            return None
+        engine = self._llm_engine
+        if engine is None:
+            return None
+
+        async def _call(prompt: str) -> str:
+            try:
+                return await engine.chat_text(prompt, timeout=30.0)
+            except AttributeError:
+                # Older engines without chat_text; fall back to the
+                # deterministic summary.
+                return ""
+
+        return _call
+
+    async def _miss_penalty_worker(self, account: AccountState) -> None:
+        """Daily cron: audit yesterday's rejections, score reasons,
+        check reflection trigger; weekly: emit threshold overrides.
+
+        Modelled on ``daily_rollover_worker``: poll every
+        ``miss_penalty_poll_sec`` and fire when the UTC hour matches
+        ``miss_penalty_run_at_utc_hour`` AND the run has not yet
+        completed for the current UTC date.
+        """
+        from datetime import datetime, timezone
+
+        if (
+            self._miss_penalty is None
+            or self._reject_scorer is None
+            or self._threshold_tuner is None
+            or self._reflection is None
+        ):
+            return
+
+        last_run_path = (
+            Path(self.cfg.miss_penalty_state_dir) / "_last_run.txt"
+        )
+        last_run_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _read_last_run_date() -> str:
+            try:
+                return last_run_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                return ""
+
+        def _write_last_run_date(date_str: str) -> None:
+            try:
+                last_run_path.write_text(date_str, encoding="utf-8")
+            except OSError as e:
+                logger.warning("miss_penalty: last_run write failed: %s", e)
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    now_utc = datetime.now(timezone.utc)
+                    today_str = now_utc.strftime("%Y-%m-%d")
+                    last_str = _read_last_run_date()
+                    should_run = (
+                        last_str != today_str
+                        and now_utc.hour >= self.cfg.miss_penalty_run_at_utc_hour
+                    )
+                    if should_run:
+                        await self._run_miss_penalty_pass(
+                            account=account, now_utc=now_utc,
+                        )
+                        _write_last_run_date(today_str)
+                except Exception as e:
+                    logger.exception("miss_penalty_worker failed: %s", e)
+                    self.state.last_error = (
+                        f"miss_penalty:{type(e).__name__}"
+                    )
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=self.cfg.miss_penalty_poll_sec,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            pass
+
+    async def _run_miss_penalty_pass(
+        self, *, account: AccountState, now_utc,
+    ) -> None:
+        """Single audit + score + (weekly) tune + reflection check.
+
+        Pulled out of the worker so tests can call it directly without
+        spinning up a real cron loop.
+        """
+        if (
+            self._miss_penalty is None
+            or self._reject_scorer is None
+            or self._threshold_tuner is None
+            or self._reflection is None
+        ):
+            return
+
+        logger.info(
+            "miss_penalty: starting daily pass at %s", now_utc.isoformat(),
+        )
+
+        # 1) Audit rejections, persist missed_opportunities.jsonl.
+        new_missed = await self._miss_penalty.run_audit(
+            lookback_hours=self.cfg.miss_penalty_lookback_hours,
+        )
+        logger.info("miss_penalty: %d new audit rows", len(new_missed))
+
+        # 2) Recompute reject-reason scores.
+        scores = self._reject_scorer.recompute()
+
+        # 3) Weekly: produce threshold-override proposals.
+        suggested = []
+        if now_utc.weekday() == self.cfg.threshold_tuner_run_on_weekday:
+            overrides = self._threshold_tuner.tune(scores=scores)
+            suggested = [
+                ov.to_dict()
+                for ov in overrides.values()
+                if ov.direction_label == "loosen"
+            ]
+            logger.info(
+                "miss_penalty: %d threshold proposals on weekday=%d",
+                len(suggested), now_utc.weekday(),
+            )
+
+        # 4) Reflection-mode trigger check.
+        all_missed = self._miss_penalty.load_recent_missed()
+        decision = self._reflection.maybe_trigger(
+            missed=all_missed,
+            actual_trades_in_window=self._count_recent_trades(
+                window_sec=self.cfg.reflection_window_days * 24 * 3600,
+            ),
+        )
+        if decision.triggered:
+            logger.warning(
+                "miss_penalty: reflection mode TRIGGERED -- %s",
+                decision.reason,
+            )
+            await self._reflection.generate_report(
+                decision=decision,
+                missed=all_missed,
+                scores=scores,
+                suggested_overrides=suggested,
+            )
+        else:
+            logger.info(
+                "miss_penalty: reflection check ok (%s)", decision.reason,
+            )
+
+    def _count_recent_trades(self, *, window_sec: int) -> int:
+        """Count approved decisions in the last ``window_sec`` seconds.
+
+        We re-walk the audit log instead of maintaining an in-memory
+        counter so a daemon restart doesn't reset the count
+        mid-window. Cost is amortised: the worker only runs once per
+        day and the audit log is bounded by the rotation policy
+        (``audit_log.py``).
+        """
+        from altcoin_agent.risk.miss_penalty_engine import (
+            iter_decisions_with_rotations,
+        )
+
+        cutoff = time.time() - window_sec
+        count = 0
+        for rec in iter_decisions_with_rotations(
+            Path(self.cfg.decision_audit_log_path), since_ts=cutoff,
+        ):
+            if rec.get("approved", False):
+                count += 1
+        return count
+
     async def _get_live_quote(self, symbol: str) -> float:
         """Return a fresh mark/last price for ``symbol``.
 
@@ -1678,6 +2085,48 @@ class App:
             return
         if sig.trigger_price is None or sig.trigger_price <= 0:
             logger.warning("missing trigger_price on %s; skipping order", sig.symbol)
+            return
+
+        # Phase A — reflection mode suspension.
+        #
+        # When the controller has paused the daemon (because the last
+        # 7 days saw >=3 missed pumps and <2 trades), only A-quadrant
+        # signals (final_score >= a_quadrant_bypass_score) get through.
+        # We log the rejection in the audit so the operator can see
+        # what got blocked while reflecting; everything below the
+        # bypass score never reaches the gate.
+        if (
+            self._reflection is not None
+            and self._reflection.is_suspended()
+            and not self._reflection.can_bypass_suspension(
+                final_score=sig.final_score,
+            )
+        ):
+            self.state.orders_rejected += 1
+            reason = (
+                f"reflection_mode_suspended:final_score={sig.final_score:.1f}"
+                f"<{self.cfg.reflection_a_quadrant_bypass_score:.1f}"
+            )
+            if self._decision_audit_log is not None:
+                with suppress(Exception):
+                    self._decision_audit_log.record_decision(
+                        trace_id=getattr(sig, "trace_id", None),
+                        symbol=sig.symbol,
+                        signal_kind=getattr(sig, "kind", "unknown"),
+                        rule_score=sig.rule_score,
+                        final_score=sig.final_score,
+                        direction=sig.direction.value,
+                        approved=False,
+                        reason=reason,
+                        leverage=None, size=None, notional_usdt=None,
+                        current_price=sig.trigger_price,
+                        top5_depth_usdt=None, realized_vol_pct=None,
+                        initial_stop=None, max_slippage_used=None,
+                    )
+            logger.info(
+                "Reflection mode suspended; rejecting %s (%s)",
+                sig.symbol, reason,
+            )
             return
 
         # Bug #3 fix (defence-in-depth): the background rollover worker
