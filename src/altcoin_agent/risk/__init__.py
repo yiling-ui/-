@@ -44,6 +44,11 @@ from altcoin_agent.risk.cluster import (
     ClusterMap,
     cap_breached,
 )
+from altcoin_agent.risk.confidence_gate import (
+    ConfidenceGate,
+    ConfidenceVerdict,
+    ConfidenceWeights,
+)
 from altcoin_agent.risk.executor import (
     CCXTExecutor,
     ExchangeAdapter,
@@ -56,6 +61,14 @@ from altcoin_agent.risk.kill_switch import (
 )
 from altcoin_agent.risk.persistence import AccountPersistor
 from altcoin_agent.risk.position_watcher import CloseCallback, PositionWatcher
+from altcoin_agent.risk.pump_phase import (
+    KlineBar,
+    PhaseInputs,
+    PhaseThresholds,
+    PhaseTransition,
+    PumpPhase,
+    PumpPhaseFSM,
+)
 from altcoin_agent.risk.reconciler import Reconciler, ReconcilerReport
 from altcoin_agent.risk.regime_filter import RegimeFilter, RegimeFilterConfig
 from altcoin_agent.risk.rolling import (
@@ -66,6 +79,15 @@ from altcoin_agent.risk.rolling import (
 from altcoin_agent.risk.sizing import DynamicLeverageConfig, PositionSizer
 from altcoin_agent.risk.sqlite_persistence import SQLiteAccountStore
 from altcoin_agent.risk.state import AccountState, Position, PositionLeg, Side
+from altcoin_agent.risk.symbol_profile import (
+    DEFAULT_QUADRANT_PARAMS,
+    Quadrant,
+    QuadrantParams,
+    SymbolProfile,
+    SymbolProfileStore,
+    classify as classify_quadrant,
+    quadrant_params,
+)
 from altcoin_agent.risk.trailing import TrailingState, TrailingStopFSM
 
 __all__ = [
@@ -77,16 +99,28 @@ __all__ = [
     "CloseCallback",
     "ClusterCapConfig",
     "ClusterMap",
+    "ConfidenceGate",
+    "ConfidenceVerdict",
+    "ConfidenceWeights",
+    "DEFAULT_QUADRANT_PARAMS",
     "DecisionAuditLog",
     "DynamicLeverageConfig",
     "ExchangeAdapter",
     "ExecutionError",
     "KillSwitchConfig",
     "KillSwitchWatcher",
+    "KlineBar",
+    "PhaseInputs",
+    "PhaseThresholds",
+    "PhaseTransition",
     "Position",
     "PositionLeg",
     "PositionSizer",
     "PositionWatcher",
+    "PumpPhase",
+    "PumpPhaseFSM",
+    "Quadrant",
+    "QuadrantParams",
     "Reconciler",
     "ReconcilerReport",
     "RegimeFilter",
@@ -99,8 +133,12 @@ __all__ = [
     "RollingController",
     "Side",
     "SQLiteAccountStore",
+    "SymbolProfile",
+    "SymbolProfileStore",
     "TrailingState",
     "TrailingStopFSM",
     "build_ccxt_adapter",
     "cap_breached",
+    "classify_quadrant",
+    "quadrant_params",
 ]
