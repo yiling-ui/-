@@ -88,7 +88,8 @@ Phase B.5 + QUADRANT Phase 4-5（10 天）
 - ✅ Phase B.2 (监控 / 结构化日志 / DLQ) + B.3 (SQLite WAL) — 本次提交
 - ✅ QUADRANT Phase 1-3 (框架 + 历史数据 + PumpPhaseFSM + 回测 runner) — feat/quadrant-phase-1-3-scaffolding
 - ✅ Phase B.4 (回测引擎：matching engine + 滑点模型 + walk-forward + data_adapter) — feat/phase-b4-backtest-engine
-- ⏭️  下一步：Phase 4 训练系统（trainer 实装：用历史数据 + matching engine 跑 walk-forward，输出 production_rules.json）+ Phase B.5 LLM Pre-Rate cache
+- ✅ Phase 4 (训练系统：rule_miner + walk-forward trainer + 80% 晋升门槛 + B.4.4 实盘/回测一致性 e2e) — feat/phase-4-trainer
+- ⏭️  下一步：Phase B.5 LLM Pre-Rate worker + ai_engine 接入（cache + token budget 已在 Phase 1-3 落地）+ QUADRANT Phase 5 实盘接入（SymbolProfile / ConfidenceGate / quadrant params 接入 RiskGate / Sizer / Fuser）
 
 ---
 
