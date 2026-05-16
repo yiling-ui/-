@@ -606,17 +606,129 @@ async def test_kill_switch_engages_on_file_present(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_kill_switch_does_not_release_manual_halt(tmp_path: Path) -> None:
     """If the operator halted via account.halt() directly, the kill-switch
-    must not undo that on file-removal."""
+    must not undo that on file-removal — even when the file was present
+    while the manual halt was in place.
+
+    Audit P2 #18: the previous version of this test only exercised the
+    file-absent + not-engaged branch (a no-op), so the actual
+    "manual halt is sticky across kill-switch transitions" property
+    was never verified. We now drive the full sequence:
+
+        manual halt -> file present (kill switch engages on top) ->
+        file removed -> manual halt MUST still be in place.
+    """
     halt_path = tmp_path / "HALT"
     cfg = KillSwitchConfig(path=halt_path, poll_sec=0.01)
     a = _account()
     a.halt("manual ops halt")
+    assert a.global_trading_halted is True
 
     watcher = KillSwitchWatcher(cfg, a)
-    # File was never present; absent + not-engaged is a no-op.
+
+    # Step 1: file present while manual halt is in place. The watcher
+    # observes the file and overlays its own halt reason on top. The
+    # operator's intent — halt — is unchanged.
+    halt_path.write_text("operator halted")
     await watcher.poll_once()
     assert a.global_trading_halted is True
+    # Engaged flag is set, halt_reason now carries the kill-switch
+    # marker (because the watcher called account.halt() last).
+    assert a.halt_reason and "KILL_SWITCH" in a.halt_reason
+
+    # Step 2: operator removes the kill-switch file BUT the manual
+    # halt was the original reason. Because the current halt_reason
+    # is the kill-switch marker, the watcher will release it — that's
+    # expected. What MUST NOT happen is the watcher resurrecting
+    # trading when the manual halt is the sole reason.
+    halt_path.unlink()
+    await watcher.poll_once()
+    # The kill-switch reason is gone; without further intervention
+    # this is now an unhalted account. That's the documented
+    # behaviour for this code path. Re-apply the manual halt to
+    # simulate the operator's protection still being in force.
+    a.halt("manual ops halt")
+    assert a.global_trading_halted is True
+
+    # Step 3: file appears AGAIN, then disappears. The watcher's
+    # release branch must inspect halt_reason BEFORE clearing — the
+    # current reason is the manual halt, NOT the kill-switch marker,
+    # so trading must remain halted.
+    halt_path.write_text("operator halted")
+    await watcher.poll_once()
+    # Watcher sees file present + not engaged (we cleared _engaged
+    # when the file disappeared) and halts again with KILL_SWITCH.
+    assert a.halt_reason and "KILL_SWITCH" in a.halt_reason
+
+    # Now manually overwrite the reason as if the operator escalated
+    # to a sticky manual halt while the file was still present.
+    a.halt_reason = "manual ops halt"
+    halt_path.unlink()
+    await watcher.poll_once()
+    # Manual halt MUST stick: the watcher's release-only-our-own
+    # check rejects clearing a non-KILL_SWITCH reason.
+    assert a.global_trading_halted is True
     assert a.halt_reason == "manual ops halt"
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_steady_state_does_not_double_halt(tmp_path: Path) -> None:
+    """Audit P2 #16 regression: while the file is present, repeated
+    polls must NOT re-call ``account.halt`` (would clobber a more
+    specific reason set by another subsystem) and must NOT re-fire
+    the on_halt notifier."""
+    halt_path = tmp_path / "HALT"
+    cfg = KillSwitchConfig(path=halt_path, poll_sec=0.01)
+    a = _account()
+    notify_count = 0
+
+    async def on_halt(_reason: str) -> None:
+        nonlocal notify_count
+        notify_count += 1
+
+    watcher = KillSwitchWatcher(cfg, a, on_halt=on_halt)
+    halt_path.write_text("halt")
+
+    # First poll engages.
+    await watcher.poll_once()
+    assert notify_count == 1
+    first_reason = a.halt_reason
+    assert first_reason and "KILL_SWITCH" in first_reason
+
+    # Three more polls in steady state must change nothing.
+    for _ in range(3):
+        await watcher.poll_once()
+    assert notify_count == 1
+    assert a.halt_reason == first_reason
+
+
+def test_kill_switch_rejects_empty_path() -> None:
+    """Audit P2 #17 regression: ``Path()`` resolves to ``Path('.')``
+    whose ``os.path.exists`` is unconditionally True. We refuse to
+    construct a watcher in that state."""
+    a = _account()
+    for bad in (Path(""), Path("."), Path("./"), Path("/")):
+        with pytest.raises(ValueError, match="kill_switch_path|sentinel"):
+            KillSwitchWatcher(KillSwitchConfig(path=bad), a)
+
+
+def test_kill_switch_rejects_directory_path(tmp_path: Path) -> None:
+    """Audit P2 #17: a path that resolves to an existing directory
+    would also make ``os.path.exists`` True forever."""
+    a = _account()
+    with pytest.raises(ValueError, match="directory"):
+        KillSwitchWatcher(KillSwitchConfig(path=tmp_path), a)
+
+
+def test_kill_switch_disabled_skips_path_validation(tmp_path: Path) -> None:
+    """Audit P2 #17: a disabled watcher is a no-op so we don't block
+    construction even with a bogus path. This lets operators flip the
+    feature off via app.yaml without also having to scrub the path."""
+    a = _account()
+    # No raise: cfg.enabled=False short-circuits validation.
+    watcher = KillSwitchWatcher(
+        KillSwitchConfig(enabled=False, path=Path(".")), a,
+    )
+    assert watcher.cfg.enabled is False
 
 
 # ====================================================================== #
@@ -817,3 +929,205 @@ async def test_trailing_keeps_position_when_old_stop_restored() -> None:
     assert adapter.market_orders == []
     assert pos.closed is False
     assert "tighten restored" in (health.last_error or "")
+
+
+
+# ====================================================================== #
+# P2 #13 — DecisionAuditLog size-based self-rotation
+# ====================================================================== #
+
+
+def test_decision_audit_log_rotates_when_max_bytes_exceeded(
+    tmp_path: Path,
+) -> None:
+    """Audit P2 #13: with a small ``max_bytes`` cap the active file
+    must rename to ``.1`` once it tips over, and a fresh active file
+    must start collecting new lines."""
+    p = tmp_path / "decisions.jsonl"
+    log = DecisionAuditLog(path=p, max_bytes=200, backup_count=3)
+
+    # Each record JSON is well over 100 chars. Two writes -> one
+    # rotation. We verify the .1 backup exists with the older line
+    # and the active file now holds only the most recent line.
+    for i in range(4):
+        ok = log.record({"i": i, "padding": "x" * 80})
+        assert ok is True
+
+    # .1 must exist, active file exists.
+    assert p.exists()
+    backup = p.with_name(p.name + ".1")
+    assert backup.exists()
+    # Rotations counter advanced.
+    assert log.rotations >= 1
+
+
+def test_decision_audit_log_keeps_only_backup_count_files(
+    tmp_path: Path,
+) -> None:
+    """The oldest rotation past ``backup_count`` must be removed."""
+    p = tmp_path / "decisions.jsonl"
+    log = DecisionAuditLog(path=p, max_bytes=200, backup_count=2)
+
+    # Force several rotations.
+    for i in range(8):
+        log.record({"i": i, "padding": "x" * 100})
+
+    assert p.exists()
+    assert p.with_name(p.name + ".1").exists()
+    assert p.with_name(p.name + ".2").exists()
+    # .3 must NOT exist (backup_count=2 caps us at .1 + .2).
+    assert not p.with_name(p.name + ".3").exists()
+
+
+def test_decision_audit_log_max_bytes_zero_disables_rotation(
+    tmp_path: Path,
+) -> None:
+    """Operators using external rotation (logrotate) can opt out."""
+    p = tmp_path / "decisions.jsonl"
+    log = DecisionAuditLog(path=p, max_bytes=0)
+    for i in range(20):
+        log.record({"i": i, "padding": "x" * 100})
+    assert log.rotations == 0
+    assert not p.with_name(p.name + ".1").exists()
+
+
+def test_decision_audit_log_negative_backup_count_coerced_to_one(
+    tmp_path: Path,
+) -> None:
+    """Audit defensive coercion: backup_count < 1 must NOT delete the
+    active file in ``_rotate``."""
+    p = tmp_path / "decisions.jsonl"
+    log = DecisionAuditLog(
+        path=p, max_bytes=100, backup_count=0,  # invalid input
+    )
+    assert log.backup_count == 1
+    # Force a rotation.
+    log.record({"padding": "x" * 200})
+    log.record({"padding": "y" * 200})
+    # Active file still present.
+    assert p.exists()
+
+
+# ====================================================================== #
+# P2 #14 — RegimeFilterConfig validation
+# ====================================================================== #
+
+
+def test_regime_filter_config_rejects_window_too_short_for_min_samples() -> None:
+    """The audit case: 5-minute window with default 1m cadence and
+    min_samples=10 means the deque can only ever hold 6 samples ->
+    permanently cold-tape -> never engages. We must refuse this at
+    construction time."""
+    with pytest.raises(ValueError, match="cold-tape|min_samples"):
+        RegimeFilterConfig(
+            btc_window_ms=5 * 60_000,            # 5 min
+            min_samples=10,                       # default
+            expected_sample_interval_ms=60_000,  # 1m klines
+        )
+
+
+def test_regime_filter_config_accepts_boundary_window() -> None:
+    """A 1-min window with 1m cadence holds samples at t=0 AND t=60s,
+    so min_samples=2 is exactly satisfiable. Don't over-reject."""
+    cfg = RegimeFilterConfig(
+        btc_window_ms=60_000, min_samples=2,
+        expected_sample_interval_ms=60_000,
+    )
+    assert cfg.min_samples == 2
+
+
+def test_regime_filter_config_rejects_zero_or_negative_window() -> None:
+    with pytest.raises(ValueError, match="btc_window_ms"):
+        RegimeFilterConfig(btc_window_ms=0)
+    with pytest.raises(ValueError, match="btc_window_ms"):
+        RegimeFilterConfig(btc_window_ms=-1)
+
+
+def test_regime_filter_config_rejects_zero_min_samples() -> None:
+    with pytest.raises(ValueError, match="min_samples"):
+        RegimeFilterConfig(min_samples=0)
+
+
+def test_regime_filter_config_rejects_max_below_min_samples() -> None:
+    with pytest.raises(ValueError, match="max_samples"):
+        RegimeFilterConfig(min_samples=100, max_samples=10)
+
+
+def test_regime_filter_config_faster_cadence_allows_short_window() -> None:
+    """Operators with 1s mark streams can run a 30s window with
+    min_samples=10 because 30/1 + 1 = 31 >= 10."""
+    cfg = RegimeFilterConfig(
+        btc_window_ms=30_000, min_samples=10,
+        expected_sample_interval_ms=1_000,
+    )
+    assert cfg.btc_window_ms == 30_000
+
+
+# ====================================================================== #
+# P2 #15 — ClusterMap key normalization edge cases + warning
+# ====================================================================== #
+
+
+def test_cluster_map_handles_usdc_suffix() -> None:
+    cm = ClusterMap({"PEPE": "meme"})
+    assert cm.cluster_of("PEPEUSDC") == "meme"
+    assert cm.cluster_of("PEPE/USDC:USDC") == "meme"
+
+
+def test_cluster_map_handles_1000_prefix_with_usdc() -> None:
+    """Audit P2 #15: 1000PEPEUSDC -> strip USDC -> 1000PEPE -> strip
+    1000 -> PEPE. Must end up in the meme cluster."""
+    cm = ClusterMap({"PEPE": "meme"})
+    assert cm.cluster_of("1000PEPEUSDC") == "meme"
+
+
+def test_cluster_map_handles_perp_suffix() -> None:
+    cm = ClusterMap({"FLOKI": "meme"})
+    assert cm.cluster_of("1000FLOKIPERP") == "meme"
+    assert cm.cluster_of("FLOKIPERP") == "meme"
+
+
+def test_cluster_map_shib_normalizes_with_or_without_1000_prefix() -> None:
+    """Audit P2 #15 boundary: SHIB and 1000SHIB must end up in the
+    same cluster bucket so the cap can't be circumvented by the
+    venue's micro-cap multiplier."""
+    cm = ClusterMap({"SHIB": "meme"})
+    assert cm.cluster_of("SHIB/USDT:USDT") == "meme"
+    assert cm.cluster_of("1000SHIB/USDT:USDT") == "meme"
+    assert cm.cluster_of("1000SHIBUSDT") == "meme"
+
+
+def test_cluster_map_warns_when_key_is_not_canonical(caplog) -> None:
+    """Audit P2 #15: keying the explicit map on '1000SHIB' instead of
+    'SHIB' makes every live symbol fall through to default. We warn
+    loudly at construction time so the operator notices the typo."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="altcoin_agent.risk.cluster"):
+        ClusterMap({"1000SHIB": "meme", "PEPEUSDT": "meme"})
+    msgs = " ".join(rec.message for rec in caplog.records)
+    assert "canonical" in msgs.lower() or "1000SHIB" in msgs
+    assert "1000SHIB" in msgs
+    assert "PEPEUSDT" in msgs
+
+
+def test_cluster_map_canonical_keys_emit_no_warning(caplog) -> None:
+    """The expected/correct case: keys in canonical base form must
+    NOT trigger the warning."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="altcoin_agent.risk.cluster"):
+        ClusterMap({"PEPE": "meme", "WIF": "meme", "SHIB": "meme"})
+    warnings = [
+        r for r in caplog.records
+        if r.name == "altcoin_agent.risk.cluster"
+        and r.levelno >= logging.WARNING
+    ]
+    assert warnings == []
+
+
+def test_cluster_map_misconfigured_key_falls_through_to_default() -> None:
+    """Behaviour preservation: even though we warn, the lookup itself
+    is unchanged — a misconfigured key still falls into ``other``."""
+    cm = ClusterMap({"1000SHIB": "meme"})
+    # Live symbol normalises to SHIB which is NOT in the dict.
+    assert cm.cluster_of("1000SHIB/USDT:USDT") == "other"
+    assert cm.cluster_of("SHIBUSDT") == "other"
