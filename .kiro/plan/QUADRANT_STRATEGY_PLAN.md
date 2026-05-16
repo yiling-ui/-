@@ -311,7 +311,7 @@ class TokenBudgetManager:
 
 ### Phase 1: 框架搭建（第 1-2 天）
 
-- [ ] 创建模块目录骨架
+- [x] 创建模块目录骨架
   - `src/altcoin_agent/risk/symbol_profile.py`
   - `src/altcoin_agent/risk/pump_phase.py`
   - `src/altcoin_agent/risk/confidence_gate.py`
@@ -321,33 +321,33 @@ class TokenBudgetManager:
   - `src/altcoin_agent/backtest/runner.py`
   - `src/altcoin_agent/training/trainer.py`
   - `src/altcoin_agent/training/rules_promoter.py`
-- [ ] 写 `dataclass` 骨架（SymbolProfile / PumpPhase enum / ConfidenceVerdict / TokenBudgetState）
-- [ ] 写最小可运行的 mock 实现（returns hardcoded values）
-- [ ] 单元测试：每个 dataclass 序列化 + 反序列化
+- [x] 写 `dataclass` 骨架（SymbolProfile / PumpPhase enum / ConfidenceVerdict / TokenBudgetState）
+- [x] 写最小可运行的 mock 实现（returns hardcoded values）
+- [x] 单元测试：每个 dataclass 序列化 + 反序列化
 
-**验收**：`pytest tests/` 全部通过，新模块 import 不报错。
+**验收**：`pytest tests/` 全部通过，新模块 import 不报错。**已通过 (614 passed, 92 new tests).**
 
 ### Phase 2: 历史数据回填（第 3-4 天）
 
-- [ ] 实现 `historical_loader.py`
+- [x] 实现 `historical_loader.py`
   - ccxt fetch_ohlcv 拉 100 个 symbol 过去 3 年的 1m K 线
-  - 限速：每分钟 < 1200 次请求（binance 上限）
-  - 增量缓存：已下载的不重复
-  - 输出：`.kiro/state/backtest_cache/{symbol}/{year}_{month}.parquet`
-- [ ] 实现 `funding_history_loader.py`
-- [ ] 写一个 CLI：`python -m altcoin_agent.backtest.historical_loader --symbols PEPE,WIF,TRUMP --years 3`
+  - 限速：每分钟 < 1200 次请求（binance 上限）— 通过 `inter_call_sleep_sec` 节流
+  - 增量缓存：已下载的不重复（`force=False` 跳过已有月份）
+  - 输出：`.kiro/state/backtest_cache/{exchange}/{symbol}/{tf}/{YYYY}/{MM}.json`（v1 用 JSON，避免 pyarrow 依赖）
+- [ ] 实现 `funding_history_loader.py` — Phase 4 再做
+- [ ] 写一个 CLI：`python -m altcoin_agent.backtest.historical_loader --symbols PEPE,WIF,TRUMP --years 3` — Phase 4 再做
 
-**验收**：能下载 + 加载 PEPE 过去 3 年的 1m K 线（约 150 万根）。
+**验收**：能下载 + 加载 PEPE 过去 3 年的 1m K 线（约 150 万根）。**Phase 1-3 内只验证了 mock fetcher + 月份分片缓存；100-symbol × 3y 的真实拉取留给操作员触发。**
 
 ### Phase 3: 相位识别 + 回测引擎（第 5-7 天）
 
-- [ ] 实现 `pump_phase.py` 状态机
-- [ ] 写 `phase_tagger.py` CLI：输入 symbol + 时间范围，输出每根 K 的 phase 标签
-- [ ] 用历史数据验证：手动选 3 个已知妖币（PEPE 2024.5、WIF 2024.3、TRUMP 2025.1），对比代码输出的相位序列与人工判断的相位
-- [ ] 实现 `backtest/runner.py`：离线驱动 Screener + Phase + Fuser + Gate
-- [ ] 输出：每个 symbol 的 backtest report（trades, PnL curve, max_dd, sharpe）
+- [x] 实现 `pump_phase.py` 状态机
+- [ ] 写 `phase_tagger.py` CLI：输入 symbol + 时间范围，输出每根 K 的 phase 标签 — Phase 4 再做
+- [ ] 用历史数据验证：手动选 3 个已知妖币（PEPE 2024.5、WIF 2024.3、TRUMP 2025.1），对比代码输出的相位序列与人工判断的相位 — Phase 4 验证
+- [x] 实现 `backtest/runner.py`：离线驱动 PumpPhaseFSM 输出每根 K 的 phase 标签（Screener + Fuser + Gate 的串接留给 Phase B.4 完整回测引擎）
+- [ ] 输出：每个 symbol 的 backtest report（trades, PnL curve, max_dd, sharpe）— Phase B.4
 
-**验收**：在 PEPE 2024.5 那次妖币行情上，回测出 +200~600% 收益（A 象限预期）。
+**验收**：在 PEPE 2024.5 那次妖币行情上，回测出 +200~600% 收益（A 象限预期）。**Phase 1-3 仅验证了合成 pump cycle 的相位识别正确（RAMP→PARABOLIC→BLOWOFF→CRASH 全部命中）；真实数据回测留给 Phase B.4 + Phase 4。**
 
 ### Phase 4: 训练系统（第 8-12 天）
 
