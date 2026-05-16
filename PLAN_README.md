@@ -85,7 +85,8 @@ Phase B.5 + QUADRANT Phase 4-5（10 天）
 **进度**:
 - ✅ Phase B.1 (P0 致命缺口) — PR #24 已合并
 - ✅ Phase A (机会成本惩罚 + 反思模式) — PR feat/phase-a-miss-penalty-engine
-- ⏭️  下一步：Phase B.2 + B.3（监控 / SQLite WAL）并行；之后 QUADRANT Phase 1-3
+- ✅ Phase B.2 (监控 / 结构化日志 / DLQ) + B.3 (SQLite WAL) — 本次提交
+- ⏭️  下一步：QUADRANT Phase 1-3（框架 + 历史数据 + PumpPhaseFSM）
 
 ---
 
