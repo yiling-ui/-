@@ -91,6 +91,44 @@ class CCXTExchangeAdapter:
 
     # ---------------- helpers ---------------- #
 
+    def _idempotency_param_key(self) -> str:
+        """Return the venue-specific parameter name ccxt expects for
+        client-side idempotency tokens.
+
+        Phase B.1.1 — ccxt unifies most Binance / OKX / Gate.io
+        params but leaves the idempotency key venue-specific:
+            binance USDT-M futures: ``newClientOrderId``
+            okx swap:               ``clOrdId``
+            gateio swap:            ``text``  (Gate.io's client_oid
+                                                 must start with ``t-`` and
+                                                 the param is named ``text``;
+                                                 the value is normalised
+                                                 below to satisfy that).
+        For unknown venues we default to ``newClientOrderId`` because
+        most ccxt-supported futures venues now accept it, and the
+        worst case (a venue that ignores unknown params) is the same
+        as not setting it: no idempotency, but no crash.
+        """
+        return {
+            "binance": "newClientOrderId",
+            "binanceusdm": "newClientOrderId",
+            "okx":     "clOrdId",
+            "gateio":  "text",
+            "gate":    "text",
+        }.get(self.exchange_name, "newClientOrderId")
+
+    def _normalize_client_order_id(self, coid: str) -> str:
+        """Sanitize and (where required) prefix the token for the venue.
+
+        Gate.io requires user-supplied IDs to start with ``t-`` —
+        we add it if absent so callers don't have to track venue-
+        specific quirks. Binance and OKX accept the raw token.
+        """
+        if self.exchange_name in ("gateio", "gate"):
+            if not coid.startswith("t-"):
+                return f"t-{coid}"[:30]
+        return coid
+
     def _stop_params(self, side: Side, stop_price: float, reduce_only: bool) -> dict[str, Any]:
         params: dict[str, Any] = {"reduceOnly": reduce_only,
                                    "stopPrice": stop_price,
@@ -141,14 +179,25 @@ class CCXTExchangeAdapter:
         *,
         price: float | None = None,
         reduce_only: bool = False,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]:
         params = self._entry_params(side, reduce_only)
+        # Phase B.1.1: stamp the venue-specific idempotency key.
+        # ccxt's create_market_order forwards unknown params verbatim
+        # to the venue, so this works even if a future ccxt version
+        # adds native support for ``client_order_id`` (which would
+        # then take precedence and we'd just be sending it twice
+        # — harmless because the values match).
+        if client_order_id is not None:
+            key = self._idempotency_param_key()
+            params[key] = self._normalize_client_order_id(client_order_id)
         resp = await self.client.create_market_order(
             symbol, side.value, size, params=params,
         )
-        logger.info("market %s %s %s ccxt_id=%s avg=%s",
+        logger.info("market %s %s %s ccxt_id=%s avg=%s coid=%s",
                     side.value, size, symbol,
-                    resp.get("id"), resp.get("average") or resp.get("price"))
+                    resp.get("id"), resp.get("average") or resp.get("price"),
+                    client_order_id)
         return self._normalize_order(resp)
 
     async def place_stop_order(
@@ -158,8 +207,12 @@ class CCXTExchangeAdapter:
         size: float,
         stop_price: float,
         reduce_only: bool = True,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]:
         params = self._stop_params(side, stop_price, reduce_only)
+        if client_order_id is not None:
+            key = self._idempotency_param_key()
+            params[key] = self._normalize_client_order_id(client_order_id)
         # Order type "stop_market" is unified across most ccxt venues, but
         # binance accepts "STOP_MARKET" via params; we prefer the unified
         # form when the venue supports it.
@@ -167,8 +220,9 @@ class CCXTExchangeAdapter:
         resp = await self.client.create_order(
             symbol, order_type, side.value, size, price=None, params=params,
         )
-        logger.info("stop %s %s %s @ %s ccxt_id=%s",
-                    side.value, size, symbol, stop_price, resp.get("id"))
+        logger.info("stop %s %s %s @ %s ccxt_id=%s coid=%s",
+                    side.value, size, symbol, stop_price, resp.get("id"),
+                    client_order_id)
         return self._normalize_order(resp)
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:

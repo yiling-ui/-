@@ -15,6 +15,7 @@ as False; the gate then refuses ALL orders. This is fail-closed by design.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -182,6 +183,13 @@ class Reconciler:
                 size=size,
                 stop_price=stop_price,
                 reduce_only=True,
+                # Phase B.1.1: idempotent emergency-stop on orphan
+                # reconciliation. If the daemon crashes between
+                # ``place_stop_order`` returning success and the
+                # response landing on disk, the next boot's
+                # Reconciler run will retry with the same UUID and
+                # the venue will dedupe (vs. opening two stops).
+                client_order_id=f"alt-r-{uuid.uuid4().hex[:12]}",
             )
             logger.warning(
                 "Reconciler attached emergency stop on orphan %s %s @ %s "
