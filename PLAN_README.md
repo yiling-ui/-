@@ -1,6 +1,14 @@
 # 📋 工作计划入口（New Session Entry Point）
 
-**这个分支不是要合并的代码分支，是一份工作计划。**
+> **🎯 新对话第一件事：你现在已经在正确的分支上了。**
+>
+> 分支名：`plan-and-tasks-START-HERE`  
+> 该分支已包含：
+> - ✅ P2 安全修复全部代码（audit log 轮转 / regime 校验 / cluster 校验 / kill switch 硬化）
+> - ✅ 完整的两份计划文档
+> - ✅ 354 个测试基线全部通过
+
+**这个分支不是要合并到 main 的代码分支，是一份工作计划 + 已修代码的"快照"。**
 
 如果你是新对话刚 checkout 到这个分支：
 
@@ -12,7 +20,7 @@
 
 ## 第 2 步：理解上下文
 - 这个仓库是一个 altcoin 妖币交易 agent
-- 之前的修复：P2 安全修复（PR #23，已 push 未合并）
+- 之前的修复：**P2 安全修复已经在本分支里**（不需要再去找 PR #23），代码可以直接读
 - 操作员决定：
   1. 放弃硬指标 5000% 收益，改为按妖币画像差异化打法
   2. **加入机会成本惩罚**：错过一个 +200% 妖币 = -3 分（命中的 3 倍）
@@ -71,5 +79,26 @@ Phase B.5 + QUADRANT Phase 4-5（10 天）
 
 ---
 
-**当前阶段**：计划已制定，等待执行。  
-**下一步**：从 Phase 1 开始。
+**当前阶段**：计划已制定，P2 修复已合并入分支，等待执行。  
+**下一步**：从 Phase B.1（P0 致命缺口：clientOrderId 幂等性 + market entry retry + 持久化事件驱动）开始。
+
+---
+
+## 🔗 验证你在正确的分支上
+
+```bash
+git branch --show-current
+# 应输出：plan-and-tasks-START-HERE
+
+git log --oneline -5
+# 应能看到：
+#   merge: P2 安全修复
+#   plan: 追加机会成本惩罚 + 生产级工程化升级清单
+#   plan: 四象限差异化策略 + 自学习训练 + token 预算严控
+#   fix(p2): audit log rotation, regime/cluster validation...
+
+python3.12 -m pytest tests/ -q
+# 应输出：354 passed
+```
+
+如果以上三项都通过，你就在对的分支上，可以从 Phase B.1 开始执行。
