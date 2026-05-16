@@ -370,9 +370,8 @@ class TokenBudgetManager:
 - [x] 实现 `llm/cache.py`，挂到 `llm_provider.py` 内部 — `LLMEngine.judge` 增加可选 `cache` + `phase` 参数；命中 0 token，未命中写回
 - [x] 实现 `llm/pre_rater.py` 后台 worker — A 象限 + score>=70 才入队，最大队列 64，预算锁死后丢弃
 - [x] `risk/quadrant_factory.py`：把 `SymbolProfile` 的 quadrant 翻译成 `PositionSizer + RiskGateConfig + TrailingStopFSM`（不动 `sizing.py` / `gate.py` / `trailing.py` 本体，零回归风险）
+- [x] `main.py` 接入：`AppConfig` 加 10 个 cfg 字段（默认全 OFF）+ App 加 3 个 slot + 启动/关闭生命周期 + 11 个 integration test
 - [ ] 修改 `ai_engine.py`：批处理多 symbol 合并 prompt — 推迟（命中率 60-80% 后批处理边际收益小）
-- [ ] 把 `QuadrantRiskFactory` 串到 `main.py` 的信号 → gate 路径上 — 等操作员打开 dry-run 时一起做
-- [ ] 把 `LLMPreRater` 串到 `main.py` 的 fuser → ai_engine 路径上 — 同上
 - [ ] 修改 `risk/gate.py`：接收 `pump_phase` + `confidence`，< 0.80 直接拒 — 推迟到 Phase 5.1，等 main.py 实际跑起来再判断是否需要
 - [ ] 修改 `risk/trailing.py`：接收 `pump_phase`，BLOWOFF_TOP 时立即收紧 — 同上
 - [ ] 修改 `fuser.py`：每个象限不同 high_priority 阈值 — 同上

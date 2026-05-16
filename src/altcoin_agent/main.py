@@ -41,11 +41,13 @@ from altcoin_agent.ai_engine import DeepSeekEngine
 from altcoin_agent.dashboard import DashboardState, make_dashboard_app
 from altcoin_agent.fuser import Direction, FusedSignal, FuserConfig, ScoreFuser
 from altcoin_agent.learning_engine import RuleStore
+from altcoin_agent.llm.cache import LLMCache
+from altcoin_agent.llm.pre_rater import LLMPreRater
+from altcoin_agent.llm.token_budget import TokenBudgetManager
 from altcoin_agent.notifier import Notifier, build_default_notifier
 from altcoin_agent.observability import (
     DeadLetterQueue,
     DLQEntry,
-    MetricsRegistry,
     bind_trace_id,
     build_default_registry,
 )
@@ -363,6 +365,40 @@ class AppConfig:
     # still runs every day; only the proposal step is gated.
     threshold_tuner_run_on_weekday: int = 6
 
+    # ------------------------------------------------------------------ #
+    # Phase 5 — LLM cache + tier-aware budget + pre-rate worker.
+    #
+    # All three are opt-in (default OFF) so a fresh deployment behaves
+    # byte-for-byte like v1.0. When ``llm_cache_enabled`` is True the
+    # cache is wired into ``LLMEngine.judge`` keyed by
+    # (symbol, phase, social_hash); cache hits return the prior
+    # verdict in 0ms with zero tokens consumed. When
+    # ``llm_budget_manager_enabled`` is True the engine consults the
+    # tier-aware ``TokenBudgetManager`` (FREE/ECONOMY/EMERGENCY/FREEZE)
+    # before paying for a call. When ``llm_pre_rate_enabled`` is True
+    # the daemon spawns a background worker that proactively calls the
+    # engine for high-priority A-quadrant candidates so the hot path
+    # always hits the cache.
+    #
+    # Operators wanting full Phase 5 behaviour should set all three to
+    # True. Setting only the cache (no budget manager) gives the
+    # latency win without the tier policy. Setting only the budget
+    # manager (no cache) is wasteful (every miss pays full network
+    # latency); we don't recommend that combination.
+    # ------------------------------------------------------------------ #
+    llm_cache_enabled: bool = False
+    llm_cache_path: str = ".kiro/state/llm_cache.json"
+    llm_cache_max_entries: int = 1024
+    llm_cache_ttl_sec: int = 12 * 3600
+    llm_budget_manager_enabled: bool = False
+    llm_budget_state_path: str = ".kiro/state/token_usage.json"
+    llm_budget_monthly_tokens: int = 5_000_000
+    llm_pre_rate_enabled: bool = False
+    # Per the plan's revised math, only A-quadrant + score >= 70
+    # keep token spend under 2.25M/month (vs naive 22M/month).
+    llm_pre_rate_min_score: float = 70.0
+    llm_pre_rate_queue_max: int = 64
+
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
         try:
@@ -552,6 +588,31 @@ class AppConfig:
             reflection_use_llm=bool(d.get("reflection_use_llm", False)),
             threshold_tuner_run_on_weekday=int(
                 d.get("threshold_tuner_run_on_weekday", 6),
+            ),
+            # Phase 5 — LLM cache + budget manager + pre-rater.
+            llm_cache_enabled=bool(d.get("llm_cache_enabled", False)),
+            llm_cache_path=str(
+                d.get("llm_cache_path", ".kiro/state/llm_cache.json"),
+            ),
+            llm_cache_max_entries=int(d.get("llm_cache_max_entries", 1024)),
+            llm_cache_ttl_sec=int(d.get("llm_cache_ttl_sec", 12 * 3600)),
+            llm_budget_manager_enabled=bool(
+                d.get("llm_budget_manager_enabled", False),
+            ),
+            llm_budget_state_path=str(
+                d.get(
+                    "llm_budget_state_path", ".kiro/state/token_usage.json",
+                ),
+            ),
+            llm_budget_monthly_tokens=int(
+                d.get("llm_budget_monthly_tokens", 5_000_000),
+            ),
+            llm_pre_rate_enabled=bool(d.get("llm_pre_rate_enabled", False)),
+            llm_pre_rate_min_score=float(
+                d.get("llm_pre_rate_min_score", 70.0),
+            ),
+            llm_pre_rate_queue_max=int(
+                d.get("llm_pre_rate_queue_max", 64),
             ),
         )
 
@@ -1134,6 +1195,14 @@ class App:
     _reject_scorer: RejectReasonScorer | None = None
     _threshold_tuner: ThresholdAutoTuner | None = None
     _reflection: ReflectionModeController | None = None
+    # Phase 5 — LLM cache / budget manager / pre-rate worker. Each is
+    # constructed in ``run`` only when the matching cfg flag is True;
+    # otherwise the daemon's behaviour is byte-for-byte identical to
+    # v1.0. Tests can pre-populate any of these slots before calling
+    # ``run`` to inject mocks.
+    _llm_cache: LLMCache | None = None
+    _token_budget_manager: TokenBudgetManager | None = None
+    _llm_pre_rater: LLMPreRater | None = None
 
     async def run(self) -> None:
         self.state.started_at = time.time()
@@ -1594,6 +1663,93 @@ class App:
             logger.info("DEEPSEEK_API_KEY not set; running in rule-only mode "
                         "(LLM consults and post-mortems disabled).")
 
+        # ----- Phase 5: cache + budget manager + pre-rate worker -----
+        # All three are opt-in. Cache and budget manager attach as
+        # optional fields on the existing engine so legacy callers
+        # that didn't pass ``cache=`` or ``budget_manager=`` keep
+        # working unchanged. The pre-rater spawns a separate task in
+        # ``_start_background_tasks`` further down; here we just
+        # construct it.
+        if self._llm_engine is not None and self.cfg.llm_cache_enabled \
+                and self._llm_cache is None:
+            try:
+                self._llm_cache = LLMCache(
+                    max_entries=self.cfg.llm_cache_max_entries,
+                    default_ttl_sec=self.cfg.llm_cache_ttl_sec,
+                    state_path=self.cfg.llm_cache_path,
+                )
+                self._llm_engine.cache = self._llm_cache
+                logger.info(
+                    "LLMCache enabled: ttl=%ds max=%d path=%s "
+                    "(60-80%% token saving expected)",
+                    self.cfg.llm_cache_ttl_sec,
+                    self.cfg.llm_cache_max_entries,
+                    self.cfg.llm_cache_path,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "LLMCache setup failed (swallowed): %s", e,
+                )
+                self._llm_cache = None
+
+        if self._llm_engine is not None \
+                and self.cfg.llm_budget_manager_enabled \
+                and self._token_budget_manager is None:
+            try:
+                self._token_budget_manager = TokenBudgetManager(
+                    monthly_budget=self.cfg.llm_budget_monthly_tokens,
+                    state_path=self.cfg.llm_budget_state_path,
+                )
+                self._llm_engine.budget_manager = self._token_budget_manager
+                logger.info(
+                    "TokenBudgetManager enabled: monthly=%d "
+                    "(mode=%s, used=%d/%d)",
+                    self.cfg.llm_budget_monthly_tokens,
+                    self._token_budget_manager.mode().value,
+                    self._token_budget_manager.state.used,
+                    self._token_budget_manager.state.budget,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "TokenBudgetManager setup failed (swallowed): %s", e,
+                )
+                self._token_budget_manager = None
+
+        # The pre-rater needs both the engine AND the cache (it calls
+        # judge() expecting cache writes). Without the cache, the
+        # worker just burns tokens on every candidate; gate it on
+        # both flags so misconfigurations don't waste budget.
+        if (
+            self._llm_engine is not None
+            and self.cfg.llm_pre_rate_enabled
+            and self._llm_cache is not None
+            and self._llm_pre_rater is None
+        ):
+            try:
+                self._llm_pre_rater = LLMPreRater(
+                    engine=self._llm_engine,
+                    cache=self._llm_cache,
+                    budget_manager=self._token_budget_manager,
+                    prerate_min_score=self.cfg.llm_pre_rate_min_score,
+                    queue_maxsize=self.cfg.llm_pre_rate_queue_max,
+                )
+                logger.info(
+                    "LLMPreRater enabled: min_score=%.1f queue_max=%d "
+                    "(A-quadrant only; expected ~2.25M tokens/month)",
+                    self.cfg.llm_pre_rate_min_score,
+                    self.cfg.llm_pre_rate_queue_max,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "LLMPreRater setup failed (swallowed): %s", e,
+                )
+                self._llm_pre_rater = None
+        elif self.cfg.llm_pre_rate_enabled and self._llm_cache is None:
+            logger.warning(
+                "LLM pre-rate enabled but cache disabled; skipping "
+                "pre-rater (cache is required to avoid token waste)",
+            )
+
         # RuleStore: shared by ScoreFuser (read via dynamic_rules.json mtime
         # reload) and the post-mortem scheduler (write side). The path
         # follows the same precedence as RuleIndex so both ends always see
@@ -1902,6 +2058,23 @@ class App:
             self._tasks.append(asyncio.create_task(
                 kill_switch_worker(), name="kill_switch_worker",
             ))
+
+        # Phase 5 — start the LLM pre-rate background worker. It runs
+        # for as long as the daemon does; ``_shutdown`` calls
+        # ``stop()`` on the rater so the queue drains cleanly. The
+        # rater is its own task lifetime (it manages an asyncio.Queue
+        # internally), so we don't append it to ``self._tasks`` —
+        # ``stop()`` is the canonical lifecycle hook.
+        if self._llm_pre_rater is not None:
+            try:
+                await self._llm_pre_rater.start()
+                logger.info(
+                    "LLMPreRater background worker started",
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "LLMPreRater start failed (swallowed): %s", e,
+                )
 
         await self._stop_event.wait()
         await self._shutdown()
@@ -2911,6 +3084,13 @@ class App:
         if self._dashboard_runner is not None:
             with suppress(Exception):
                 await self._dashboard_runner.cleanup()
+        # Phase 5 — stop the pre-rater BEFORE closing the engine so
+        # any in-flight rating finishes its provider call cleanly.
+        # ``stop()`` is idempotent and bounded by an internal timeout
+        # so a stuck worker can't block shutdown indefinitely.
+        if self._llm_pre_rater is not None:
+            with suppress(Exception):
+                await self._llm_pre_rater.stop()
         # Close DeepSeek client if it was built.
         if self._llm_engine is not None:
             with suppress(Exception):
