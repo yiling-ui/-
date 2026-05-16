@@ -15,3 +15,7 @@ htmlcov/
 data/
 reports/
 .DS_Store
+
+# Runtime artifacts written by the daemon (account snapshots, audit log)
+.kiro/state/
+logs/decisions*.jsonl

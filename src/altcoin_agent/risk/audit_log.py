@@ -60,7 +60,13 @@ class DecisionAuditLog:
         if not self.enabled:
             return False
         try:
-            row = {"ts": entry.pop("ts", time.time()), **entry}
+            # Audit (third pass) #9: previously used ``entry.pop("ts", ...)``
+            # which mutated the caller's dict — second invocation with the
+            # same dict (e.g. the dashboard's signal payload) would silently
+            # drop its ``ts`` field. Build the row from a copy instead so
+            # callers can pass aliased dicts safely.
+            ts_val = entry.get("ts", time.time())
+            row = {"ts": ts_val, **{k: v for k, v in entry.items() if k != "ts"}}
             line = json.dumps(row, default=str, sort_keys=True)
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
