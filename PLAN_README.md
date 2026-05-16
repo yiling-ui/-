@@ -87,7 +87,8 @@ Phase B.5 + QUADRANT Phase 4-5（10 天）
 - ✅ Phase A (机会成本惩罚 + 反思模式) — PR feat/phase-a-miss-penalty-engine
 - ✅ Phase B.2 (监控 / 结构化日志 / DLQ) + B.3 (SQLite WAL) — 本次提交
 - ✅ QUADRANT Phase 1-3 (框架 + 历史数据 + PumpPhaseFSM + 回测 runner) — feat/quadrant-phase-1-3-scaffolding
-- ⏭️  下一步：Phase B.4 真正的回测引擎（matching engine + 滑点 + walk-forward），随后 Phase 4 训练系统
+- ✅ Phase B.4 (回测引擎：matching engine + 滑点模型 + walk-forward + data_adapter) — feat/phase-b4-backtest-engine
+- ⏭️  下一步：Phase 4 训练系统（trainer 实装：用历史数据 + matching engine 跑 walk-forward，输出 production_rules.json）+ Phase B.5 LLM Pre-Rate cache
 
 ---
 
