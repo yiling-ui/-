@@ -316,7 +316,7 @@ Phase B.4: 回测引擎 (10 天) ← 最大块
   ├─ B.4.1: data_adapter             ✅ src/altcoin_agent/backtest/data_adapter.py
   ├─ B.4.2: matching_engine + slippage  ✅ matching_engine.py + slippage_model.py
   ├─ B.4.3: runner + walk_forward    ✅ runner.py (Phase 1-3) + walk_forward.py
-  └─ B.4.4: 实盘/回测一致性验证      ⏭ 等 Phase 4 trainer 接入后跑
+  └─ B.4.4: 实盘/回测一致性验证      ✅ test_phase_4_e2e_mock.py：MatchingEngine 实现 ExchangeAdapter Protocol，e2e 跑 trainer 全链路
 
 Phase B.5: LLM Pre-Rate (5 天)
   ├─ B.5.1: cache 实现                ✅ src/altcoin_agent/llm/cache.py (Phase 1-3 落地)
