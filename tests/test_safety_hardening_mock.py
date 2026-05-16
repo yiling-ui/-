@@ -318,10 +318,12 @@ class _PartialFillAdapter:
         self.calls: list[dict] = []
 
     async def market_order(self, symbol, side, size, *, price=None,
-                           reduce_only=False):  # noqa: ANN001
+                           reduce_only=False,
+                           client_order_id=None):  # noqa: ANN001
         self.calls.append({
             "symbol": symbol, "side": side.value, "size": size,
             "price": price, "reduce_only": reduce_only,
+            "client_order_id": client_order_id,
         })
         return {
             "id": f"o-{len(self.calls)}",
@@ -421,9 +423,11 @@ class _ReconcileAdapter:
         return []
 
     async def place_stop_order(self, *, symbol, side, size,
-                               stop_price, reduce_only):
+                               stop_price, reduce_only,
+                               client_order_id=None):
         rec = {"symbol": symbol, "side": side.value, "size": size,
-               "stop_price": stop_price, "reduce_only": reduce_only}
+               "stop_price": stop_price, "reduce_only": reduce_only,
+               "client_order_id": client_order_id}
         self.placed_stops.append(rec)
         return {"id": f"stop-{len(self.placed_stops)}"}
 
@@ -802,10 +806,12 @@ class _NakedTightenAdapter:
         self.market_orders: list[dict] = []
 
     async def market_order(self, symbol, side, size, *, price=None,
-                           reduce_only=False):  # noqa: ANN001
+                           reduce_only=False,
+                           client_order_id=None):  # noqa: ANN001
         self.market_orders.append({
             "symbol": symbol, "side": side.value, "size": size,
             "price": price, "reduce_only": reduce_only,
+            "client_order_id": client_order_id,
         })
         return {"id": "x", "average": price or 0.0}
 

@@ -534,11 +534,13 @@ class DryRunExchangeAdapter:
         self._n += 1
         return f"dryrun-{self._n}"
 
-    async def market_order(self, symbol, side, size, *, price=None, reduce_only=False):  # noqa: ANN001
+    async def market_order(self, symbol, side, size, *, price=None, reduce_only=False,
+                           client_order_id=None):  # noqa: ANN001
         oid = self._id()
         rec = {"id": oid, "symbol": symbol, "side": side.value, "size": size,
                "price": price, "reduce_only": reduce_only,
-               "average": price or 0.0}
+               "average": price or 0.0,
+               "client_order_id": client_order_id}
         self.market_orders.append(rec)
         # Maintain a fake position book so PositionWatcher sees consistent
         # state. An entry is the order whose side matches the position's
@@ -552,17 +554,20 @@ class DryRunExchangeAdapter:
                 "contracts": float(size),
                 "entryPrice": float(price or 0.0),
             }
-        logger.info("[DRY-RUN] MARKET %s %s %s @ %s reduce=%s",
-                    side.value.upper(), size, symbol, price, reduce_only)
+        logger.info("[DRY-RUN] MARKET %s %s %s @ %s reduce=%s coid=%s",
+                    side.value.upper(), size, symbol, price, reduce_only,
+                    client_order_id)
         return rec
 
-    async def place_stop_order(self, symbol, side, size, stop_price, reduce_only=True):  # noqa: ANN001
+    async def place_stop_order(self, symbol, side, size, stop_price, reduce_only=True,
+                               client_order_id=None):  # noqa: ANN001
         oid = self._id()
         rec = {"id": oid, "symbol": symbol, "side": side.value, "size": size,
-               "stop_price": stop_price, "reduce_only": reduce_only}
+               "stop_price": stop_price, "reduce_only": reduce_only,
+               "client_order_id": client_order_id}
         self.stop_orders.append(rec)
-        logger.info("[DRY-RUN] STOP-MARKET %s %s %s @ %s",
-                    side.value.upper(), size, symbol, stop_price)
+        logger.info("[DRY-RUN] STOP-MARKET %s %s %s @ %s coid=%s",
+                    side.value.upper(), size, symbol, stop_price, client_order_id)
         return rec
 
     async def cancel_order(self, order_id, symbol):  # noqa: ANN001
@@ -990,6 +995,17 @@ class App:
                     "AccountState persistence: no prior snapshot at %s "
                     "(starting fresh)", self._persistor.path,
                 )
+            # Phase B.1.3: hook the persistor into AccountState's
+            # change-notification channel. From this point forward
+            # every ``set_cooldown`` / ``halt`` / ``record_pnl`` /
+            # ``maybe_roll_over_day`` call snapshots the new state
+            # to disk synchronously. The mutators all live on the
+            # AccountState itself so adapters / executors / kill-
+            # switch / future modules don't need to know about the
+            # persistor — they just call the mutator.
+            account.register_change_listener(
+                lambda a, _p=self._persistor: _p.save(a),
+            )
 
         # Bug #3 fix: stamp the boot day so the first real flip resets
         # daily counters cleanly. Without this, ``maybe_roll_over_day``
@@ -1958,18 +1974,15 @@ class App:
         realized_r = (price_delta / r_unit) if r_unit > 0 else 0.0
         is_loss = realized_pnl_usdt < 0
 
-        # 2) account-level rollups
-        account.realized_pnl_today_usdt += realized_pnl_usdt
-        account.equity_usdt += realized_pnl_usdt
-
-        # 3 + 4) loss accounting
-        if is_loss:
-            account.daily_stoploss_hits += 1
-            account.consecutive_losses[symbol] = (
-                account.consecutive_losses.get(symbol, 0) + 1
-            )
-        else:
-            account.consecutive_losses.pop(symbol, None)
+        # 2-4) account-level rollups + per-symbol consec-loss accounting.
+        # Phase B.1.3: delegated to AccountState.record_pnl so the new
+        # event-driven persistence hook fires automatically. Behaviour
+        # is byte-for-byte identical to the previous inlined block:
+        #   realized_pnl_today_usdt += pnl
+        #   equity_usdt              += pnl
+        #   if loss: daily_stoploss_hits += 1; consec_losses[sym] += 1
+        #   else:    consec_losses.pop(sym)
+        account.record_pnl(symbol, realized_pnl_usdt, is_loss=is_loss)
 
         # 5) detach trailing tracker
         trailing.detach(symbol)
@@ -1985,9 +1998,13 @@ class App:
             with suppress(Exception):
                 rolling.reset_for_symbol(symbol)
 
-        # 7) Audit (third pass) #1: persist the post-close snapshot so a
-        # crash between this close and the next one doesn't lose the
-        # daily PnL credit / stoploss counter / consec-loss bump.
+        # 7) Phase B.1.3 (was: Audit third-pass #1): the post-close
+        # snapshot is now driven automatically by ``record_pnl`` /
+        # ``set_cooldown`` / ``halt`` via AccountState's change
+        # listener. We keep this explicit save as a defence-in-
+        # depth flush in case future code mutates additional state
+        # between ``record_pnl`` and the end of this handler — the
+        # listener's save() is idempotent and write-cost is <1ms.
         if self._persistor is not None:
             with suppress(Exception):
                 self._persistor.save(account)

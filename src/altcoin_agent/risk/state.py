@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class Side(str, Enum):
@@ -148,6 +152,62 @@ class AccountState:
     # a different anchor.
     rollover_anchor_utc_hour: int = 0
 
+    # ------------------------------------------------------------------ #
+    # Phase B.1.3 — event-driven persistence hook.
+    #
+    # Old design persisted at three hard-coded points (boot, post-close,
+    # one shutdown path). Cooldowns set by ``CCXTExecutor`` on stop /
+    # entry failure, ``account.halt`` from the ``KillSwitchWatcher``,
+    # and any future mutators were *not* persisted; a daemon crash
+    # right after such a mutation would silently drop the change. The
+    # ``MISS_PENALTY_AND_PRODUCTION_PLAN.md`` Phase B.1.3 calls out
+    # this gap as 🟠 severe and prescribes "save() on every state
+    # mutation".
+    #
+    # ``_on_change`` is a single callable (typically
+    # ``AccountPersistor.save``) invoked whenever a daily-scoped or
+    # halt/cooldown field changes. It's registered via
+    # ``register_change_listener`` from ``main.App.run``. Failures in
+    # the listener are caught and logged so a flaky disk never blocks
+    # the trading loop. Tests can register their own listener to
+    # observe and assert that every mutator triggered exactly one
+    # save.
+    #
+    # We deliberately do NOT auto-fire on raw attribute assignment
+    # (``account.equity_usdt = X``); the dataclass would have to be
+    # frozen + a ``__setattr__`` override, breaking every test that
+    # constructs an AccountState mid-flight. Instead we expose
+    # explicit mutator helpers (``record_pnl`` / ``register_loss`` /
+    # ``clear_consecutive_loss``) and wire the existing mutators
+    # (``set_cooldown`` / ``halt`` / ``maybe_roll_over_day``) to
+    # invoke the listener.
+    _on_change: Callable[[AccountState], None] | None = field(
+        default=None, repr=False, compare=False,
+    )
+
+    def register_change_listener(
+        self,
+        listener: Callable[[AccountState], None] | None,
+    ) -> None:
+        """Attach (or detach with ``None``) a hook fired after each
+        persistable mutation. Idempotent: re-registering replaces the
+        previous listener.
+        """
+        self._on_change = listener
+
+    def _notify_change(self) -> None:
+        """Internal: invoke the registered listener. Failures are
+        logged and swallowed so persistence never breaks trading.
+        """
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(self)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "AccountState change listener raised (swallowed): %s", e,
+            )
+
     @property
     def daily_drawdown_pct(self) -> float:
         if self.starting_equity_today_usdt <= 0:
@@ -163,10 +223,78 @@ class AccountState:
 
     def set_cooldown(self, symbol: str, duration_sec: int, now_ms: int) -> None:
         self.cooldown_until_ts_ms[symbol] = now_ms + duration_sec * 1000
+        # Phase B.1.3: persist after every mutation to the cooldown
+        # map. Without this, a stop-failure cooldown set in the
+        # executor disappeared on restart and the symbol was trade-
+        # eligible the moment the daemon came back up.
+        self._notify_change()
 
     def halt(self, reason: str) -> None:
         self.global_trading_halted = True
         self.halt_reason = reason
+        # Phase B.1.3: persist halt state immediately. The kill-switch
+        # only lives in memory otherwise; a process restart would
+        # silently un-halt the account.
+        self._notify_change()
+
+    # ------------------------------------------------------------------ #
+    # Phase B.1.3 — PnL accounting helpers.
+    #
+    # ``main._on_position_close`` historically did the bookkeeping
+    # inline with raw attribute mutation (``realized_pnl_today_usdt
+    # += ...``, ``daily_stoploss_hits += 1``, ``consecutive_losses[...]
+    # = ...``) and then called ``persistor.save`` at the end. Three
+    # problems with that:
+    #   (1) every other call site that wanted to record a fill had to
+    #       repeat the same 6-line pattern;
+    #   (2) any forgotten ``save()`` (e.g. emergency-close path in
+    #       executor, or future code) lost data on crash;
+    #   (3) the dashboard / metrics didn't have a single hook to
+    #       observe "something just changed".
+    #
+    # We centralise the daily rollups here and fire ``_notify_change``
+    # exactly once per logical event. The old call sites delegate to
+    # these helpers; behaviour is byte-for-byte identical.
+    # ------------------------------------------------------------------ #
+
+    def record_pnl(
+        self,
+        symbol: str,
+        realized_pnl_usdt: float,
+        *,
+        is_loss: bool | None = None,
+    ) -> None:
+        """Record a realised fill against the daily roll-ups + per-symbol
+        consecutive-loss counter.
+
+        Args:
+            symbol: position symbol (used for consec-loss bookkeeping).
+            realized_pnl_usdt: signed PnL of the close in USDT.
+            is_loss: when None, treat ``realized_pnl_usdt < 0`` as a
+                loss. Callers can override (rare) when post-mortem
+                attribution differs from raw sign — kept for forward
+                compatibility with the upcoming MissPenaltyEngine.
+        """
+        if is_loss is None:
+            is_loss = realized_pnl_usdt < 0
+        self.realized_pnl_today_usdt += realized_pnl_usdt
+        self.equity_usdt += realized_pnl_usdt
+        if is_loss:
+            self.daily_stoploss_hits += 1
+            self.consecutive_losses[symbol] = (
+                self.consecutive_losses.get(symbol, 0) + 1
+            )
+        else:
+            self.consecutive_losses.pop(symbol, None)
+        self._notify_change()
+
+    def clear_consecutive_loss(self, symbol: str) -> None:
+        """Drop the per-symbol consec-loss streak. Intended for paths
+        that close a position without it being a loss but where
+        ``record_pnl`` isn't appropriate (e.g. manual flatten).
+        """
+        if self.consecutive_losses.pop(symbol, None) is not None:
+            self._notify_change()
 
     # ------------------------------------------------------------------ #
     # Bug #3 fix — daily rollover.
@@ -236,4 +364,8 @@ class AccountState:
         self.realized_pnl_today_usdt = 0.0
         self.daily_stoploss_hits = 0
         self.last_rollover_date_utc = today
+        # Phase B.1.3: a day-rollover wipes today's PnL counter and the
+        # stoploss-hit counter; that is exactly the kind of mutation
+        # we don't want to lose to a restart five minutes later.
+        self._notify_change()
         return True

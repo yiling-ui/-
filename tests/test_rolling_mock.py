@@ -64,18 +64,21 @@ class FakeAdapter:
 
     async def market_order(
         self, symbol, side, size, *, price=None, reduce_only=False,
+        client_order_id=None,
     ):  # noqa: ANN001
         oid = self._id()
         rec = {
             "id": oid, "symbol": symbol, "side": side.value, "size": size,
             "average": price or 1.0, "reduce_only": reduce_only,
             "price": price,
+            "client_order_id": client_order_id,
         }
         self.market_orders.append(rec)
         return rec
 
     async def place_stop_order(
         self, symbol, side, size, stop_price, reduce_only=True,
+        client_order_id=None,
     ):  # noqa: ANN001
         if self.fail_next_stop:
             self.fail_next_stop = False
@@ -84,6 +87,7 @@ class FakeAdapter:
         rec = {
             "id": oid, "symbol": symbol, "side": side.value, "size": size,
             "stop_price": stop_price, "reduce_only": reduce_only,
+            "client_order_id": client_order_id,
         }
         self.stop_orders.append(rec)
         return rec
