@@ -162,6 +162,16 @@ class CCXTExecutor:
                 f"partial_fill_below_threshold:{fill_ratio:.4f}",
             )
 
+        # Audit (third pass) #3: when fill_ratio is in [min_fill_ratio, 1.0)
+        # the position is acceptable but the **actual** size on the venue is
+        # ``filled``, not ``decision.size``. Using decision.size for the
+        # STOP_MARKET reduce_only order would either be auto-clamped (Binance)
+        # or rejected outright (Bybit/Gate) at trigger time. Worse, the local
+        # ``Position.size`` would lie about the true exposure, throwing off
+        # PnL math, leverage cap re-checks, and add_leg's stop resize.
+        # Pin actual_size to the venue truth and use it everywhere downstream.
+        actual_size = filled if filled > 0 else float(decision.size)
+
         # 3) hard stop on the exchange — RETRY then fail-closed close.
         stop_side = decision.side.opposite
         stop_resp: dict[str, Any] | None = None
@@ -171,7 +181,7 @@ class CCXTExecutor:
                 stop_resp = await self.adapter.place_stop_order(
                     symbol=symbol,
                     side=stop_side,
-                    size=decision.size,
+                    size=actual_size,
                     stop_price=decision.initial_stop,
                     reduce_only=True,
                 )
@@ -193,7 +203,7 @@ class CCXTExecutor:
                 await self.adapter.market_order(
                     symbol=symbol,
                     side=stop_side,
-                    size=decision.size,
+                    size=actual_size,
                     price=current_price,
                     reduce_only=True,
                 )
@@ -205,13 +215,14 @@ class CCXTExecutor:
             account.set_cooldown(symbol, self.stop_failure_cooldown_sec, now_ms_default())
             raise ExecutionError(f"stop_placement_failed:{last_err}")
 
-        # 4) record the position
+        # 4) record the position — using actual_size so the local book
+        # reflects venue truth.
         pos = Position(
             symbol=symbol,
             exchange=self.exchange_name,
             side=decision.side,
             entry_price=avg_price,
-            size=decision.size,
+            size=actual_size,
             leverage=decision.leverage,
             initial_stop=decision.initial_stop,
             current_stop=decision.initial_stop,
@@ -224,7 +235,7 @@ class CCXTExecutor:
         # ``avg_entry_price`` fall back to the legacy fields when
         # ``legs`` is empty, so existing code paths remain identical).
         pos.legs.append(PositionLeg(
-            leg_id=0, side=decision.side, size=decision.size,
+            leg_id=0, side=decision.side, size=actual_size,
             entry_price=avg_price, margin_source="initial",
         ))
         account.open_positions[symbol] = pos
@@ -282,6 +293,54 @@ class CCXTExecutor:
             entry_resp.get("average") or entry_resp.get("price") or current_price
         )
 
+        # Audit (third pass) #3: pin actual_leg_size to venue truth.
+        # ``add_leg`` historically used the requested ``size``; if the
+        # IOC market order partially filled (common in thin altcoin
+        # books) the legacy code resized the venue-side stop to cover
+        # phantom contracts, eventually triggering reduce_only rejections
+        # and an emergency-close of the entire (winning) position. We
+        # now read the real ``filled`` and propagate it everywhere
+        # downstream (PositionLeg.size, position.size, stop_resize size).
+        try:
+            filled_raw = entry_resp.get("filled")
+            if filled_raw is None:
+                filled_raw = entry_resp.get("amount", size)
+            filled = abs(float(filled_raw))
+        except (TypeError, ValueError):
+            filled = float(size)
+        actual_leg_size = filled if filled > 0 else float(size)
+        if actual_leg_size < size * self.min_fill_ratio:
+            # Severe partial fill on the leg — same fail-closed posture
+            # as ``open``: close just the partial leg and bail. The
+            # caller (RollingController) will see the ExecutionError
+            # and may auto-disable rolling.
+            logger.critical(
+                "add_leg partial fill on %s: requested=%.6f filled=%.6f "
+                "ratio=%.4f — closing partial leg only",
+                position.symbol, size, actual_leg_size,
+                actual_leg_size / max(size, 1e-9),
+            )
+            try:
+                await self.adapter.market_order(
+                    symbol=position.symbol,
+                    side=position.side.opposite,
+                    size=actual_leg_size,
+                    price=current_price,
+                    reduce_only=True,
+                )
+            except Exception as e:
+                logger.critical(
+                    "EMERGENCY CLOSE of partial add_leg fill failed for "
+                    "%s: %s — manual intervention required",
+                    position.symbol, e,
+                )
+            account.set_cooldown(
+                position.symbol, self.stop_failure_cooldown_sec, now_ms_default(),
+            )
+            raise ExecutionError(
+                f"add_leg_partial_fill:{actual_leg_size / max(size, 1e-9):.4f}",
+            )
+
         # 2) Replace the resting stop so it covers the new aggregate size.
         # We piggyback on tighten_hard_stop's cancel+place+restore-on-failure
         # semantics, but pass through the EXISTING current_stop unless the
@@ -292,7 +351,7 @@ class CCXTExecutor:
         leg = PositionLeg(
             leg_id=next_leg_id,
             side=position.side,
-            size=size,
+            size=actual_leg_size,
             entry_price=avg_price,
             margin_source="rolled_unrealized",
             trigger_score=trigger_score,
@@ -300,7 +359,7 @@ class CCXTExecutor:
         position.legs.append(leg)
         # Keep the legacy ``size`` field in sync. The trailing FSM and
         # stop-placement code path read ``position.size`` directly.
-        position.size = old_size + size
+        position.size = old_size + actual_leg_size
 
         target_stop = (
             new_stop_for_full

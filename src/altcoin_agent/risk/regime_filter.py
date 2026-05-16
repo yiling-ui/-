@@ -79,6 +79,15 @@ class RegimeFilter:
         Non-reference symbols are silently ignored so the same stream
         wrapper that already feeds the price tape can fan-out to us
         without extra filtering at the call site.
+
+        Audit (third pass) #11: ccxt.pro WS reconnects can replay the
+        last few bars, producing timestamps that go backwards inside
+        the deque. ``roc_pct`` then computes ``(latest - oldest)/oldest``
+        with ``oldest`` not actually being the oldest, returning a
+        garbage rate. We drop any sample whose ts is not strictly newer
+        than the most recent one. Equality is also rejected so the
+        deque stays strictly monotone — that lets ``roc_pct``'s
+        head-trim loop be unambiguous.
         """
         if not self.cfg.enabled:
             return
@@ -86,7 +95,10 @@ class RegimeFilter:
             return
         if close <= 0 or ts_ms <= 0:
             return
-        self._samples.append((int(ts_ms), float(close)))
+        ts = int(ts_ms)
+        if self._samples and ts <= self._samples[-1][0]:
+            return  # late or duplicate sample; ignore
+        self._samples.append((ts, float(close)))
 
     # --------------------- queries --------------------- #
 
