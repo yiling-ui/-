@@ -64,6 +64,7 @@ from altcoin_agent.risk.rolling import (
     RollingController,
 )
 from altcoin_agent.risk.sizing import DynamicLeverageConfig, PositionSizer
+from altcoin_agent.risk.sqlite_persistence import SQLiteAccountStore
 from altcoin_agent.risk.state import AccountState, Position, PositionLeg, Side
 from altcoin_agent.risk.trailing import TrailingState, TrailingStopFSM
 
@@ -97,6 +98,7 @@ __all__ = [
     "RollingConfig",
     "RollingController",
     "Side",
+    "SQLiteAccountStore",
     "TrailingState",
     "TrailingStopFSM",
     "build_ccxt_adapter",
