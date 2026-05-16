@@ -351,16 +351,18 @@ class TokenBudgetManager:
 
 ### Phase 4: 训练系统（第 8-12 天）
 
-- [ ] 实现 `training/trainer.py`：walk-forward 训练
-- [ ] 实现 `training/rules_promoter.py`：80% 门槛判定 + 晋升 / 降级
-- [ ] 跑过去 3 年的全量训练
-- [ ] 输出 `production_rules.json` + 每月训练报告
-- [ ] 实现持续训练 cron job（每日 03:00 UTC）
+- [x] 实现 `training/trainer.py`：walk-forward 训练 — `walkforward_trainer.py` 落地（`trainer.py` 保留为 daily-cycle wrapper）
+- [x] 实现 `training/rules_promoter.py`：80% 门槛判定 + 晋升 / 降级 — Phase 1-3 已落地
+- [x] 新增 `training/rule_miner.py`：从 (features, pnl) 观察派生 LearnedRule（按 quadrant/phase/score 桶分组）
+- [x] e2e 集成（B.4.4）：MatchingEngine → TradeObservation → WalkforwardTrainer → RulesPromoter，全链路 token=0
+- [ ] 跑过去 3 年的全量训练 — 需要操作员触发 `historical_loader.download` 拉真实 K 线，留给 Phase 5
+- [ ] 输出 `production_rules.json` + 每月训练报告 — Phase 5（实盘 dry-run 阶段）
+- [ ] 实现持续训练 cron job（每日 03:00 UTC）— Phase 5（与 main.py 接入一起做）
 
 **验收**：
-- 训练完成后，`production_rules.json` 至少包含 10 条规则
-- 每条规则的 `samples >= 30, win_rate >= 0.80, validation_months_passed >= 3`
-- 训练总 token 消耗 < 200,000
+- 训练完成后，`production_rules.json` 至少包含 10 条规则 — 留给 Phase 5 真实数据跑完
+- 每条规则的 `samples >= 30, win_rate >= 0.80, validation_months_passed >= 3` — 已通过 unit + e2e mock test 验证机制正确
+- 训练总 token 消耗 < 200,000 — 当前实现 = **0 tokens**（纯规则桶分，e2e test 锁死）
 
 ### Phase 5: 接入实盘 + Token 预算（第 13-15 天）
 
