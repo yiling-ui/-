@@ -112,6 +112,14 @@ class Notifier(Protocol):
     async def closed(self, payload: dict[str, Any]) -> None: ...
     async def rejected(self, payload: dict[str, Any]) -> None: ...
     async def error(self, message: str, payload: dict[str, Any] | None = None) -> None: ...
+    # Operational patch (post-review): dedicated channel for legitimate
+    # bank flow events (deposit / withdrawal). Previously routed through
+    # ``error()`` -> 🚨 ERROR icon, which trains the operator to ignore
+    # the message they most need to read. ``flow()`` renders with a
+    # neutral 🏦 BANK icon. Existing callers that don't implement this
+    # method are not broken: ``NullNotifier.flow`` is a no-op and the
+    # Protocol is ``runtime_checkable`` (``hasattr`` works).
+    async def flow(self, message: str, payload: dict[str, Any] | None = None) -> None: ...
     async def aclose(self) -> None: ...
 
 
@@ -133,6 +141,9 @@ class NullNotifier:
         return None
 
     async def error(self, message: str, payload: dict[str, Any] | None = None) -> None:
+        return None
+
+    async def flow(self, message: str, payload: dict[str, Any] | None = None) -> None:
         return None
 
     async def aclose(self) -> None:
@@ -291,6 +302,13 @@ class TelegramNotifier:
 
     async def error(self, message: str, payload: dict[str, Any] | None = None) -> None:
         msg = f"<b>🚨 ERROR</b>\n<pre>{self._esc(message)}</pre>"
+        if payload:
+            msg += "\n" + self._esc(str(payload)[:300])
+        await self._send(msg)
+
+    async def flow(self, message: str, payload: dict[str, Any] | None = None) -> None:
+        """Operator deposits/withdrawals — neutral bank icon, NOT error."""
+        msg = f"<b>🏦 BANK FLOW</b>\n<pre>{self._esc(message)}</pre>"
         if payload:
             msg += "\n" + self._esc(str(payload)[:300])
         await self._send(msg)

@@ -237,6 +237,31 @@ class AccountState:
         # silently un-halt the account.
         self._notify_change()
 
+    def resume(self) -> bool:
+        """Mirror of :meth:`halt` — clear the global halt flag and
+        persist the change atomically.
+
+        Operational patch: PR #34 added a ``/resume`` Telegram command
+        that wrote ``global_trading_halted = False`` directly. Direct
+        attribute assignment skipped ``_notify_change`` (which fires
+        ``AccountPersistor.save``), so a halt set via ``halt()`` was
+        durable across restarts but a ``/resume`` was NOT — a daemon
+        restart in the next 30 s reloaded the persisted halt and
+        silently undid the operator's intent. Asymmetric persistence
+        is exactly the kind of footgun that bites at the worst time.
+
+        Calling ``resume()`` on an already-running account is a no-op
+        (returns False); the persistence write is suppressed so the
+        listener doesn't flap on idle ``/resume`` clicks.
+        Returns True iff a halt was actually cleared.
+        """
+        if not self.global_trading_halted and self.halt_reason is None:
+            return False
+        self.global_trading_halted = False
+        self.halt_reason = None
+        self._notify_change()
+        return True
+
     # ------------------------------------------------------------------ #
     # Phase B.1.3 — PnL accounting helpers.
     #
@@ -373,6 +398,22 @@ class AccountState:
         # constraint: a 6% breaker against a 5,000 starting still
         # represents 300 USDT remaining buffer when 600 USDT have
         # already been lost — an inconsistent statement.
+        #
+        # Asymmetry note (post-review): the multiplicative rescale
+        # is well-behaved on losing days but produces a non-obvious
+        # reading on PROFITABLE ones. Example: starting=10_000,
+        # realized_pnl_today=+200, equity=10_200. Operator wires out
+        # 5_100 -> scale=0.5 -> starting becomes 5_000 ->
+        # daily_drawdown_pct = -200/5_000 = -0.04 ("4% in profit",
+        # double the pre-withdrawal -0.02 reading). The breaker only
+        # gates on POSITIVE drawdown so this never fires it
+        # incorrectly (fail-safe direction), but the dashboard reads
+        # the same field and operators should expect "withdrew during
+        # a green day -> ratio looks better, not worse". A genuinely
+        # invariant rescale would also rescale realized_pnl_today,
+        # but that breaks the USDT audit trail against
+        # decisions.jsonl, so we keep the current behaviour and
+        # document instead.
         old_equity = self.equity_usdt
         if old_equity > 0 and self.starting_equity_today_usdt > 0:
             scale = float(new_equity_usdt) / old_equity

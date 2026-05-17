@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,9 +90,8 @@ class DashboardState:
         eq = float(getattr(a, "equity_usdt", 0.0) or 0.0)
         if eq <= 0:
             return
-        import time as _time
         self.equity_curve.append({
-            "ts": _time.time(),
+            "ts": time.time(),
             "equity_usdt": eq,
             "realized_pnl_today_usdt": float(
                 getattr(a, "realized_pnl_today_usdt", 0.0) or 0.0,

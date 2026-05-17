@@ -182,6 +182,18 @@ class WithdrawalDetector:
     # Internal state.
     _last_observed_equity: float | None = None
     _last_realized_pnl_total: float = 0.0
+    # Operational patch (post-review): the daemon zeros
+    # ``account.realized_pnl_today_usdt`` at UTC midnight via
+    # ``maybe_roll_over_day``. Without tracking the rollover marker
+    # here, the next poll computed:
+    #     pnl_delta   = 0  -  yesterdays_pnl       (e.g. -500)
+    #     unexplained = venue_delta - pnl_delta    (e.g. +500)
+    # and fired a phantom "deposit_detected" event of yesterday's
+    # PnL — once per UTC day per running daemon. We snapshot
+    # ``last_rollover_date_utc`` alongside the PnL total and, when
+    # the dates differ between polls, reset both snapshots from the
+    # post-rollover state without raising any flow event.
+    _last_rollover_date_utc: str | None = None
     _polls: int = 0
     _events: int = 0
     _errors: int = 0
@@ -261,6 +273,7 @@ class WithdrawalDetector:
         if self._last_observed_equity is None:
             self._last_observed_equity = observed
             self._last_realized_pnl_total = self.account.realized_pnl_today_usdt
+            self._last_rollover_date_utc = self.account.last_rollover_date_utc
             logger.info(
                 "WithdrawalDetector baseline established: "
                 "venue_balance=%.2f USDT", observed,
@@ -268,6 +281,40 @@ class WithdrawalDetector:
             out["ok"] = True
             out["action"] = "baseline_set"
             out["observed"] = observed
+            return out
+
+        # Operational patch (post-review): UTC-day rollover handling.
+        # ``account.maybe_roll_over_day`` zeros
+        # ``realized_pnl_today_usdt`` at the trading-day boundary; if
+        # we don't notice that here the next netting computes a
+        # phantom flow of yesterday's PnL. Detect by comparing
+        # rollover date markers — when they differ, reset OUR snapshot
+        # to the current (post-rollover) totals and skip the round so
+        # the operator never sees a ghost event. The rollover itself
+        # is logged at INFO so the audit trail is intact.
+        cur_rollover_date = self.account.last_rollover_date_utc
+        if (
+            cur_rollover_date is not None
+            and self._last_rollover_date_utc is not None
+            and cur_rollover_date != self._last_rollover_date_utc
+        ):
+            prev_rollover_date = self._last_rollover_date_utc
+            logger.info(
+                "WithdrawalDetector: detected UTC-day rollover "
+                "(%s -> %s); resetting PnL snapshot to avoid phantom "
+                "flow event. observed=%.2f",
+                prev_rollover_date, cur_rollover_date, observed,
+            )
+            self._last_observed_equity = observed
+            self._last_realized_pnl_total = (
+                self.account.realized_pnl_today_usdt
+            )
+            self._last_rollover_date_utc = cur_rollover_date
+            out["ok"] = True
+            out["action"] = "rollover_resync"
+            out["observed"] = observed
+            out["rollover_from"] = prev_rollover_date
+            out["rollover_to"] = cur_rollover_date
             return out
 
         # Delta we actually saw on the venue.
@@ -341,4 +388,5 @@ class WithdrawalDetector:
             "errors": self._errors,
             "last_observed_equity": self._last_observed_equity,
             "last_realized_pnl_total": self._last_realized_pnl_total,
+            "last_rollover_date_utc": self._last_rollover_date_utc,
         }

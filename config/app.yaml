@@ -90,3 +90,29 @@ equity_snapshot_interval_sec: 60.0
 telegram_commands_enabled: false
 telegram_commands_allow_write: false
 telegram_commands_allowed_chat_ids: []
+
+# ----- Reversal guard (post-review) -----
+# Operator instruction: 反手要谨慎防止插针，合理规划风险要么就平仓观望，
+# 等待时机。只有合适时机才反手。
+# When a high-priority signal would flip our existing position (or
+# would re-enter opposite within reversal_guard_recent_close_window_sec
+# of a close), the ReversalGuard either VETOES (wick / score / cooldown
+# fail) or DEFERS the trade (close-and-watch). The "approve" path is
+# narrow by design: only post-close reversals that pass every check
+# are allowed straight through.
+# Defaults are fail-closed; tighten or relax in production.
+reversal_guard_enabled: false
+# Window after a close in which an opposite-direction signal counts
+# as a reversal candidate (still subject to all other checks).
+reversal_guard_recent_close_window_sec: 300
+# Wick / 插针 detector — Parkinson range over this window must be
+# below ``wick_threshold_pct`` of mid for a reversal to be allowed.
+reversal_guard_wick_window_sec: 60
+reversal_guard_wick_threshold_pct: 0.04
+# The flipped signal's final_score must clear this floor.
+reversal_guard_min_reversal_final_score: 7.5
+# After a veto, set this cooldown on the symbol so we don't thrash.
+reversal_guard_cooldown_sec: 120
+# Minimum elapsed time since the close for a post-close reversal.
+# Below this we always defer "close and watch".
+reversal_guard_min_seconds_since_close: 30
