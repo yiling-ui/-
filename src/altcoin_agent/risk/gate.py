@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from altcoin_agent.fuser import Direction, FusedSignal
 from altcoin_agent.price_tape import PriceTape
@@ -52,9 +52,11 @@ from altcoin_agent.risk.cluster import (
     ClusterMap,
     cap_breached,
 )
+from altcoin_agent.risk.pump_phase import PumpPhase
 from altcoin_agent.risk.regime_filter import RegimeFilter
 from altcoin_agent.risk.sizing import PositionSizer
 from altcoin_agent.risk.state import AccountState, Side
+from altcoin_agent.risk.symbol_profile import SymbolProfile
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,48 @@ class RiskGateConfig:
     max_signal_age_sec: int = 10
     # Per-symbol cooldown after high_priority emission
     symbol_cooldown_sec: int = 60
+
+    # ------------------------------------------------------------------ #
+    # R6 — phase + confidence gate (optional, default permissive).
+    #
+    # When the caller passes ``phase`` and ``confidence`` to ``evaluate``
+    # (or a ``SymbolProfile`` whose quadrant carries a custom
+    # ``confidence_threshold``), the gate enforces:
+    #
+    #   1. ``confidence >= phase_min_confidence[phase]``
+    #      Default thresholds preserve v1.0 behaviour for callers that
+    #      pass the legacy 0.0 confidence: 0.0 always >= 0.0.
+    #
+    #   2. ``phase`` is on the ``allowed_entry_phases`` allow-list.
+    #      Default allows everything, so legacy callers see no change.
+    #      QUADRANT_STRATEGY_PLAN section 四 says CRASH/BLEED/DEAD are
+    #      no-trade phases for entries; operators that want plan-spec
+    #      behaviour set ``allowed_entry_phases = {accumulation, ramp,
+    #      parabolic}`` in app.yaml.
+    #
+    # Both checks fail-open when ``phase`` / ``confidence`` are None
+    # so existing tests stay green.
+    # ------------------------------------------------------------------ #
+    phase_min_confidence: dict[str, float] = field(
+        default_factory=lambda: {
+            PumpPhase.ACCUMULATION.value: 0.0,
+            PumpPhase.RAMP.value: 0.0,
+            PumpPhase.PARABOLIC.value: 0.0,
+            PumpPhase.BLOWOFF_TOP.value: 0.0,
+            PumpPhase.CRASH.value: 0.0,
+            PumpPhase.BLEED.value: 0.0,
+            PumpPhase.DEAD.value: 0.0,
+        }
+    )
+    allowed_entry_phases: frozenset[str] = frozenset({
+        PumpPhase.ACCUMULATION.value,
+        PumpPhase.RAMP.value,
+        PumpPhase.PARABOLIC.value,
+        PumpPhase.BLOWOFF_TOP.value,
+        PumpPhase.CRASH.value,
+        PumpPhase.BLEED.value,
+        PumpPhase.DEAD.value,
+    })
 
 
 @dataclass
@@ -115,6 +159,10 @@ class RiskGate:
         regime_filter: RegimeFilter | None = None,
         cluster_map: ClusterMap | None = None,
         cluster_cap_cfg: ClusterCapConfig | None = None,
+        # R6 — phase + confidence + symbol profile (all optional).
+        phase: PumpPhase | None = None,
+        confidence: float | None = None,
+        symbol_profile: SymbolProfile | None = None,
     ) -> RiskDecision:
         """Run all 9 checks. Returns an approved decision with sizing details
         on success, or a rejection with a reason on the first failure.
@@ -132,6 +180,16 @@ class RiskGate:
         ``cluster_map`` + ``cluster_cap_cfg`` (audit #11): when both
         present, blocks any signal that would push the symbol's cluster
         (e.g. ``meme``) past the configured cap.
+
+        ``phase`` / ``confidence`` / ``symbol_profile`` (R6): when
+        provided, enforce the QUADRANT_STRATEGY_PLAN per-phase
+        confidence thresholds and the allowed-entry-phase allow-list.
+        ``symbol_profile`` (when set) overrides
+        ``phase_min_confidence`` with its quadrant's
+        ``effective_confidence_threshold`` -- so an A-quadrant symbol
+        with a stricter trainer-tuned threshold gets its tighter
+        gate. All three default to None and are fail-open, preserving
+        v1.0 behaviour for legacy callers.
 
         All three optional checks fail-OPEN when their inputs are
         missing or stale, so existing callers and dry-run tests keep
@@ -205,6 +263,35 @@ class RiskGate:
                 )
                 if breached:
                     return RiskDecision(False, reason)
+
+            # 0d) R6 — phase allow-list + per-phase confidence floor.
+            #
+            # Two cheap local checks before any networked work. Both
+            # fail-OPEN on missing inputs so legacy callers see no
+            # change. Symbol profile (when supplied) overrides the
+            # gate-level confidence floor with the quadrant's
+            # ``effective_confidence_threshold``.
+            if phase is not None:
+                if phase.value not in self.cfg.allowed_entry_phases:
+                    return RiskDecision(
+                        False, f"phase_not_allowed:{phase.value}",
+                    )
+                if confidence is not None:
+                    floor = self.cfg.phase_min_confidence.get(
+                        phase.value, 0.0,
+                    )
+                    if symbol_profile is not None:
+                        # Profile threshold supersedes gate floor.
+                        floor = max(
+                            floor,
+                            symbol_profile.effective_confidence_threshold(),
+                        )
+                    if confidence < floor:
+                        return RiskDecision(
+                            False,
+                            f"confidence_below_floor:"
+                            f"{confidence:.3f}<{floor:.3f}@phase={phase.value}",
+                        )
 
             # 1) global halt
             if account.global_trading_halted:
