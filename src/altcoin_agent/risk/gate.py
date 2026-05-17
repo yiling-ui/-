@@ -71,6 +71,16 @@ class RiskGateConfig:
     consecutive_loss_cooldown_sec: int = 4 * 3600
     # Liquidity
     min_liquidity_usdt: float = 200_000.0    # top-5 depth USDT
+    # Operational patch (depth-aware sizing): cap a single leg's notional
+    # at ``max_notional_vs_depth_pct`` of the live top-5 depth so the
+    # daemon cannot eat through the book on a thin-liquidity altcoin
+    # once the account scales (500 USDT @ 5x = 2500 USDT, fine; 50,000 @
+    # 15x = 750,000 USDT and you become the entire top-5 -> 5-10%
+    # immediate slippage, blowing through the 5% initial stop on entry).
+    # 0.0 disables the check (legacy behaviour for backtests / tests).
+    # Set to e.g. 0.10 in production: a single entry can take at most
+    # 10% of the visible top-5 depth.
+    max_notional_vs_depth_pct: float = 0.0
     # Slippage (SR-1)
     base_slippage: float = 0.03              # 3% at 5x leverage
     # Signal age
@@ -369,6 +379,38 @@ class RiskGate:
                     False, "sizing_below_minimum", side=side, leverage=leverage,
                 )
 
+            # 10b) depth-aware notional cap (operational patch).
+            #
+            # Why this matters: ``min_liquidity_usdt`` (闸门 #8) only checks
+            # that the book is ABOVE a floor. It does NOT prevent a large
+            # account from sizing a SINGLE order that eats most of that
+            # floor. With equity=50,000 USDT @ 15x leverage on an altcoin
+            # whose top-5 depth is 500,000 USDT, the gate happily approves
+            # a 750,000 USDT notional — meaning we ARE the book + 50%, and
+            # the actual fill price will sit well outside our stop.
+            #
+            # We therefore compare the *just-sized* notional against the
+            # live depth and reject if the order would consume more than
+            # ``max_notional_vs_depth_pct`` of the visible top-5. The
+            # check is deliberately OFF by default (== 0.0) so the legacy
+            # test suite that uses synthetic depths stays green; production
+            # flips it on via ``app.yaml`` (recommended: 0.10 = 10%).
+            if self.cfg.max_notional_vs_depth_pct > 0:
+                cap_notional = (
+                    top5_depth_usdt * self.cfg.max_notional_vs_depth_pct
+                )
+                if notional > cap_notional:
+                    return RiskDecision(
+                        False,
+                        f"notional_exceeds_depth_cap:{notional:.0f}>"
+                        f"{cap_notional:.0f}@"
+                        f"pct={self.cfg.max_notional_vs_depth_pct:.2f}",
+                        side=side,
+                        leverage=leverage,
+                        size=size,
+                        notional_usdt=notional,
+                    )
+
             return RiskDecision(
                 approved=True,
                 reason="ok",
@@ -519,6 +561,30 @@ class RiskGate:
                     f"sizing_below_minimum:{new_leg_notional:.2f}",
                     side=side, leverage=parent.leverage,
                 )
+
+            # 10b) depth-aware notional cap (operational patch, rolling path).
+            #
+            # Same rationale as the entry path: a single market order that
+            # consumes more than ``max_notional_vs_depth_pct`` of the
+            # visible top-5 depth is guaranteed to slip badly. We check
+            # the *new leg's* notional rather than the cumulative position
+            # because (a) the existing exposure already trades, and (b)
+            # the slippage that hurts us is the impact of THIS order.
+            if self.cfg.max_notional_vs_depth_pct > 0:
+                cap_notional = (
+                    top5_depth_usdt * self.cfg.max_notional_vs_depth_pct
+                )
+                if new_leg_notional > cap_notional:
+                    return RiskDecision(
+                        False,
+                        f"notional_exceeds_depth_cap:{new_leg_notional:.0f}>"
+                        f"{cap_notional:.0f}@"
+                        f"pct={self.cfg.max_notional_vs_depth_pct:.2f}",
+                        side=side,
+                        leverage=parent.leverage,
+                        size=proposed_size,
+                        notional_usdt=new_leg_notional,
+                    )
 
             return RiskDecision(
                 approved=True,

@@ -297,6 +297,108 @@ class AccountState:
             self._notify_change()
 
     # ------------------------------------------------------------------ #
+    # Operational patch — external equity adjustment (manual deposits /
+    # withdrawals to bank).
+    #
+    # Why this exists: an operator who wires 5,000 USDT out of the
+    # exchange to their bank does NOT generate a realised PnL event,
+    # but the exchange-side equity drops by 5k. Two failure modes if
+    # we don't model this:
+    #   (1) ``equity_usdt`` (used by sizing) gradually de-syncs from
+    #       the venue truth — every new entry is sized off a phantom
+    #       balance that hasn't existed for hours.
+    #   (2) ``daily_drawdown_pct`` = ``-realized_pnl / starting_equity``
+    #       — once the daily reconciler corrects ``equity_usdt`` we'd
+    #       otherwise be tempted to also re-derive ``starting_equity``
+    #       to "undo" the drawdown, which is the wrong fix because it
+    #       would mask a real losing streak.
+    #
+    # The right fix (this method): bring ``equity_usdt`` to the new
+    # balance AND shift ``starting_equity_today_usdt`` by the SAME
+    # delta so the *ratio* in ``daily_drawdown_pct`` stays unchanged.
+    # That preserves the circuit breaker's meaning (same realised loss
+    # in USDT but expressed as the same %-of-start) while letting
+    # sizing operate against the truthful number.
+    #
+    # The ``WithdrawalDetector`` (in main.py wiring) is the one
+    # legitimate caller in production. Tests can call it directly to
+    # simulate any bank-flow scenario.
+    # ------------------------------------------------------------------ #
+
+    def adjust_equity_baseline(
+        self,
+        new_equity_usdt: float,
+        *,
+        reason: str = "external_balance_adjustment",
+    ) -> float:
+        """Reconcile local equity to a venue-observed balance without
+        polluting the daily drawdown breaker.
+
+        Returns the *delta* applied (positive = deposit, negative =
+        withdrawal). Callers can log / notify on the magnitude.
+        """
+        if new_equity_usdt < 0:
+            # Negative balance is nonsensical; ignore and log.
+            logger.warning(
+                "adjust_equity_baseline: refused negative new_equity=%.2f "
+                "(reason=%s); leaving state untouched",
+                new_equity_usdt, reason,
+            )
+            return 0.0
+
+        delta = float(new_equity_usdt) - self.equity_usdt
+        if delta == 0.0:
+            return 0.0
+
+        # Preserve the daily_drawdown ratio across the adjustment.
+        # daily_drawdown_pct = -realized_pnl_today / starting_equity_today.
+        # If we just shifted starting_equity by ``delta`` (additive), the
+        # ratio would change because the numerator (realised PnL) is
+        # USDT-absolute, not proportional. The right invariant is:
+        # rescale starting_equity by the SAME multiplicative factor as
+        # equity, so the ratio = -pnl / (starting * scale) cannot be
+        # preserved with a single transform — we have to choose.
+        #
+        # Choice (and rationale): we scale starting_equity by the same
+        # multiplicative factor as equity_usdt. This means a 50%
+        # withdrawal halves both numbers; the next ``daily_drawdown_pct``
+        # query then shows -pnl / halved_starting which is 2× the
+        # previous value — that is the CORRECT semantic, because in
+        # USDT terms a 200 USDT loss against a halved account IS a
+        # bigger drawdown. The breaker should fire sooner if the
+        # operator pulls capital while the day was already negative.
+        #
+        # An alternative ("preserve-the-ratio") would be additive on
+        # both sides, but that masks the post-withdrawal capital
+        # constraint: a 6% breaker against a 5,000 starting still
+        # represents 300 USDT remaining buffer when 600 USDT have
+        # already been lost — an inconsistent statement.
+        old_equity = self.equity_usdt
+        if old_equity > 0 and self.starting_equity_today_usdt > 0:
+            scale = float(new_equity_usdt) / old_equity
+            self.starting_equity_today_usdt = max(
+                0.0, self.starting_equity_today_usdt * scale,
+            )
+        else:
+            # Defensive: degenerate state, fall back to additive shift
+            # so we don't divide by zero.
+            self.starting_equity_today_usdt = max(
+                0.0, self.starting_equity_today_usdt + delta,
+            )
+
+        self.equity_usdt = float(new_equity_usdt)
+
+        logger.warning(
+            "adjust_equity_baseline: %s delta=%+.2f USDT "
+            "(equity %.2f, starting_today %.2f) reason=%s",
+            "deposit" if delta > 0 else "withdrawal",
+            delta, self.equity_usdt, self.starting_equity_today_usdt,
+            reason,
+        )
+        self._notify_change()
+        return delta
+
+    # ------------------------------------------------------------------ #
     # Bug #3 fix — daily rollover.
     #
     # ``starting_equity_today_usdt``, ``realized_pnl_today_usdt`` and

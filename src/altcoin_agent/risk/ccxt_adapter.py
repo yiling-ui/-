@@ -360,6 +360,94 @@ class CCXTExchangeAdapter:
             })
         return out
 
+    async def fetch_total_usdt_balance(self) -> float:
+        """Total USDT-equivalent balance for ``WithdrawalDetector``.
+
+        For a USDT-margined perpetuals account we want a number that:
+          * tracks the operator's bank-flow (deposits / withdrawals
+            move it 1:1),
+          * already includes unrealised PnL on open positions (so the
+            detector's "unexplained delta" calculus only needs to net
+            against *realised* PnL flowing through ``account``).
+
+        Both Binance USDT-M futures and Gate.io USDT futures return a
+        wallet-and-margin object via ``fetch_balance()``. The shape
+        differs a little but ccxt unifies enough of it that we can
+        prefer ``info.totalWalletBalance + info.totalUnrealizedProfit``
+        on Binance, ``info.total_initial_margin + info.cross_wallet_balance``
+        on Gate, and a generic ``USDT.total`` fallback elsewhere.
+
+        Raises ``RuntimeError`` on transient errors so the
+        ``WithdrawalDetector`` swallows the round and retries; never
+        returns 0 on error (0 would look like a full withdrawal).
+        """
+        if not hasattr(self.client, "fetch_balance"):
+            raise RuntimeError(
+                f"{self.exchange_name} client has no fetch_balance",
+            )
+        bal = await self.client.fetch_balance()  # type: ignore[attr-defined]
+        if not isinstance(bal, dict):
+            raise RuntimeError(f"unexpected balance shape: {bal!r}")
+
+        # Venue-specific extraction (defensively, with fallback).
+        info = bal.get("info") or {}
+        # Binance USDT-M futures: ``totalWalletBalance`` is the wallet
+        # in USDT; ``totalUnrealizedProfit`` is unrealised PnL on
+        # all open positions. Their sum is the "marginBalance" the
+        # account-holder sees in the UI.
+        if self.exchange_name == "binance":
+            try:
+                wallet = float(info.get("totalWalletBalance") or 0.0)
+                upnl = float(info.get("totalUnrealizedProfit") or 0.0)
+                total = wallet + upnl
+                if total > 0:
+                    return total
+            except (TypeError, ValueError):
+                pass
+        if self.exchange_name == "gateio" or self.exchange_name == "gate":
+            # Gate.io futures returns ``total`` and ``available`` per
+            # currency; for cross-margin the wallet equity is in
+            # ``info.cross_wallet_balance`` plus ``info.unrealised_pnl``.
+            try:
+                cross_wb = float(info.get("cross_wallet_balance") or 0.0)
+                upnl = float(info.get("unrealised_pnl") or 0.0)
+                total = cross_wb + upnl
+                if total > 0:
+                    return total
+            except (TypeError, ValueError):
+                pass
+
+        # Generic fallback: ccxt unifies ``USDT.total`` to the
+        # net-of-margin total balance for most venues.
+        usdt = bal.get("USDT") or bal.get("usdt") or {}
+        if isinstance(usdt, dict):
+            for key in ("total", "free"):
+                v = usdt.get(key)
+                if v is not None:
+                    try:
+                        out = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if out > 0:
+                        return out
+
+        # ccxt sometimes puts the unified totals under ``total[USDT]``.
+        totals = bal.get("total") or {}
+        if isinstance(totals, dict):
+            v = totals.get("USDT")
+            if v is not None:
+                try:
+                    out = float(v)
+                except (TypeError, ValueError):
+                    out = 0.0
+                if out > 0:
+                    return out
+
+        raise RuntimeError(
+            f"no usable USDT balance in fetch_balance response on "
+            f"{self.exchange_name}: keys={list(bal.keys())}",
+        )
+
 
 # ------------------------------------------------------------------ #
 # Convenience constructor with safety belts

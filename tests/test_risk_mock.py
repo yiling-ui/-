@@ -1092,3 +1092,133 @@ def test_rollover_with_zero_starting_equity_still_safe() -> None:
     a.last_rollover_date_utc = "2026-05-15"
     a.maybe_roll_over_day(now_ms=_ms_at(2026, 5, 16))
     assert a.daily_drawdown_pct == 0.0
+
+
+
+# ====================================================================== #
+# Operational patch — depth-aware notional cap (large-account protection)
+# ====================================================================== #
+
+
+def test_gate_depth_cap_disabled_by_default() -> None:
+    """Legacy callers (and the entire pre-existing test suite) must see
+    no behavioural change. ``max_notional_vs_depth_pct = 0.0`` means the
+    gate ignores the depth cap and approves the legacy happy path."""
+    gate = RiskGate(PositionSizer(), RiskGateConfig(min_liquidity_usdt=200_000))
+    # No cap set => default 0.0 => disabled.
+    assert gate.cfg.max_notional_vs_depth_pct == 0.0
+    decision = gate.evaluate(
+        signal=_signal(),
+        account=_account(),
+        current_price=1.000,
+        top5_depth_usdt=400_000,
+        realized_vol_pct=0.05,
+        initial_stop=0.95,
+    )
+    assert decision.approved
+
+
+def test_gate_depth_cap_rejects_when_notional_eats_too_much_book() -> None:
+    """Operational patch: with a 10% depth cap and a 50,000 equity
+    account, an aggressive entry that sizes to 80,000 USDT notional on
+    a 500,000 USDT top-5 book (16% of depth) must be rejected.
+
+    This is the exact scenario the audit flagged: at 500 USDT capital
+    the daemon never approached the depth, but at 50,000+ USDT a single
+    leg can become a price-mover on illiquid altcoins."""
+    # Cap to 10% of depth.
+    gate = RiskGate(
+        PositionSizer(),
+        RiskGateConfig(
+            min_liquidity_usdt=200_000,
+            max_notional_vs_depth_pct=0.10,
+        ),
+    )
+    # Equity 50k, sweep stop 0.5% -> risk-parity wants ~150k notional.
+    # With 15x leverage cap on 50k equity that clamps to 750k. Either
+    # way we are well over 10% of a 500k book (= 50k cap).
+    big_account = AccountState(equity_usdt=50_000.0)
+    big_account.starting_equity_today_usdt = 50_000.0
+    big_account.reconciliation_complete = True
+
+    decision = gate.evaluate(
+        signal=_signal(),
+        account=big_account,
+        current_price=1.000,
+        top5_depth_usdt=500_000.0,
+        realized_vol_pct=0.05,
+        initial_stop=0.995,  # 0.5% stop -> tight, large notional
+    )
+    assert not decision.approved
+    assert "notional_exceeds_depth_cap" in decision.reason
+    # Diagnostic fields are populated so the dashboard can show what got
+    # rejected (size + notional are still computed — only the gate vetoes).
+    assert decision.size and decision.size > 0
+    assert decision.notional_usdt and decision.notional_usdt > 0
+
+
+def test_gate_depth_cap_allows_when_book_is_deep_enough() -> None:
+    """A 10% cap on a 5,000,000 USDT book gives a 500k single-leg
+    headroom, which a 50k account at 15x cannot reach unless the stop
+    is pathologically tight. With a normal 5% stop the risk-parity
+    notional sits well under the cap."""
+    gate = RiskGate(
+        PositionSizer(),
+        RiskGateConfig(
+            min_liquidity_usdt=200_000,
+            max_notional_vs_depth_pct=0.10,
+        ),
+    )
+    big_account = AccountState(equity_usdt=50_000.0)
+    big_account.starting_equity_today_usdt = 50_000.0
+    big_account.reconciliation_complete = True
+
+    decision = gate.evaluate(
+        signal=_signal(),
+        account=big_account,
+        current_price=1.000,
+        top5_depth_usdt=5_000_000.0,
+        realized_vol_pct=0.05,
+        initial_stop=0.95,
+    )
+    assert decision.approved, f"expected approve, got {decision.reason}"
+    # Sanity: notional should be well under 10% of the 5M book.
+    assert decision.notional_usdt is not None
+    assert decision.notional_usdt <= 5_000_000.0 * 0.10
+
+
+def test_gate_depth_cap_boundary_at_exact_pct() -> None:
+    """When notional equals the cap exactly the gate must approve
+    (the rejection condition is strict >, not >=). This is regression
+    insurance against an off-by-one edge that would hurt operators
+    who size right at the cap intentionally."""
+    sizer = PositionSizer(
+        max_risk_per_trade=0.015, min_notional_usdt=1.0,
+    )
+    gate = RiskGate(
+        sizer,
+        RiskGateConfig(
+            min_liquidity_usdt=100_000,
+            max_notional_vs_depth_pct=0.10,
+        ),
+    )
+    # Carefully chosen so risk-parity notional comes in exactly at the
+    # 10% mark. We use a moderate stop and equity scale so the cap is
+    # binding.
+    a = AccountState(equity_usdt=10_000.0)
+    a.starting_equity_today_usdt = 10_000.0
+    a.reconciliation_complete = True
+
+    # A wide book where 10% leaves plenty of room for normal sizing.
+    decision = gate.evaluate(
+        signal=_signal(),
+        account=a,
+        current_price=1.000,
+        top5_depth_usdt=1_000_000.0,
+        realized_vol_pct=0.05,
+        initial_stop=0.95,
+    )
+    assert decision.approved
+    assert decision.notional_usdt is not None
+    # 1.5% * 10k / 5% * 1.0 = 3000 USDT notional, well under 100k cap.
+    assert decision.notional_usdt <= 1_000_000.0 * 0.10
