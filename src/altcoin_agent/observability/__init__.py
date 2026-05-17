@@ -46,6 +46,16 @@ from altcoin_agent.observability.structured_log import (
     current_trace_id,
     new_trace_id,
 )
+from altcoin_agent.observability.tracing import (
+    OTEL_AVAILABLE,
+    Tracer,
+    configure_tracing,
+    get_tracer,
+    reset_tracing,
+    shutdown_tracing,
+    start_span,
+    traced,
+)
 
 __all__ = [
     "Counter",
@@ -54,9 +64,17 @@ __all__ = [
     "Gauge",
     "Histogram",
     "MetricsRegistry",
+    "OTEL_AVAILABLE",
     "StructuredLogger",
+    "Tracer",
     "bind_trace_id",
     "build_default_registry",
+    "configure_tracing",
     "current_trace_id",
+    "get_tracer",
     "new_trace_id",
+    "reset_tracing",
+    "shutdown_tracing",
+    "start_span",
+    "traced",
 ]

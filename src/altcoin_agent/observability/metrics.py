@@ -41,8 +41,8 @@ import math
 import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
