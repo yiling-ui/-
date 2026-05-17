@@ -911,26 +911,32 @@ async def run_post_mortem(
     expected_direction: Direction | None = None,
     hours_back: int = 4,
     hours_forward: int = 1,
+    realized_result: EventResult | None = None,
 ) -> PostMortemReport:
     """Main entry point. Returns the full report and persists rule updates.
 
-    `slice_override` lets tests / demos inject a synthetic slice without
+    ``slice_override`` lets tests / demos inject a synthetic slice without
     touching the network.
 
-    Bug #2 fix:
+    Audit-fix #4 — close-event-driven learning
+    -----------------------------------------
+    When ``realized_result`` is provided (the production path, fired from
+    ``_on_position_close``), the realized direction and magnitude are the
+    REAL trade outcome — derived from the actual fill price and trade
+    realised PnL, not synthesised from OKX REST market data. The features
+    are still extracted from the pre-entry slice (so the LLM/heuristic
+    can ask "what predicted this trade?"), but the hit/miss attribution
+    is anchored to what the trade actually realised.
 
-    * When called with ``entry_ts_ms`` (the live post-mortem path), the slice
-      spans ``[entry - hours_back, entry + hours_forward]``; ``compute_event_result``
-      evaluates only the post-entry segment and ``extract_candidate_features``
-      uses only the pre-entry segment. The features can no longer be
-      contaminated by post-entry data, and the result can no longer be
-      "the biggest move that happened before we even opened".
-    * ``expected_direction`` makes the result direction-aware: a long that
-      gets stopped out is recorded as a *negative-magnitude pump* (we bet
-      pump, lost money), so the rule store learns from misses too. Without
-      this, a stopped-out long would pick up the dump bucket of every
-      losing pre-entry feature, training the system to short the very
-      patterns it had marked as bullish.
+    Legacy paths preserved:
+
+    * When ``realized_result`` is None and ``entry_ts_ms`` is set, the
+      result is computed from the post-entry market segment. This is the
+      backtest / replay code path used by ``scripts/backtest_30d.py`` and
+      ``discover_events.py``.
+    * When ``realized_result`` is None and ``entry_ts_ms`` is None, the
+      original whole-slice extremum is used (unchanged behaviour for
+      ``synthesize_dump_slice`` and the existing learning-engine tests).
     """
     if slice_override is not None:
         s = slice_override
@@ -945,7 +951,14 @@ async def run_post_mortem(
         s = await fetch_historical_slice(symbol, target_ts_ms,
                                           hours_back=hours_back)
 
-    result = compute_event_result(s, expected_direction=expected_direction)
+    if realized_result is not None:
+        # Production path: trust the trade's actual realised outcome over
+        # any market-slice synthesis. Features are still measured from the
+        # pre-entry window so the LLM/heuristic can pick what predicted
+        # the move.
+        result = realized_result
+    else:
+        result = compute_event_result(s, expected_direction=expected_direction)
     candidates = extract_candidate_features(s, result)
 
     if engine is not None and engine.provider is not None:

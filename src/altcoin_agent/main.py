@@ -400,7 +400,7 @@ class HealthState:
     last_close_ts: float = 0.0
     llm_consults: int = 0
     llm_consults_skipped: int = 0
-    post_mortems_scheduled: int = 0
+    post_mortems_recorded: int = 0
     last_error: str | None = None
 
 
@@ -426,7 +426,7 @@ async def make_health_app(state: HealthState) -> web.Application:
             "last_close_ts": state.last_close_ts,
             "llm_consults": state.llm_consults,
             "llm_consults_skipped": state.llm_consults_skipped,
-            "post_mortems_scheduled": state.post_mortems_scheduled,
+            "post_mortems_recorded": state.post_mortems_recorded,
             "last_signal_ts": state.last_signal_ts,
             "last_error": state.last_error,
         }
@@ -478,8 +478,8 @@ async def make_health_app(state: HealthState) -> web.Application:
               "Total LLM consults that produced a verdict")
         gauge("llm_consults_skipped", state.llm_consults_skipped,
               "Total LLM consults skipped (no engine, dropped, error)")
-        gauge("post_mortems_scheduled", state.post_mortems_scheduled,
-              "Total post-mortem learning passes scheduled after open")
+        gauge("post_mortems_recorded", state.post_mortems_recorded,
+              "Total post-mortem learning passes recorded after a real close")
         gauge("last_signal_ts", state.last_signal_ts,
               "Wall-clock ts of most-recent screener event")
         return web.Response(
@@ -1859,32 +1859,15 @@ class App:
             self.dashboard.push_order(opened_payload)
             with suppress(Exception):
                 await self.notifier.opened(opened_payload)
-            # Close the self-evolution loop: schedule a post-mortem 1h
-            # after entry so the rules learned from this trade flow back
-            # into the fuser via dynamic_rules.json.
-            #
-            # Bug #2 fix: pass ``entry_ts_ms`` (now, the moment we opened)
-            # and ``expected_direction`` derived from the position side.
-            # The post-mortem will then slice [entry-4h, entry+1h], extract
-            # features strictly from the pre-entry segment, and evaluate
-            # the realized move strictly post-entry — so we learn what
-            # predicted what we actually got, not what predicted some
-            # arbitrary extremum in the lookback window.
-            if self._post_mortem is not None:
-                entry_ts_ms = int(time.time() * 1000)
-                target_ts_ms = entry_ts_ms + (
-                    self._post_mortem.delay_sec * 1000
-                )
-                expected_direction = (
-                    "pump" if position.side == Side.LONG else "dump"
-                )
-                self._post_mortem.schedule(
-                    symbol=sig.symbol,
-                    target_ts_ms=target_ts_ms,
-                    entry_ts_ms=entry_ts_ms,
-                    expected_direction=expected_direction,
-                )
-                self.state.post_mortems_scheduled += 1
+            # Audit-fix Req #4: the self-evolution loop is now CLOSE-event
+            # driven. ``_on_position_close`` calls ``self._post_mortem.record(...)``
+            # with the actual realized PnL / fill price the moment a real
+            # exchange-side close is detected by ``PositionWatcher``. We
+            # NO LONGER schedule a fixed-time post-mortem at open: doing
+            # so would file a learning event ~1h after open regardless of
+            # whether the trade had been stopped out 5 minutes in, which
+            # poisons ``dynamic_rules.json`` with synthetic market-slice
+            # outcomes that have nothing to do with the realised trade.
         except Exception as e:
             logger.exception("Executor failed for %s: %s", sig.symbol, e)
             self.state.last_error = f"executor:{type(e).__name__}"
@@ -2030,6 +2013,27 @@ class App:
         if self.notifier is not None:
             with suppress(Exception):
                 await self.notifier.closed(closed_payload)
+
+        # Audit-fix Req #4: file the learning event NOW, off the real
+        # close, with the realised PnL we just computed. This replaces
+        # the previous open-time fixed-1h timer that would update
+        # ``dynamic_rules.json`` with synthetic market-slice outcomes
+        # disconnected from the actual trade. Failures are best-effort:
+        # the learning loop must never poison the trading loop.
+        if self._post_mortem is not None:
+            with suppress(Exception):
+                self._post_mortem.record(
+                    symbol=symbol,
+                    entry_ts_ms=position.opened_at_ts_ms,
+                    close_ts_ms=int(time.time() * 1000),
+                    side=position.side.value,
+                    entry_price=avg_entry,
+                    fill_price=fill_price,
+                    realized_pnl_usdt=realized_pnl_usdt,
+                    realized_r=realized_r,
+                    close_reason=reason,
+                )
+                self.state.post_mortems_recorded += 1
 
     def _mode_label(self) -> str:
         if self.cfg.dry_run:

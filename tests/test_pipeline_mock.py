@@ -547,3 +547,191 @@ async def test_post_mortem_scheduler_omits_entry_kwargs_for_legacy_call(
     await asyncio.wait_for(task, timeout=2.0)
     assert "entry_ts_ms" not in captured
     assert "expected_direction" not in captured
+
+
+
+# --------------------------------------------------------------------- #
+# DelayedPostMortemScheduler.record() — close-event-driven learning loop.
+#
+# Audit-fix Req #4 invariant: rule updates are anchored to the REAL trade
+# outcome (entry_price, fill_price, realized_pnl_usdt), not to a fixed-time
+# market-slice synthesis fired off the open handler. These tests pin that
+# contract.
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_post_mortem_record_uses_realized_result_no_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``record()`` must call ``run_post_mortem`` with the EventResult we
+    built from the real trade — i.e. the synthetic OKX-slice path is
+    skipped — and must do so IMMEDIATELY, not after sleeping ``delay_sec``.
+    """
+    store = RuleStore(json_path=tmp_path / "rules.json",
+                       md_path=tmp_path / "rules.md")
+
+    captured: dict = {}
+
+    async def fake_run_post_mortem(**kwargs):
+        captured.update(kwargs)
+        from altcoin_agent.learning_engine import (
+            EventResult,
+            PostMortemReport,
+        )
+        rr = kwargs.get("realized_result")
+        return PostMortemReport(
+            symbol=kwargs["symbol"],
+            target_ts_ms=kwargs["target_ts_ms"],
+            result=rr or EventResult(
+                direction="pump", magnitude_pct=0.0,
+                minutes_to_extremum=0,
+                realized_at_ts_ms=kwargs["target_ts_ms"],
+            ),
+            candidates=[],
+            picks=[],
+        )
+
+    monkeypatch.setattr(pipeline_mod, "run_post_mortem", fake_run_post_mortem)
+
+    # delay_sec=3600 to prove ``record()`` does NOT honour the legacy
+    # delay path — if it did, the test would hang for an hour.
+    sched = DelayedPostMortemScheduler(store=store, engine=None, delay_sec=3600)
+
+    entry_ts = 1_700_000_000_000
+    close_ts = entry_ts + 5 * 60 * 1000  # closed 5 min after open
+    task = sched.record(
+        symbol="RAVEUSDT",
+        entry_ts_ms=entry_ts,
+        close_ts_ms=close_ts,
+        side="long",
+        entry_price=1.0000,
+        fill_price=0.9700,           # stopped out -3%
+        realized_pnl_usdt=-30.0,
+        realized_r=-1.0,
+        close_reason="exchange_close_detected",
+    )
+    await asyncio.wait_for(task, timeout=2.0)
+
+    # The post-mortem ran with our synthetic EventResult, not a network slice.
+    assert captured["symbol"] == "RAVEUSDT"
+    assert captured["target_ts_ms"] == close_ts
+    assert captured["entry_ts_ms"] == entry_ts
+    assert captured["expected_direction"] == "pump"   # LONG -> pump thesis
+    rr = captured["realized_result"]
+    assert rr.direction == "pump"
+    # Stopped-out long: magnitude is the negative fractional move from entry.
+    assert rr.magnitude_pct == pytest.approx(-0.03, abs=1e-9)
+    assert rr.realized_at_ts_ms == close_ts
+
+
+@pytest.mark.asyncio
+async def test_post_mortem_record_short_thesis_negative_magnitude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SHORT that gets stopped out (price went UP) must record a
+    ``dump`` direction with a NEGATIVE magnitude — proving the realised
+    direction is the trader's intended thesis, not the market's actual
+    move, so the rule store learns from misses on the side we bet."""
+    store = RuleStore(json_path=tmp_path / "rules.json",
+                       md_path=tmp_path / "rules.md")
+
+    captured: dict = {}
+
+    async def fake_run_post_mortem(**kwargs):
+        captured.update(kwargs)
+        from altcoin_agent.learning_engine import (
+            EventResult,
+            PostMortemReport,
+        )
+        rr = kwargs.get("realized_result")
+        return PostMortemReport(
+            symbol=kwargs["symbol"],
+            target_ts_ms=kwargs["target_ts_ms"],
+            result=rr or EventResult(
+                direction="dump", magnitude_pct=0.0,
+                minutes_to_extremum=0,
+                realized_at_ts_ms=kwargs["target_ts_ms"],
+            ),
+            candidates=[],
+            picks=[],
+        )
+
+    monkeypatch.setattr(pipeline_mod, "run_post_mortem", fake_run_post_mortem)
+
+    sched = DelayedPostMortemScheduler(store=store, engine=None, delay_sec=0)
+    entry_ts = 1_700_000_000_000
+    close_ts = entry_ts + 12 * 60 * 1000
+    task = sched.record(
+        symbol="DOGEUSDT",
+        entry_ts_ms=entry_ts,
+        close_ts_ms=close_ts,
+        side="short",
+        entry_price=0.1000,
+        fill_price=0.1050,           # short stopped out, +5% adverse
+        realized_pnl_usdt=-50.0,
+        realized_r=-1.0,
+        close_reason="trailing_stop_fill",
+    )
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert captured["expected_direction"] == "dump"
+    rr = captured["realized_result"]
+    assert rr.direction == "dump"
+    assert rr.magnitude_pct == pytest.approx(-0.05, abs=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_post_mortem_record_winner_positive_magnitude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A LONG that wins (price went UP) records ``pump`` with POSITIVE
+    magnitude — feeding hits into the rule store on the bullish features
+    that fired this winning entry."""
+    store = RuleStore(json_path=tmp_path / "rules.json",
+                       md_path=tmp_path / "rules.md")
+
+    captured: dict = {}
+
+    async def fake_run_post_mortem(**kwargs):
+        captured.update(kwargs)
+        from altcoin_agent.learning_engine import (
+            EventResult,
+            PostMortemReport,
+        )
+        rr = kwargs.get("realized_result")
+        return PostMortemReport(
+            symbol=kwargs["symbol"],
+            target_ts_ms=kwargs["target_ts_ms"],
+            result=rr or EventResult(
+                direction="pump", magnitude_pct=0.08,
+                minutes_to_extremum=42,
+                realized_at_ts_ms=kwargs["target_ts_ms"],
+            ),
+            candidates=[],
+            picks=[],
+        )
+
+    monkeypatch.setattr(pipeline_mod, "run_post_mortem", fake_run_post_mortem)
+
+    sched = DelayedPostMortemScheduler(store=store, engine=None, delay_sec=0)
+    entry_ts = 1_700_000_000_000
+    close_ts = entry_ts + 42 * 60 * 1000
+    await asyncio.wait_for(
+        sched.record(
+            symbol="WIFUSDT",
+            entry_ts_ms=entry_ts,
+            close_ts_ms=close_ts,
+            side="long",
+            entry_price=1.0000,
+            fill_price=1.0800,          # +8% trail-take
+            realized_pnl_usdt=80.0,
+            realized_r=2.7,
+            close_reason="exchange_close_detected",
+        ),
+        timeout=2.0,
+    )
+
+    rr = captured["realized_result"]
+    assert rr.direction == "pump"
+    assert rr.magnitude_pct == pytest.approx(0.08, abs=1e-9)

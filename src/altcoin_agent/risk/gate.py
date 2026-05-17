@@ -1,19 +1,47 @@
 """gate.py — RiskGate, the single hard wall before any order is placed.
 
-Nine fail-closed checks, in order. Any single failure produces a rejection
-with a reason. On unexpected exception the result is also a rejection
-(fail-closed).
+Thirteen fail-closed checks, in order. Any single failure produces a
+rejection with a reason. On unexpected exception the result is also a
+rejection (fail-closed).
 
-The 9 checks:
-    1. Account globally halted (manual or auto)
-    2. Reconciliation complete
-    3. Daily drawdown circuit breaker
-    4. Daily stop-loss hit count
-    5. Per-symbol cooldown
-    6. Per-symbol consecutive-loss cooldown
-    7. Concurrent position cap
-    8. Top-5 orderbook depth (liquidity)
-    9. Slippage (SR-1, dynamic threshold by leverage)
+Every check below is independent: each returns a rejection on its own,
+no boolean ``and``/``or`` short-circuiting fuses two checks into one.
+This is the invariant the architecture depends on so that a single
+defect in one gate cannot silently disable another.
+
+The 13 independent checks (in evaluation order)
+-----------------------------------------------
+Signal-validity (pre-network):
+    1. Signal is not blocked upstream (``signal.blocked``).
+    2. Signal is high-priority (``signal.is_high_priority``).
+    3. Signal direction is not NEUTRAL.
+
+Local-memory micro-structure (no network round-trip):
+    4. Anti-chase (price tape): recent move not already too far in our
+       favour to add.
+    5. Vol-kill (price tape): tape not in whipsaw range expansion.
+    6. BTC regime filter (audit #10): block LONG when BTC is dropping
+       fast / SHORT when BTC is ripping (cold tape -> fail-open).
+    7. Symbol-cluster cap (audit #11): correlated symbol set
+       (PEPE/WIF/FLOKI ...) effectively counts as one trade.
+
+Account-level circuit breakers:
+    8. Global trading halt (manual or kill-switch).
+    9. Reconciliation must be complete (SR-2).
+    10. Daily drawdown circuit breaker.
+    11. Daily stop-loss hit count cap.
+    12. Per-symbol cooldown active.
+    13. Per-symbol consecutive-loss cooldown.
+
+Capacity and execution feasibility:
+    14. Concurrent-position cap.
+    15. Top-5 orderbook depth (liquidity).
+    16. Slippage cap (SR-1, dynamic by leverage).
+
+(Fifteen ``return RiskDecision(False, ...)`` veto points plus a final
+post-sizing ``size <= 0`` rejection. The "13" headline counts the user-
+facing risk gates; the three signal-validity checks above are mandatory
+preconditions enforced at the same fail-closed level.)
 
 Per architect call SR-1, the slippage threshold is asymmetric:
 moves IN OUR FAVOUR are NEVER abort reasons. Only adverse drift counts.
