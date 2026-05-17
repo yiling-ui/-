@@ -45,6 +45,11 @@ from altcoin_agent.llm.cache import LLMCache
 from altcoin_agent.llm.pre_rater import LLMPreRater
 from altcoin_agent.llm.token_budget import TokenBudgetManager
 from altcoin_agent.notifier import Notifier, build_default_notifier
+from altcoin_agent.notifier.telegram_commands import (
+    CommandHandlers,
+    TelegramCommandPoller,
+    TelegramCommandPollerConfig,
+)
 from altcoin_agent.observability import (
     DeadLetterQueue,
     DLQEntry,
@@ -115,6 +120,10 @@ from altcoin_agent.risk.threshold_auto_tuner import (
     ThresholdAutoTuner,
     ThresholdAutoTunerConfig,
 )
+from altcoin_agent.risk.withdrawal_detector import (
+    WithdrawalDetector,
+    WithdrawalDetectorConfig,
+)
 from altcoin_agent.training.production_rules_loader import (
     ProductionRulesLoader,
 )
@@ -141,6 +150,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AppConfig:
+    # Operational guidance: the daemon is *tested* against these two
+    # venues — binance USDT-M futures and Gate.io USDT futures — and
+    # ships ccxt error-handling + idempotency tweaks for each. ccxt.pro
+    # supports many more (okx, bybit, bitget, kucoin, mexc, …) and the
+    # adapter / sizing / gate logic is venue-agnostic, so operators can
+    # add any of those by extending this list. Anything outside the
+    # supported set produces a one-line warning at boot ("running on
+    # untested venue X — partial-fill / 5xx behaviour may differ").
     exchanges: list[str] = field(default_factory=lambda: ["binance"])
     symbols: list[str] = field(default_factory=lambda: ["BTC/USDT:USDT"])
     timeframes: tuple[str, ...] = ("1m", "5m")
@@ -285,6 +302,31 @@ class AppConfig:
     kill_switch_enabled: bool = True
     kill_switch_path: str = ".kiro/state/HALT"
     kill_switch_poll_sec: float = 2.0
+
+    # Operational patches — large-account / withdrawals / TG commands
+    # ----------------------------------------------------------------
+    # Depth-aware notional cap (gate.py 闸 #10b). Default 0.0 = disabled
+    # so existing tests pass; production sets e.g. 0.10 in app.yaml.
+    max_notional_vs_depth_pct: float = 0.0
+    # WithdrawalDetector — polls fetch_balance and reconciles
+    # ``account.equity_usdt`` to the venue when an unexplained delta
+    # (deposit / withdrawal) is observed. Off by default so dry-run
+    # tests don't hit the network.
+    withdrawal_detector_enabled: bool = False
+    withdrawal_poll_sec: float = 300.0
+    withdrawal_min_significant_delta_usdt: float = 100.0
+    withdrawal_startup_grace_sec: float = 30.0
+    # Equity snapshot ticker — pushes a point to the dashboard's
+    # ``equity_curve`` ring buffer every N seconds so the PnL chart
+    # has data even without a fresh trade event.
+    equity_snapshot_interval_sec: float = 60.0
+    # TelegramCommandPoller — opt-in two-way control plane. The
+    # operator sends /status /equity /positions etc. over Telegram.
+    # ``allowed_chat_ids`` is comma-separated in app.yaml, parsed in
+    # ``AppConfig.from_dict`` below into a set[int].
+    telegram_commands_enabled: bool = False
+    telegram_commands_allow_write: bool = False
+    telegram_commands_allowed_chat_ids: tuple[int, ...] = ()
     # Decision audit log (audit #28)
     decision_audit_log_enabled: bool = True
     decision_audit_log_path: str = "logs/decisions.jsonl"
@@ -613,6 +655,35 @@ class AppConfig:
             ),
             kill_switch_poll_sec=float(
                 d.get("kill_switch_poll_sec", 2.0),
+            ),
+            # Operational patches.
+            max_notional_vs_depth_pct=float(
+                d.get("max_notional_vs_depth_pct", 0.0),
+            ),
+            withdrawal_detector_enabled=bool(
+                d.get("withdrawal_detector_enabled", False),
+            ),
+            withdrawal_poll_sec=float(
+                d.get("withdrawal_poll_sec", 300.0),
+            ),
+            withdrawal_min_significant_delta_usdt=float(
+                d.get("withdrawal_min_significant_delta_usdt", 100.0),
+            ),
+            withdrawal_startup_grace_sec=float(
+                d.get("withdrawal_startup_grace_sec", 30.0),
+            ),
+            equity_snapshot_interval_sec=float(
+                d.get("equity_snapshot_interval_sec", 60.0),
+            ),
+            telegram_commands_enabled=bool(
+                d.get("telegram_commands_enabled", False),
+            ),
+            telegram_commands_allow_write=bool(
+                d.get("telegram_commands_allow_write", False),
+            ),
+            telegram_commands_allowed_chat_ids=tuple(
+                int(x) for x in
+                (d.get("telegram_commands_allowed_chat_ids") or [])
             ),
             decision_audit_log_enabled=bool(
                 d.get("decision_audit_log_enabled", True),
@@ -1037,6 +1108,29 @@ assert isinstance(DryRunExchangeAdapter(), ExchangeAdapter), (
 def _build_live_adapter(cfg: AppConfig) -> CCXTExchangeAdapter | None:
     """Build a ccxt-backed adapter from environment variables."""
     exchange = cfg.exchanges[0] if cfg.exchanges else "binance"
+
+    # Operational note: venues we have explicitly tested for ccxt
+    # quirks (idempotency param naming, fetch_balance shape, etc.).
+    # ``ccxt_adapter.py`` has dedicated branches for these. Other
+    # ccxt.pro venues will likely *work* but we warn the operator.
+    _PRIMARY = {"binance", "binanceusdm", "gateio", "gate"}
+    _RESERVED = {"okx", "bybit", "bitget", "kucoin", "mexc", "bingx"}
+    if exchange not in _PRIMARY and exchange not in _RESERVED:
+        logger.warning(
+            "Exchange %r is not in the tested list "
+            "(primary: %s; reserved: %s). The adapter is venue-agnostic "
+            "but partial-fill / 5xx / idempotency-key behaviour may "
+            "differ. Validate carefully in dry-run before flipping live.",
+            exchange, sorted(_PRIMARY), sorted(_RESERVED),
+        )
+    elif exchange in _RESERVED:
+        logger.info(
+            "Exchange %r: reserved-but-tested venue. ccxt.pro support is "
+            "in place; the partial-fill threshold and 5xx classification "
+            "use the same defaults as binance.",
+            exchange,
+        )
+
     key_var = f"{exchange.upper()}_API_KEY"
     sec_var = f"{exchange.upper()}_API_SECRET"
     pass_var = f"{exchange.upper()}_API_PASSPHRASE"
@@ -1323,6 +1417,9 @@ class App:
     _cluster_cap_cfg: ClusterCapConfig | None = None
     _kill_switch: KillSwitchWatcher | None = None
     _decision_audit_log: DecisionAuditLog | None = None
+    # Operational patches.
+    _withdrawal_detector: WithdrawalDetector | None = None
+    _telegram_command_poller: TelegramCommandPoller | None = None
     # Phase B.2 — observability slots (None = feature off).
     _metrics: DefaultMetrics | None = None
     _dlq: DeadLetterQueue | None = None
@@ -1453,6 +1550,7 @@ class App:
         sizer = PositionSizer()
         gate = RiskGate(sizer, RiskGateConfig(
             min_liquidity_usdt=self.cfg.min_liquidity_usdt,
+            max_notional_vs_depth_pct=self.cfg.max_notional_vs_depth_pct,
         ))
         atr = ATRCalculator()
         # Anti-chase / vol-kill price tape (low-latency hot-path defence).
@@ -2335,8 +2433,273 @@ class App:
                 name="production_rules_reload_worker",
             ))
 
+        # ----------------------------------------------------------- #
+        # Operational patches — wired here so all required deps
+        # (account, notifier, dashboard, adapter) are constructed.
+        # ----------------------------------------------------------- #
+
+        # Equity snapshot ticker — feeds the dashboard's PnL chart
+        # even when no trade has flipped state for a while. Cheap
+        # (one float push every 60s).
+        async def equity_snapshot_worker() -> None:
+            interval = max(1.0, self.cfg.equity_snapshot_interval_sec)
+            try:
+                while not self._stop_event.is_set():
+                    try:
+                        self.dashboard.record_equity_snapshot()
+                    except Exception as e:  # pragma: no cover defensive
+                        logger.warning(
+                            "equity_snapshot_worker push failed: %s", e,
+                        )
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(), timeout=interval,
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        continue
+            except asyncio.CancelledError:
+                pass
+        self._tasks.append(asyncio.create_task(
+            equity_snapshot_worker(), name="equity_snapshot_worker",
+        ))
+
+        # WithdrawalDetector — only when the adapter actually exposes
+        # ``fetch_total_usdt_balance`` (the dry-run adapter does not).
+        # Off by default; operators flip ``withdrawal_detector_enabled``
+        # in app.yaml once they wire a real ccxt adapter.
+        if (
+            self.cfg.withdrawal_detector_enabled
+            and self._withdrawal_detector is None
+            and hasattr(self._adapter, "fetch_total_usdt_balance")
+        ):
+            async def _on_flow_event(
+                reason: str, delta: float, diag: dict[str, Any],
+            ) -> None:
+                """Push to dashboard ring buffer + Telegram-alert the
+                operator. Both calls are best-effort."""
+                with suppress(Exception):
+                    self.dashboard.push_external_flow({
+                        "ts": time.time(),
+                        "kind": reason,
+                        "delta_usdt": delta,
+                        "venue_balance": diag.get("venue_balance"),
+                        "notes": (
+                            f"unexplained={diag.get('unexplained'):+.2f}, "
+                            f"pnl_delta={diag.get('pnl_delta'):+.2f}"
+                        ),
+                    })
+                with suppress(Exception):
+                    if self.notifier is not None:
+                        await self.notifier.error(
+                            f"BANK FLOW {reason}: {delta:+.2f} USDT "
+                            f"(venue balance now "
+                            f"{diag.get('venue_balance'):.2f})",
+                            payload={"reason": reason, "delta": delta},
+                        )
+            self._withdrawal_detector = WithdrawalDetector(
+                adapter=self._adapter,  # type: ignore[arg-type]
+                account=account,
+                cfg=WithdrawalDetectorConfig(
+                    enabled=True,
+                    poll_interval_sec=self.cfg.withdrawal_poll_sec,
+                    min_significant_delta_usdt=(
+                        self.cfg.withdrawal_min_significant_delta_usdt
+                    ),
+                    startup_grace_sec=self.cfg.withdrawal_startup_grace_sec,
+                ),
+                on_event=_on_flow_event,
+            )
+            wd = self._withdrawal_detector
+
+            async def withdrawal_detector_worker() -> None:
+                try:
+                    await wd.run(self._stop_event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.exception(
+                        "withdrawal_detector_worker failed: %s", e,
+                    )
+                    self.state.last_error = (
+                        f"withdrawal_detector:{type(e).__name__}"
+                    )
+
+            self._tasks.append(asyncio.create_task(
+                withdrawal_detector_worker(),
+                name="withdrawal_detector_worker",
+            ))
+
+        # TelegramCommandPoller — opt-in two-way control plane.
+        # We bind the handlers to the live ``account`` / ``self``
+        # references via closures, mirroring how Notifier is wired.
+        if (
+            self.cfg.telegram_commands_enabled
+            and self._telegram_command_poller is None
+            and self.cfg.telegram_commands_allowed_chat_ids
+        ):
+            handlers = self._build_telegram_command_handlers(account)
+            tg_token = os.getenv("TG_BOT_TOKEN", "")
+            tg_api_base = os.getenv(
+                "TG_API_BASE", "https://api.telegram.org",
+            )
+            if not tg_token:
+                logger.warning(
+                    "telegram_commands_enabled=true but TG_BOT_TOKEN "
+                    "is empty; skipping the command poller",
+                )
+            else:
+                async def _reply_sender(text: str) -> None:
+                    # Route replies through the existing notifier so
+                    # they share the rate-limiter (and so the operator
+                    # only needs one bot configured).
+                    with suppress(Exception):
+                        # Notifier.signal expects a payload dict; we
+                        # repurpose ``signal`` is wrong here. Use
+                        # ``error`` (which already accepts free-form
+                        # text) so replies show up as a distinct kind
+                        # of message in TG.
+                        if self.notifier is not None:
+                            await self.notifier.error(text)
+                self._telegram_command_poller = TelegramCommandPoller(
+                    cfg=TelegramCommandPollerConfig(
+                        enabled=True,
+                        bot_token=tg_token,
+                        api_base=tg_api_base,
+                        allowed_chat_ids=set(
+                            self.cfg.telegram_commands_allowed_chat_ids,
+                        ),
+                        allow_write_commands=(
+                            self.cfg.telegram_commands_allow_write
+                        ),
+                    ),
+                    handlers=handlers,
+                    reply_sender=_reply_sender,
+                )
+                tg_poller = self._telegram_command_poller
+
+                async def telegram_command_worker() -> None:
+                    try:
+                        await tg_poller.run(self._stop_event)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.exception(
+                            "telegram_command_worker failed: %s", e,
+                        )
+
+                self._tasks.append(asyncio.create_task(
+                    telegram_command_worker(),
+                    name="telegram_command_worker",
+                ))
+
         await self._stop_event.wait()
         await self._shutdown()
+
+    # ---------------------- Telegram command handlers ---------------------- #
+
+    def _build_telegram_command_handlers(
+        self, account: AccountState,
+    ) -> CommandHandlers:
+        """Bind per-instance command handlers to ``account`` / ``self``.
+
+        Read commands (``/status`` / ``/equity`` / ``/positions`` /
+        ``/pnl`` / ``/help``) work whenever the chat is whitelisted.
+        Write commands (``/halt`` / ``/resume``) additionally require
+        ``cfg.telegram_commands_allow_write`` and never bypass the
+        chat-id check.
+        """
+
+        async def status(cmd: str, args: list[str], chat_id: int) -> str:
+            h = self.state
+            return (
+                "STATUS\n"
+                f"  fuser_alive: {h.fuser_alive}\n"
+                f"  screener_alive: {h.screener_alive}\n"
+                f"  reconciliation_complete: "
+                f"{h.reconciliation_complete}\n"
+                f"  rule_event_count: {h.rule_event_count}\n"
+                f"  high_priority_count: {h.high_priority_count}\n"
+                f"  orders_placed: {h.orders_placed}\n"
+                f"  orders_rejected: {h.orders_rejected}\n"
+                f"  open_positions: {h.open_positions}\n"
+                f"  global_halt: {account.global_trading_halted} "
+                f"({account.halt_reason or '-'})\n"
+                f"  last_error: {h.last_error or '-'}"
+            )
+
+        async def equity(cmd: str, args: list[str], chat_id: int) -> str:
+            return (
+                "EQUITY\n"
+                f"  current: {account.equity_usdt:.2f} USDT\n"
+                f"  starting today: "
+                f"{account.starting_equity_today_usdt:.2f}\n"
+                f"  realized PnL today: "
+                f"{account.realized_pnl_today_usdt:+.2f}\n"
+                f"  daily drawdown: "
+                f"{account.daily_drawdown_pct * 100:.2f}%\n"
+                f"  daily stoploss hits: {account.daily_stoploss_hits}"
+            )
+
+        async def positions(cmd: str, args: list[str], chat_id: int) -> str:
+            if not account.open_positions:
+                return "POSITIONS: none"
+            rows = ["POSITIONS"]
+            for p in account.open_positions.values():
+                rows.append(
+                    f"  {p.symbol} {p.side.value} size={p.size} "
+                    f"entry={p.entry_price} stop={p.current_stop} "
+                    f"lev={p.leverage}x"
+                )
+            return "\n".join(rows)
+
+        async def pnl(cmd: str, args: list[str], chat_id: int) -> str:
+            curve = list(self.dashboard.equity_curve)
+            if len(curve) < 2:
+                return "PNL: insufficient data (need at least 2 snapshots)"
+            first, last = curve[0], curve[-1]
+            delta = last["equity_usdt"] - first["equity_usdt"]
+            pct = (delta / first["equity_usdt"] * 100.0
+                   if first["equity_usdt"] > 0 else 0.0)
+            mins = (last["ts"] - first["ts"]) / 60.0
+            return (
+                "PNL (since first snapshot)\n"
+                f"  start: {first['equity_usdt']:.2f}  "
+                f"now: {last['equity_usdt']:.2f}\n"
+                f"  delta: {delta:+.2f} USDT ({pct:+.2f}%)\n"
+                f"  span: {mins:.1f} minutes, "
+                f"{len(curve)} snapshots"
+            )
+
+        async def halt_cmd(cmd: str, args: list[str], chat_id: int) -> str:
+            reason = " ".join(args) or f"telegram-halt by chat {chat_id}"
+            if account.global_trading_halted:
+                return f"already halted: {account.halt_reason or '-'}"
+            account.halt(f"manual:{reason}")
+            return f"HALTED: {reason}"
+
+        async def resume_cmd(cmd: str, args: list[str], chat_id: int) -> str:
+            if not account.global_trading_halted:
+                return "not halted; nothing to resume"
+            account.global_trading_halted = False
+            account.halt_reason = None
+            return "RESUMED"
+
+        async def help_cmd(cmd: str, args: list[str], chat_id: int) -> str:
+            return (
+                "/status     — daemon health + counters\n"
+                "/equity     — current equity / daily PnL / drawdown\n"
+                "/positions  — list open positions\n"
+                "/pnl        — equity-curve snapshot\n"
+                "/halt [reason]   — halt new entries (write-gated)\n"
+                "/resume     — clear manual halt (write-gated)\n"
+                "/help       — this help"
+            )
+
+        return CommandHandlers(
+            status=status, equity=equity, positions=positions, pnl=pnl,
+            halt=halt_cmd, resume=resume_cmd, help=help_cmd,
+        )
 
     async def _safe_notify_signal(self, payload: dict[str, Any]) -> None:
         """Telegram-notify the high-priority signal without raising.
@@ -3425,6 +3788,10 @@ class App:
         }
         with suppress(Exception):
             self.dashboard.push_close(closed_payload)
+        # Operational patch: snapshot equity right after a fill so
+        # the dashboard's PnL chart shows the discrete step.
+        with suppress(Exception):
+            self.dashboard.record_equity_snapshot()
         if self.notifier is not None:
             with suppress(Exception):
                 await self.notifier.closed(closed_payload)

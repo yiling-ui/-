@@ -2,8 +2,20 @@
 # Override via the same keys in your own config file (mounted into the
 # container at /app/config/app.yaml).
 
+# Exchange selection.
+# ``main.py._build_live_adapter`` uses the first entry of this list as
+# the live trading venue. The two primary venues (binance, gate) are
+# explicitly tested for ccxt quirks. Reserved venues (okx, bybit,
+# bitget, kucoin, mexc, bingx) work but log a one-line note at boot.
+# Operators who want fail-over to a second venue should treat the
+# extra entries as documentation only — V1.0 trades on a single venue
+# at a time.
 exchanges:
   - binance
+  # - gateio        # <- swap to: trade on Gate.io USDT futures
+  # - okx           # <- reserved-but-tested
+  # - bybit         # <- reserved-but-tested
+  # - bitget        # <- reserved-but-tested
 
 # ccxt unified-symbol form for USDT-margined perpetual swaps.
 symbols:
@@ -45,3 +57,36 @@ post_mortem_delay_sec: 3600
 # Path to the learned-rules JSON. When unset, follows the DYNAMIC_RULES_JSON
 # env var, then falls back to <repo>/.kiro/steering/dynamic_rules.json.
 # dynamic_rules_path: /app/.kiro/steering/dynamic_rules.json
+
+
+# ----- Operational patches (large-account / withdrawals / TG control) -----
+
+# Depth-aware notional cap (闸门 #10b in gate.py). When set, a single
+# order's notional cannot exceed N% of the live top-5 orderbook depth.
+# Highly recommended at 0.10 once the account passes ~5,000 USDT —
+# below that the leverage cap dominates anyway. Default 0.0 = off.
+max_notional_vs_depth_pct: 0.10
+
+# WithdrawalDetector — reconciles AccountState.equity_usdt to venue
+# truth on a poll cycle. Off by default in V1.0; flip on after
+# verifying the adapter's fetch_total_usdt_balance matches your
+# venue's "wallet balance + unrealised pnl". The startup grace
+# avoids a false "deposit" event during reconciliation.
+withdrawal_detector_enabled: false
+withdrawal_poll_sec: 300.0
+withdrawal_min_significant_delta_usdt: 100.0
+withdrawal_startup_grace_sec: 30.0
+
+# Equity snapshot cadence (dashboard PnL chart).
+equity_snapshot_interval_sec: 60.0
+
+# Telegram two-way command poller. Off by default. Read commands
+# (/status /equity /positions /pnl /help) work when the chat is
+# whitelisted. Write commands (/halt /resume) additionally require
+# telegram_commands_allow_write=true.
+#   TG_BOT_TOKEN env var: the same bot token used by the notifier.
+#   allowed_chat_ids: list of integer chat IDs that may issue
+#                     commands. Anything else is silently dropped.
+telegram_commands_enabled: false
+telegram_commands_allow_write: false
+telegram_commands_allowed_chat_ids: []
