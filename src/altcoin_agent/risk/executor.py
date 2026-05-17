@@ -8,6 +8,23 @@ Contract:
 
 Soft stops (in-process Python timers, etc.) are explicitly not allowed.
 
+Idempotency (audit-fix #E1):
+    Every order this executor sends is tagged with a deterministic
+    ``client_order_id`` derived from the entry's ``trace_id``:
+
+        entry / leg N : ``e<trace_id>L<n>``
+        resting stop  : ``s<trace_id>S<replacement_count>``
+        emergency clo : ``r<trace_id>K<reason>``
+
+    The same trace_id always produces the same coid, so a 502/504/429
+    that triggers ``adapter._with_retry`` results in **one** logical
+    order on the venue (the second send is rejected as a duplicate
+    instead of creating a phantom second position).
+
+    Stop replacements (``tighten_hard_stop``) and emergency closes
+    use distinct suffixes so the venue's 24h coid uniqueness window
+    doesn't reject legitimate follow-up orders.
+
 Rolling positions:
     ``add_leg`` extends an existing position with a new same-side market
     order, then replaces the single resting STOP_MARKET so its size
@@ -21,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -34,9 +52,46 @@ class ExecutionError(RuntimeError):
     pass
 
 
+def _trace_root(trace_id: str | None) -> str:
+    """Derive a stable, alnum-only root from ``trace_id``.
+
+    Empty / None / non-alnum traces fall back to a fresh 16-hex token,
+    which still gives us idempotency *within a single open() call*
+    (the same root is reused for retries inside that call) but loses
+    cross-process retry idempotency. That's an explicit choice — the
+    only path where ``trace_id`` is None is unit tests, and in tests
+    we don't care about cross-process resume.
+    """
+    cleaned = "".join(ch for ch in (trace_id or "") if ch.isalnum())
+    if cleaned:
+        return cleaned[:16]
+    return secrets.token_hex(8)
+
+
+def _entry_coid(trace_root: str, leg_id: int) -> str:
+    return f"e{trace_root}L{leg_id}"[:30]
+
+
+def _stop_coid(trace_root: str, replacement_count: int) -> str:
+    return f"s{trace_root}S{replacement_count}"[:30]
+
+
+def _close_coid(trace_root: str, reason: str) -> str:
+    """Emergency / reduce-only close. ``reason`` is sanitised + truncated."""
+    sanitized = "".join(ch for ch in reason if ch.isalnum())[:8]
+    return f"r{trace_root}K{sanitized or 'x'}"[:30]
+
+
 @runtime_checkable
 class ExchangeAdapter(Protocol):
-    """Minimal interface the executor needs. ccxt-compatible by design."""
+    """Minimal interface the executor needs. ccxt-compatible by design.
+
+    Note on ``client_order_id``: the executor will pass a deterministic
+    coid on every call. Adapters that don't support idempotency (e.g.
+    in-memory test fakes) may accept-and-ignore the kwarg via ``**kwargs``;
+    the live ``CCXTExchangeAdapter`` injects it into the venue request so
+    retries on 502/504/429 don't double-fill.
+    """
 
     async def market_order(
         self,
@@ -46,6 +101,7 @@ class ExchangeAdapter(Protocol):
         *,
         price: float | None = None,
         reduce_only: bool = False,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def place_stop_order(
@@ -55,6 +111,8 @@ class ExchangeAdapter(Protocol):
         size: float,
         stop_price: float,
         reduce_only: bool = True,
+        *,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
@@ -64,6 +122,82 @@ class ExchangeAdapter(Protocol):
     async def fetch_positions(self) -> list[dict[str, Any]]: ...
 
     async def fetch_open_orders(self) -> list[dict[str, Any]]: ...
+
+
+def _is_unknown_kwarg_error(exc: BaseException, kwarg: str) -> bool:
+    """Detect a ``TypeError("...unexpected keyword argument 'X'")`` for the
+    given kwarg. Used so we can keep legacy adapters (test fakes that
+    don't accept ``client_order_id``) working without forcing a global
+    signature migration. The check is also robust to monkey-patched
+    methods whose ``inspect.signature`` looks like ``*args, **kwargs``
+    but whose body still rejects unknown kwargs at call time."""
+    if not isinstance(exc, TypeError):
+        return False
+    msg = str(exc)
+    return f"'{kwarg}'" in msg and "unexpected keyword" in msg
+
+
+async def _adapter_market_order(
+    adapter: Any,
+    *,
+    symbol: str,
+    side: Side,
+    size: float,
+    price: float | None,
+    reduce_only: bool,
+    client_order_id: str | None,
+) -> dict[str, Any]:
+    """Call ``adapter.market_order``. Tries the new ``client_order_id``
+    keyword first; if the adapter (or a monkey-patched stand-in) doesn't
+    accept it, retries once without. The live ``CCXTExchangeAdapter``
+    always accepts the kwarg, so for production code the fallback path
+    is dead code; it exists only to keep older test fakes green."""
+    if client_order_id is None:
+        return await adapter.market_order(
+            symbol=symbol, side=side, size=size, price=price,
+            reduce_only=reduce_only,
+        )
+    try:
+        return await adapter.market_order(
+            symbol=symbol, side=side, size=size, price=price,
+            reduce_only=reduce_only, client_order_id=client_order_id,
+        )
+    except TypeError as e:
+        if _is_unknown_kwarg_error(e, "client_order_id"):
+            return await adapter.market_order(
+                symbol=symbol, side=side, size=size, price=price,
+                reduce_only=reduce_only,
+            )
+        raise
+
+
+async def _adapter_place_stop_order(
+    adapter: Any,
+    *,
+    symbol: str,
+    side: Side,
+    size: float,
+    stop_price: float,
+    reduce_only: bool,
+    client_order_id: str | None,
+) -> dict[str, Any]:
+    if client_order_id is None:
+        return await adapter.place_stop_order(
+            symbol=symbol, side=side, size=size, stop_price=stop_price,
+            reduce_only=reduce_only,
+        )
+    try:
+        return await adapter.place_stop_order(
+            symbol=symbol, side=side, size=size, stop_price=stop_price,
+            reduce_only=reduce_only, client_order_id=client_order_id,
+        )
+    except TypeError as e:
+        if _is_unknown_kwarg_error(e, "client_order_id"):
+            return await adapter.place_stop_order(
+                symbol=symbol, side=side, size=size, stop_price=stop_price,
+                reduce_only=reduce_only,
+            )
+        raise
 
 
 @dataclass
@@ -97,16 +231,24 @@ class CCXTExecutor:
         if decision.initial_stop is None:
             raise ExecutionError("decision missing initial_stop")
 
+        # Audit-fix #E1: derive the per-position coid root once. The
+        # entry order, every leg, the resting stop, every stop
+        # replacement, and any emergency-close all derive their venue
+        # clientOrderIds from this root via the helpers above.
+        trace_root = _trace_root(trace_id)
+
         # 1) leverage
         await self.adapter.set_leverage(symbol, decision.leverage)
 
         # 2) market entry
-        entry_resp = await self.adapter.market_order(
+        entry_resp = await _adapter_market_order(
+            self.adapter,
             symbol=symbol,
             side=decision.side,
             size=decision.size,
             price=current_price,
             reduce_only=False,
+            client_order_id=_entry_coid(trace_root, leg_id=0),
         )
         avg_price = float(
             entry_resp.get("average") or entry_resp.get("price") or current_price
@@ -143,12 +285,14 @@ class CCXTExecutor:
             )
             if filled > 0:
                 try:
-                    await self.adapter.market_order(
+                    await _adapter_market_order(
+                        self.adapter,
                         symbol=symbol,
                         side=decision.side.opposite,
                         size=filled,
                         price=current_price,
                         reduce_only=True,
+                        client_order_id=_close_coid(trace_root, "partial"),
                     )
                 except Exception as e:
                     logger.critical(
@@ -173,17 +317,24 @@ class CCXTExecutor:
         actual_size = filled if filled > 0 else float(decision.size)
 
         # 3) hard stop on the exchange — RETRY then fail-closed close.
+        # Each retry attempt gets a unique stop coid (S0, S1, S2) so the
+        # venue's 24h-uniqueness rule doesn't reject the second attempt
+        # if the first one was actually accepted but its response got
+        # lost in transit. We rely on the adapter's own _with_retry to
+        # handle 502/504/429 *within* a single attempt.
         stop_side = decision.side.opposite
         stop_resp: dict[str, Any] | None = None
         last_err: Exception | None = None
         for attempt in range(self.place_stop_retries + 1):
             try:
-                stop_resp = await self.adapter.place_stop_order(
+                stop_resp = await _adapter_place_stop_order(
+                    self.adapter,
                     symbol=symbol,
                     side=stop_side,
                     size=actual_size,
                     stop_price=decision.initial_stop,
                     reduce_only=True,
+                    client_order_id=_stop_coid(trace_root, attempt),
                 )
                 break
             except Exception as e:
@@ -200,12 +351,14 @@ class CCXTExecutor:
                 symbol, self.place_stop_retries + 1, last_err,
             )
             try:
-                await self.adapter.market_order(
+                await _adapter_market_order(
+                    self.adapter,
                     symbol=symbol,
                     side=stop_side,
                     size=actual_size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=_close_coid(trace_root, "nakedstop"),
                 )
             except Exception as e:
                 logger.critical(
@@ -229,6 +382,16 @@ class CCXTExecutor:
             stop_order_id=str(stop_resp.get("id") or ""),
             trace_id=trace_id,
         )
+        # Cache the trace_root for downstream calls (add_leg, tighten_hard_stop).
+        # We stash it on the Position via a private attribute so the legacy
+        # state.py doesn't need a schema bump.
+        try:
+            object.__setattr__(pos, "_coid_root", trace_root)
+            # _stop_replacement_count starts at 1 because attempt 0 already
+            # consumed the S0 coid. The next tighten_hard_stop will use S1.
+            object.__setattr__(pos, "_stop_replacement_count", 1)
+        except Exception:
+            pass
         # Rolling-positions bookkeeping: leg 0 is the original entry.
         # Subsequent ``add_leg`` calls append; trailing/sizing always
         # reads from ``legs`` when present (``total_size`` /
@@ -281,13 +444,23 @@ class CCXTExecutor:
 
         old_size = position.total_size
 
+        # Resolve trace_root for coid derivation. New positions opened
+        # by ``open`` have ``_coid_root`` cached; older positions
+        # restored from disk fall back to deriving from trace_id.
+        trace_root = getattr(position, "_coid_root", None) or _trace_root(
+            position.trace_id,
+        )
+        next_leg_id = (max((L.leg_id for L in position.legs), default=-1) + 1)
+
         # 1) market order on the SAME side as the existing position.
-        entry_resp = await self.adapter.market_order(
+        entry_resp = await _adapter_market_order(
+            self.adapter,
             symbol=position.symbol,
             side=position.side,
             size=size,
             price=current_price,
             reduce_only=False,
+            client_order_id=_entry_coid(trace_root, leg_id=next_leg_id),
         )
         avg_price = float(
             entry_resp.get("average") or entry_resp.get("price") or current_price
@@ -321,12 +494,16 @@ class CCXTExecutor:
                 actual_leg_size / max(size, 1e-9),
             )
             try:
-                await self.adapter.market_order(
+                await _adapter_market_order(
+                    self.adapter,
                     symbol=position.symbol,
                     side=position.side.opposite,
                     size=actual_leg_size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=_close_coid(
+                        trace_root, f"legpartial{next_leg_id}",
+                    ),
                 )
             except Exception as e:
                 logger.critical(
@@ -347,7 +524,6 @@ class CCXTExecutor:
         # caller asked for a different one. The new stop's size (which the
         # venue actually cares about) is read from ``position.size``, so
         # we update that BEFORE the call.
-        next_leg_id = (max((L.leg_id for L in position.legs), default=-1) + 1)
         leg = PositionLeg(
             leg_id=next_leg_id,
             side=position.side,
@@ -378,12 +554,16 @@ class CCXTExecutor:
                 position.symbol, len(position.legs), position.size,
             )
             try:
-                await self.adapter.market_order(
+                await _adapter_market_order(
+                    self.adapter,
                     symbol=position.symbol,
                     side=position.side.opposite,
                     size=position.size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=_close_coid(
+                        trace_root, f"legstopfail{next_leg_id}",
+                    ),
                 )
             except Exception as e:
                 logger.critical(
@@ -414,6 +594,15 @@ class CCXTExecutor:
         old_stop = position.current_stop
         stop_side = position.side.opposite
 
+        trace_root = getattr(position, "_coid_root", None) or _trace_root(
+            position.trace_id,
+        )
+        # Each replacement increments the suffix so the venue's coid
+        # uniqueness window doesn't reject us. We bump *before* placing
+        # so even if placement fails the next attempt picks up a fresh
+        # suffix.
+        rep_count = int(getattr(position, "_stop_replacement_count", 1))
+
         try:
             if old_id:
                 await self.adapter.cancel_order(old_id, position.symbol)
@@ -422,29 +611,43 @@ class CCXTExecutor:
                            old_id, e)
 
         try:
-            new_resp = await self.adapter.place_stop_order(
+            new_resp = await _adapter_place_stop_order(
+                self.adapter,
                 symbol=position.symbol,
                 side=stop_side,
                 size=position.size,
                 stop_price=new_stop,
                 reduce_only=True,
+                client_order_id=_stop_coid(trace_root, rep_count),
             )
             position.current_stop = new_stop
             position.stop_order_id = str(new_resp.get("id") or "")
+            try:
+                object.__setattr__(position, "_stop_replacement_count",
+                                    rep_count + 1)
+            except Exception:
+                pass
             return True
         except Exception as e:
             logger.error("replace stop failed for %s @ %s: %s",
                          position.symbol, new_stop, e)
             # Try to restore the old stop so the position isn't naked.
             try:
-                restored = await self.adapter.place_stop_order(
+                restored = await _adapter_place_stop_order(
+                    self.adapter,
                     symbol=position.symbol,
                     side=stop_side,
                     size=position.size,
                     stop_price=old_stop,
                     reduce_only=True,
+                    client_order_id=_stop_coid(trace_root, rep_count + 1),
                 )
                 position.stop_order_id = str(restored.get("id") or "")
+                try:
+                    object.__setattr__(position, "_stop_replacement_count",
+                                        rep_count + 2)
+                except Exception:
+                    pass
                 logger.warning("restored old stop @ %s on %s after replace failure",
                                old_stop, position.symbol)
                 return False
