@@ -250,6 +250,13 @@ class LLMEngine:
     timeout: float = 8.0
     max_retries: int = 1
     budget: TokenBudget = field(default_factory=TokenBudget)
+    # TICKET-011 / 016: counter the dashboard exposes as
+    # ``llm_degraded_count``. Bumped every time ``judge`` returns the
+    # synthetic neutral verdict (parse error, HTTP error, budget
+    # exhaustion, outer timeout). Operators key alerts off this so a
+    # spike — e.g. provider 5xx outage — surfaces inside one minute
+    # instead of inside the next training cycle.
+    degraded_count: int = 0
 
     def __post_init__(self) -> None:
         if self.provider is None:
@@ -274,6 +281,80 @@ class LLMEngine:
         await self.aclose()
 
     async def judge(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        funding_rate: float | None,
+        funding_deviation_z: float | None,
+        smc: SMCContext,
+        posts: list[SocialPost],
+        extra: dict[str, Any] | None = None,
+    ) -> AIVerdict:
+        """Run one LLM consultation and return a strict ``AIVerdict``.
+
+        TICKET-011: belt-and-braces ``asyncio.wait_for`` wrapper.
+
+        We already pass ``timeout`` through to ``provider.chat_json``,
+        which ultimately calls httpx with an explicit per-request
+        timeout. In practice this is enough for happy-path failures,
+        but two known edge cases let httpx's timer SLIP:
+
+          * a TLS renegotiation in the middle of the response body —
+            httpx waits on the socket without re-arming its
+            read-timeout;
+          * an IPv6 dual-stack connect-stall on a host where the
+            first family routes but never replies, with the second
+            family never tried because the first is in
+            ``connecting``.
+
+        Both manifest as judge() awaiting forever. The trading hot
+        path doesn't await judge() (it runs on a separate ``llm_q``
+        worker), so this never deadlocks the trader, but it would
+        gum up the LLM consult queue and silently hold an
+        ``llm_consults_skipped`` -> ``llm_consults`` stat at zero
+        for the rest of the day.
+
+        We wrap the whole call in ``asyncio.wait_for(..., timeout +
+        2)`` so the deadline is enforced even when httpx misses it.
+        On expiration we return the same neutral degraded
+        ``AIVerdict`` shape every other failure path returns —
+        downstream (``ScoreFuser`` / fuser KOL veto / post-mortem)
+        sees a uniform contract. ``timeout=0`` disables the outer
+        wrapper for callers that want raw provider semantics.
+        """
+        outer = self.timeout + 2.0 if self.timeout > 0 else 0.0
+        if outer <= 0:
+            return await self._judge_inner(
+                symbol=symbol, exchange=exchange,
+                funding_rate=funding_rate,
+                funding_deviation_z=funding_deviation_z,
+                smc=smc, posts=posts, extra=extra,
+            )
+        try:
+            return await asyncio.wait_for(
+                self._judge_inner(
+                    symbol=symbol, exchange=exchange,
+                    funding_rate=funding_rate,
+                    funding_deviation_z=funding_deviation_z,
+                    smc=smc, posts=posts, extra=extra,
+                ),
+                timeout=outer,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "LLM judge outer timeout (%.1fs) — provider stalled past "
+                "its own deadline; returning degraded neutral verdict",
+                outer,
+            )
+            self.degraded_count += 1
+            return AIVerdict(
+                intent="neutral", confidence_score=0,
+                reason=f"degraded: outer_timeout:{outer:.1f}s",
+                kol_intent="neutral", key_evidence=[],
+            )
+
+    async def _judge_inner(
         self,
         *,
         symbol: str,
@@ -350,6 +431,7 @@ class LLMEngine:
 
         logger.error("LLM inference failed after %s attempts: %s",
                      self.max_retries + 1, last_err)
+        self.degraded_count += 1
         return AIVerdict(
             intent="neutral", confidence_score=0,
             reason=f"degraded: {last_err}",

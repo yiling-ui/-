@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -78,11 +80,22 @@ class PositionWatcher:
     adapter: ExchangeAdapter
     account: AccountState
     on_close: CloseCallback
-    poll_interval_sec: float = 5.0
+    poll_interval_sec: float = 1.5
     miss_threshold: int = 2
     _miss_counts: dict[str, int] = field(default_factory=dict)
     # TICKET-004: short-lived hints from the executor.
     close_reason_hints: dict[str, str] = field(default_factory=dict)
+    # TICKET-008: most-recent successful poll wall-clock seconds.
+    # Dashboard / metrics consume this to expose
+    # ``position_watcher_lag_sec`` so a stuck poll loop is visible
+    # before it materialises as a phantom-position incident.
+    last_poll_wall_ts: float = 0.0
+    # TICKET-008: an event the executor (or any other actor that just
+    # closed a position) can set() to wake the watcher RIGHT NOW
+    # instead of waiting up to ``poll_interval_sec``. Wake events are
+    # cheap (one poll) so we just fire it whenever a reduce_only close
+    # is issued.
+    wake_event: asyncio.Event | None = None
 
     def hint_close_reason(self, symbol: str, reason: str) -> None:
         """Tell the watcher how to label the *next* close on ``symbol``.
@@ -93,13 +106,41 @@ class PositionWatcher:
         invoke ``on_close`` with the hinted reason. Calling this twice
         before the close fires keeps the most recent hint (operator
         intent: "the latest reason is the one that matters").
+
+        TICKET-008: as a side effect this also fires ``wake_event``
+        when one is wired, so the close handler runs on the very next
+        loop tick instead of waiting up to ``poll_interval_sec``. The
+        executor calls ``hint_close_reason`` from every reduce_only
+        close path (partial-fill cleanup, stop-replacement failure,
+        naked-position close, etc.), which is exactly the set of
+        events that benefits from instant detection.
         """
         if not symbol or not reason:
             return
         self.close_reason_hints[symbol] = reason
+        if self.wake_event is not None:
+            with suppress(Exception):
+                self.wake_event.set()
+
+    def kick(self) -> None:
+        """TICKET-008: external "poll right now" signal.
+
+        Called by any actor that has just changed the venue-side
+        position state and wants the watcher's bookkeeping to catch
+        up before the next poll-interval tick. Idempotent — multiple
+        calls in a single window collapse into one extra poll.
+        """
+        if self.wake_event is not None:
+            with suppress(Exception):
+                self.wake_event.set()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Main loop. Returns when ``stop_event`` is set."""
+        if self.wake_event is None:
+            # Lazy-create so callers that build the watcher in a
+            # non-running-loop context (typical pytest fixtures) don't
+            # eagerly bind a loop they aren't on yet.
+            self.wake_event = asyncio.Event()
         logger.info(
             "PositionWatcher running (poll=%.1fs, miss_threshold=%d)",
             self.poll_interval_sec, self.miss_threshold,
@@ -111,13 +152,26 @@ class PositionWatcher:
                 raise
             except Exception as e:
                 logger.exception("PositionWatcher poll_once failed: %s", e)
+            # Sleep with two early-exit conditions: stop, or an
+            # external ``wake_event.set()`` from
+            # :meth:`hint_close_reason` / :meth:`kick`. The wake event
+            # is cleared on each consumption so subsequent ticks don't
+            # spin.
+            self.wake_event.clear()
+            stop_task = asyncio.ensure_future(stop_event.wait())
+            wake_task = asyncio.ensure_future(self.wake_event.wait())
             try:
-                await asyncio.wait_for(
-                    stop_event.wait(),
+                done, _pending = await asyncio.wait(
+                    {stop_task, wake_task},
                     timeout=self.poll_interval_sec,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            except asyncio.TimeoutError:
-                pass
+            finally:
+                for t in (stop_task, wake_task):
+                    if not t.done():
+                        t.cancel()
+                        with suppress(BaseException):
+                            await t
 
     async def poll_once(self) -> list[Position]:
         """One poll cycle. Returns the list of positions we just closed.
@@ -139,6 +193,12 @@ class PositionWatcher:
             # because the exchange API is flaky).
             logger.warning("fetch_positions failed; skipping poll: %s", e)
             return []
+
+        # TICKET-008: stamp the lag clock ONLY on a successful poll.
+        # A run of failed fetches will leave ``last_poll_wall_ts`` at
+        # the timestamp of the last good poll, which is exactly what
+        # the dashboard wants to alert on.
+        self.last_poll_wall_ts = time.time()
 
         live_sizes = self._index_snapshot(snapshot)
 

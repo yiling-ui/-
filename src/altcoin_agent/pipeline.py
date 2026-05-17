@@ -404,6 +404,7 @@ class DelayedPostMortemScheduler:
         realized_pnl_usdt: float,
         realized_r: float,
         close_reason: str,
+        leverage: float | None = None,
     ) -> asyncio.Task:
         """Audit-fix Req #4: file a real post-mortem off a real close.
 
@@ -414,6 +415,21 @@ class DelayedPostMortemScheduler:
         synthetic OKX-slice computation and attributes hits/misses to
         what we actually realised on the venue.
 
+        TICKET-010: ``magnitude_pct`` must reflect realised R (the
+        leverage-amplified PnL), not the raw price move. ``bucket_pct``
+        keys on absolute fractional move; without scaling by leverage,
+        a 5x position that gained +1.5% on price (= +7.5% on equity ≈
+        +1.5R for the typical 1% stop) was being bucketed as
+        ``pos_small`` alongside an unleveraged 1.5% blip — so the rule
+        store learnt that "small price moves predict pumps" instead of
+        "this feature predicts a meaningful R-multiple gain". When the
+        caller provides ``leverage``, we multiply the per-leg price
+        delta by it so the magnitude-bucket reflects what the trade
+        ACTUALLY realised on the equity curve. ``leverage=None`` keeps
+        the legacy unscaled behaviour for callers that haven't been
+        updated. Capped at 1.0 (= +/- 100% / 1R) so a runaway leverage
+        figure can't push the magnitude into pathological buckets.
+
         Returns an asyncio.Task so callers can ``await`` it in tests.
         Failures are logged and swallowed.
         """
@@ -423,9 +439,21 @@ class DelayedPostMortemScheduler:
         # match the existing EventResult contract (fractional move).
         if entry_price > 0:
             if expected_direction == "pump":
-                magnitude_pct = (fill_price - entry_price) / entry_price
+                raw_pct = (fill_price - entry_price) / entry_price
             else:
-                magnitude_pct = (entry_price - fill_price) / entry_price
+                raw_pct = (entry_price - fill_price) / entry_price
+            # TICKET-010: leverage-aware magnitude.
+            if leverage is not None and leverage > 0:
+                magnitude_pct = raw_pct * float(leverage)
+                # Clamp to [-1.0, 1.0] so a freak leverage value
+                # cannot drive the bucket past ``pos_xlarge`` /
+                # ``neg_xlarge``.
+                if magnitude_pct > 1.0:
+                    magnitude_pct = 1.0
+                elif magnitude_pct < -1.0:
+                    magnitude_pct = -1.0
+            else:
+                magnitude_pct = raw_pct
         else:
             magnitude_pct = 0.0
         minutes_held = max(0, (close_ts_ms - entry_ts_ms) // 60_000)

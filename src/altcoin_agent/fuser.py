@@ -28,6 +28,37 @@ Hard rules (committed with the architect):
         * Reward path:  reward_mult = max(llm_boost, learned_reward),
                         capped at ``learned_overall_reward_cap`` (default 1.30)
         * Penalty path: penalties stack multiplicatively
+
+LLM verdict timing (TICKET-014)
+-------------------------------
+The LLM verdict is **advisory and may arrive AFTER the order has been
+placed**. The Risk Gate's high-priority threshold is reached on the rule
+score alone (``rule_score >= high_priority_threshold`` is the only gate
+that promotes to ``is_high_priority``); when that bar is met the
+``FusedSignal`` is dispatched and the executor places the order on the
+NEXT loop tick. Subsequent LLM verdicts on the SAME symbol-window do not
+flip a placed order — they only influence:
+
+  * the next ``high_priority`` cooldown decision on the same symbol
+    (``llm_score`` modulates ``final_score`` for future signals);
+  * the post-mortem learning loop (the verdict's KOL intent is
+    persisted via the historical KOL store on close).
+
+This is a deliberate latency tradeoff: typical altcoin pump bursts
+move 5%+ inside 500ms, faster than any realistic LLM RTT. Waiting for
+the LLM would forfeit every winning entry. The cost is that an LLM
+that strongly disagreed with the rule signal AFTER the order landed
+cannot retract the trade — but the trailing FSM and exchange-side
+STOP_MARKET still cap the worst case, and the post-mortem loop
+penalises the offending feature combination going forward so the
+NEXT signal sees a damped score.
+
+If you ever need rules + LLM-must-agree before placing the order,
+build a separate ``StrictFuser`` subclass that delays dispatch on
+``rule_direction != Direction.NEUTRAL`` until the LLM has been
+consulted; do NOT reach into this class to flip the existing
+contract — it is depended on by the trailing controller, the
+rolling controller, the audit log, and the post-mortem.
 """
 
 from __future__ import annotations
