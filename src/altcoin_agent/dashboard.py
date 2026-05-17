@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,22 @@ class DashboardState:
     recent_closes: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=50),
     )
+    # Operational patch — equity timeline for the dashboard PnL chart.
+    # Captured by ``record_equity_snapshot`` from ``main.py`` on a
+    # cadence that matches ``persistor.save`` (every state mutation).
+    # Holding 1,440 points at ~1/min cadence covers a full UTC trading
+    # day; older entries roll out FIFO. Each point is
+    # ``{"ts": float_seconds, "equity_usdt": float, "realized_pnl_today_usdt": float,
+    #   "open_positions": int}``.
+    equity_curve: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=1_440),
+    )
+    # External-flow events captured by the WithdrawalDetector. Operators
+    # use this to confirm a manual deposit/withdrawal was correctly
+    # recognised by the daemon (mirrors what shows up on Telegram).
+    recent_external_flows: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=20),
+    )
 
     def push_signal(self, payload: dict[str, Any]) -> None:
         self.recent_signals.append(payload)
@@ -60,6 +77,33 @@ class DashboardState:
 
     def push_close(self, payload: dict[str, Any]) -> None:
         self.recent_closes.append(payload)
+
+    def record_equity_snapshot(self) -> None:
+        """Append a single point to the equity curve from the live
+        ``account`` reference. Cheap (no copy of dict, just floats).
+        Skipped when account is not yet wired or equity is zero
+        (boot-time degenerate state).
+        """
+        a = self.account
+        if a is None:
+            return
+        eq = float(getattr(a, "equity_usdt", 0.0) or 0.0)
+        if eq <= 0:
+            return
+        self.equity_curve.append({
+            "ts": time.time(),
+            "equity_usdt": eq,
+            "realized_pnl_today_usdt": float(
+                getattr(a, "realized_pnl_today_usdt", 0.0) or 0.0,
+            ),
+            "open_positions": len(
+                getattr(a, "open_positions", {}) or {},
+            ),
+        })
+
+    def push_external_flow(self, payload: dict[str, Any]) -> None:
+        """Record a deposit/withdrawal event for the dashboard."""
+        self.recent_external_flows.append(payload)
 
 
 # --------------------------------------------------------------------- #
@@ -118,6 +162,14 @@ _HTML = """<!doctype html>
     <table id="orders"><thead><tr><th>Time</th><th>Sym</th><th>Side</th><th>Size</th><th>Type</th><th>Stop</th></tr></thead><tbody></tbody></table>
   </div>
   <div class="card" style="grid-column:1 / -1">
+    <h2>Equity / PnL Curve</h2>
+    <canvas id="pnlchart" height="180"></canvas>
+  </div>
+  <div class="card" style="grid-column:1 / -1">
+    <h2>External Flows (deposits / withdrawals, last 20)</h2>
+    <table id="flows"><thead><tr><th>Time</th><th>Kind</th><th>Delta (USDT)</th><th>Venue Balance</th><th>Notes</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card" style="grid-column:1 / -1">
     <h2>Dynamic Rules (top 20 by hit rate)</h2>
     <table id="rules"><thead><tr><th>Feature</th><th>Bucket</th><th>Side</th><th>Hits/Total</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
   </div>
@@ -130,13 +182,40 @@ _HTML = """<!doctype html>
     <table id="rejections"><thead><tr><th>Time</th><th>Sym</th><th>Reason</th></tr></thead><tbody></tbody></table>
   </div>
 </main>
-<footer>auto-refresh every 5s · /healthz · /api/state · /api/signals · /api/positions · /api/orders · /api/closes · /api/rules</footer>
+<footer>auto-refresh every 5s · /healthz · /api/state · /api/signals · /api/positions · /api/orders · /api/closes · /api/rules · /api/pnl-curve · /api/external-flows</footer>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
 function fmtTime(ms){if(!ms)return "-";const d=new Date(ms);return d.toISOString().slice(11,19)+"Z"}
 function row(parent,cells,cls){const tr=document.createElement("tr");for(const c of cells){const td=document.createElement("td");td.textContent=c==null?"-":String(c);if(cls&&c===cells[2])td.className=cls;tr.appendChild(td)}parent.appendChild(tr)}
+let pnlChart=null;
+function renderPnlChart(points){
+  const ctx=document.getElementById("pnlchart");
+  if(!ctx)return;
+  // Chart.js may fail to load if the operator runs the dashboard on
+  // an air-gapped host. The check below short-circuits silently so
+  // the rest of the dashboard keeps working.
+  if(typeof Chart==="undefined"){
+    ctx.parentNode.innerHTML='<h2>Equity / PnL Curve</h2><div style="color:#8b949e;font-size:12px;padding:6px">Chart.js unavailable (no internet on this host); raw data still available at <code>/api/pnl-curve</code>.</div>';
+    return;
+  }
+  const labels=points.map(p=>fmtTime(p.ts*1000));
+  const eq=points.map(p=>p.equity_usdt);
+  const rpnl=points.map(p=>p.realized_pnl_today_usdt);
+  const data={labels,datasets:[
+    {label:"Equity (USDT)",data:eq,borderColor:"#3fb950",backgroundColor:"rgba(63,185,80,0.1)",tension:0.2,yAxisID:"y",pointRadius:0,borderWidth:1.5},
+    {label:"Realised PnL today (USDT)",data:rpnl,borderColor:"#f9a826",backgroundColor:"rgba(249,168,38,0.05)",tension:0.2,yAxisID:"y2",pointRadius:0,borderWidth:1.2,borderDash:[3,3]},
+  ]};
+  const opts={responsive:true,animation:false,interaction:{mode:"index",intersect:false},
+    scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:12},grid:{color:"#21262d"}},
+            y:{position:"left",ticks:{color:"#3fb950"},grid:{color:"#21262d"},title:{display:true,text:"Equity",color:"#8b949e"}},
+            y2:{position:"right",ticks:{color:"#f9a826"},grid:{display:false},title:{display:true,text:"Daily PnL",color:"#8b949e"}}},
+    plugins:{legend:{labels:{color:"#c9d1d9"}}}};
+  if(pnlChart){pnlChart.data=data;pnlChart.update("none");}
+  else{pnlChart=new Chart(ctx,{type:"line",data:data,options:opts});}
+}
 async function refresh(){
   try{
-    const [s,sigs,pos,ords,rules,rejs,closes]=await Promise.all([
+    const [s,sigs,pos,ords,rules,rejs,closes,curve,flows]=await Promise.all([
       fetch("/api/state").then(r=>r.json()),
       fetch("/api/signals").then(r=>r.json()),
       fetch("/api/positions").then(r=>r.json()),
@@ -144,6 +223,8 @@ async function refresh(){
       fetch("/api/rules").then(r=>r.json()),
       fetch("/api/rejections").then(r=>r.json()),
       fetch("/api/closes").then(r=>r.json()),
+      fetch("/api/pnl-curve").then(r=>r.json()),
+      fetch("/api/external-flows").then(r=>r.json()),
     ]);
     const status=document.getElementById("status");
     status.textContent=s.status||"?";
@@ -188,6 +269,12 @@ async function refresh(){
     for(const x of closes.slice().reverse()){
       const cls=(x.realized_pnl_usdt!=null && x.realized_pnl_usdt>=0)?"long":"short";
       row(closesBody,[fmtTime(x.ts),x.symbol,x.side,x.size,x.entry_price,x.fill_price,x.realized_pnl_usdt,x.realized_r,x.reason],cls);
+    }
+    renderPnlChart(curve);
+    const flowsBody=document.querySelector("#flows tbody");flowsBody.innerHTML="";
+    for(const x of flows.slice().reverse()){
+      const cls=(x.delta_usdt||0)>=0?"long":"short";
+      row(flowsBody,[fmtTime((x.ts||0)*1000),x.kind||"",x.delta_usdt,x.venue_balance,x.notes||""],cls);
     }
   }catch(e){console.error(e);}
 }
@@ -280,6 +367,21 @@ def _build_routes(state: DashboardState, mode_label: str) -> list[web.RouteDef]:
             "total": len(annotated),
         })
 
+    async def api_pnl_curve(_req: web.Request) -> web.Response:
+        """Equity timeline for the dashboard PnL chart. Returns an
+        array of ``{ts, equity_usdt, realized_pnl_today_usdt,
+        open_positions}`` points sorted by ts. Operators use this to
+        eyeball the account trajectory over the past ~24h.
+        """
+        return web.json_response(list(state.equity_curve))
+
+    async def api_external_flows(_req: web.Request) -> web.Response:
+        """Recent operator deposits/withdrawals detected by the
+        WithdrawalDetector. Each entry looks like
+        ``{ts, kind, delta_usdt, venue_balance, ...}``.
+        """
+        return web.json_response(list(state.recent_external_flows))
+
     return [
         web.get("/dashboard", page),
         web.get("/api/state", api_state),
@@ -289,6 +391,8 @@ def _build_routes(state: DashboardState, mode_label: str) -> list[web.RouteDef]:
         web.get("/api/closes", api_closes),
         web.get("/api/positions", api_positions),
         web.get("/api/rules", api_rules),
+        web.get("/api/pnl-curve", api_pnl_curve),
+        web.get("/api/external-flows", api_external_flows),
     ]
 
 

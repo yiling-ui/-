@@ -19,3 +19,7 @@ reports/
 # Runtime artifacts written by the daemon (account snapshots, audit log)
 .kiro/state/
 logs/decisions*.jsonl
+
+
+# Local semantic-review reports (not part of the PR)
+semantic-review/

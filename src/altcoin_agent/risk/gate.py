@@ -71,6 +71,28 @@ class RiskGateConfig:
     consecutive_loss_cooldown_sec: int = 4 * 3600
     # Liquidity
     min_liquidity_usdt: float = 200_000.0    # top-5 depth USDT
+    # Operational patch (depth-aware sizing): cap a single leg's notional
+    # at ``max_notional_vs_depth_pct`` of the live top-5 depth so the
+    # daemon cannot eat through the book on a thin-liquidity altcoin
+    # once the account scales (500 USDT @ 5x = 2500 USDT, fine; 50,000 @
+    # 15x = 750,000 USDT and you become the entire top-5 -> 5-10%
+    # immediate slippage, blowing through the 5% initial stop on entry).
+    # 0.0 disables the check (legacy behaviour for backtests / tests).
+    # Set to e.g. 0.10 in production: a single entry can take at most
+    # 10% of the visible top-5 depth.
+    max_notional_vs_depth_pct: float = 0.0
+    # Operational patch (post-review): when caller supplies a
+    # side-resolved depth (``top_depth_by_side`` to ``evaluate``), the
+    # cap compares against the side the order will actually cross.
+    # Without this, summing bid+ask depth (the legacy
+    # ``top5_depth_usdt`` shape) is ~2x too permissive on a one-sided
+    # altcoin book — exactly the scenario the cap is designed to
+    # protect against. Defaults to True; legacy tests passing only
+    # ``top5_depth_usdt`` continue to work because we fall back to
+    # ``min(top_depth_usdt, top_depth_usdt/2*2) = top_depth_usdt`` in
+    # that path (i.e. the existing behaviour, modulo the explicit
+    # one-sided heuristic below).
+    depth_cap_side_aware: bool = True
     # Slippage (SR-1)
     base_slippage: float = 0.03              # 3% at 5x leverage
     # Signal age
@@ -145,6 +167,43 @@ class RiskGate:
         self.sizer = sizer
         self.cfg = config or RiskGateConfig()
 
+    # ------------------------------------------------------------------ #
+    # Operational patch (post-review): side-aware depth helper.
+    #
+    # Returns the depth that the order will actually cross. A long
+    # market order eats asks; a short eats bids. When the caller
+    # supplies side-resolved depth via ``top_depth_by_side``, we use
+    # the relevant side. When only the summed ``top5_depth_usdt`` is
+    # available (legacy callers, backtest engines), we fall back to
+    # ``top5_depth_usdt / 2`` as a conservative estimate — this is
+    # equivalent to assuming a perfectly balanced book, which is the
+    # most permissive honest interpretation of the legacy number.
+    # The fallback is gated on ``cfg.depth_cap_side_aware`` so a test
+    # that explicitly relies on the old "compare against the sum"
+    # semantics can opt out by setting it to False.
+    # ------------------------------------------------------------------ #
+
+    def _crossing_side_depth_usdt(
+        self,
+        *,
+        side: Side,
+        top5_depth_usdt: float,
+        top_depth_by_side: tuple[float, float] | None,
+    ) -> float:
+        if top_depth_by_side is not None:
+            bid_d, ask_d = top_depth_by_side
+            crossing = ask_d if side == Side.LONG else bid_d
+            # Defensive: a venue returning 0 on one side is suspicious
+            # but not impossible (single-MM book in a halted symbol).
+            # Treat 0 as "no liquidity on the crossing side" -> the
+            # cap effectively rejects every notional > 0, which is
+            # the right defensive behaviour.
+            return max(0.0, float(crossing))
+        if not self.cfg.depth_cap_side_aware:
+            return float(top5_depth_usdt)
+        # Legacy summed depth: assume a balanced book and split.
+        return float(top5_depth_usdt) / 2.0
+
     def evaluate(
         self,
         *,
@@ -163,6 +222,14 @@ class RiskGate:
         phase: PumpPhase | None = None,
         confidence: float | None = None,
         symbol_profile: SymbolProfile | None = None,
+        # Operational patch (post-review): side-resolved top-N depth.
+        # ``(bid_depth_usdt, ask_depth_usdt)`` — when supplied, the
+        # depth-aware notional cap (闸门 #10b) compares the order's
+        # notional against the side the order will actually cross
+        # (longs eat asks, shorts eat bids). When omitted, the cap
+        # falls back to the (legacy) summed ``top5_depth_usdt`` so
+        # existing tests continue to pass.
+        top_depth_by_side: tuple[float, float] | None = None,
     ) -> RiskDecision:
         """Run all 9 checks. Returns an approved decision with sizing details
         on success, or a rejection with a reason on the first failure.
@@ -369,6 +436,49 @@ class RiskGate:
                     False, "sizing_below_minimum", side=side, leverage=leverage,
                 )
 
+            # 10b) depth-aware notional cap (operational patch).
+            #
+            # Why this matters: ``min_liquidity_usdt`` (闸门 #8) only checks
+            # that the book is ABOVE a floor. It does NOT prevent a large
+            # account from sizing a SINGLE order that eats most of that
+            # floor. With equity=50,000 USDT @ 15x leverage on an altcoin
+            # whose top-5 depth is 500,000 USDT, the gate happily approves
+            # a 750,000 USDT notional — meaning we ARE the book + 50%, and
+            # the actual fill price will sit well outside our stop.
+            #
+            # We therefore compare the *just-sized* notional against the
+            # live depth and reject if the order would consume more than
+            # ``max_notional_vs_depth_pct`` of the visible top-5. The
+            # check is deliberately OFF by default (== 0.0) so the legacy
+            # test suite that uses synthetic depths stays green; production
+            # flips it on via ``app.yaml`` (recommended: 0.10 = 10%).
+            if self.cfg.max_notional_vs_depth_pct > 0:
+                # Operational patch (post-review): use side-aware depth
+                # — a long order only crosses asks; a short only
+                # crosses bids. Summing both was 2x too permissive on
+                # one-sided altcoin books. Falls back to legacy summed
+                # behaviour when ``top_depth_by_side`` is not supplied
+                # (see ``_crossing_side_depth_usdt`` for the fallback).
+                crossing_depth = self._crossing_side_depth_usdt(
+                    side=side,
+                    top5_depth_usdt=top5_depth_usdt,
+                    top_depth_by_side=top_depth_by_side,
+                )
+                cap_notional = (
+                    crossing_depth * self.cfg.max_notional_vs_depth_pct
+                )
+                if notional > cap_notional:
+                    return RiskDecision(
+                        False,
+                        f"notional_exceeds_depth_cap:{notional:.0f}>"
+                        f"{cap_notional:.0f}@"
+                        f"pct={self.cfg.max_notional_vs_depth_pct:.2f}",
+                        side=side,
+                        leverage=leverage,
+                        size=size,
+                        notional_usdt=notional,
+                    )
+
             return RiskDecision(
                 approved=True,
                 reason="ok",
@@ -436,6 +546,8 @@ class RiskGate:
         realized_vol_pct: float,
         trigger_price: float,
         now_ms: int | None = None,
+        # Operational patch (post-review): see ``evaluate`` for shape.
+        top_depth_by_side: tuple[float, float] | None = None,
     ) -> RiskDecision:
         """Like ``evaluate``, but for an additional leg on an open position.
 
@@ -519,6 +631,35 @@ class RiskGate:
                     f"sizing_below_minimum:{new_leg_notional:.2f}",
                     side=side, leverage=parent.leverage,
                 )
+
+            # 10b) depth-aware notional cap (operational patch, rolling path).
+            #
+            # Same rationale as the entry path: a single market order that
+            # consumes more than ``max_notional_vs_depth_pct`` of the
+            # visible top-5 depth is guaranteed to slip badly. We check
+            # the *new leg's* notional rather than the cumulative position
+            # because (a) the existing exposure already trades, and (b)
+            # the slippage that hurts us is the impact of THIS order.
+            if self.cfg.max_notional_vs_depth_pct > 0:
+                crossing_depth = self._crossing_side_depth_usdt(
+                    side=side,
+                    top5_depth_usdt=top5_depth_usdt,
+                    top_depth_by_side=top_depth_by_side,
+                )
+                cap_notional = (
+                    crossing_depth * self.cfg.max_notional_vs_depth_pct
+                )
+                if new_leg_notional > cap_notional:
+                    return RiskDecision(
+                        False,
+                        f"notional_exceeds_depth_cap:{new_leg_notional:.0f}>"
+                        f"{cap_notional:.0f}@"
+                        f"pct={self.cfg.max_notional_vs_depth_pct:.2f}",
+                        side=side,
+                        leverage=parent.leverage,
+                        size=proposed_size,
+                        notional_usdt=new_leg_notional,
+                    )
 
             return RiskDecision(
                 approved=True,

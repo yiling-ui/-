@@ -119,3 +119,107 @@ async def test_dashboard_handles_corrupt_rules_file(tmp_path: Path) -> None:
         body = await r.json()
         assert body["total"] == 0
         assert "error" in body
+
+
+
+@pytest.mark.asyncio
+async def test_dashboard_pnl_curve_endpoint(tmp_path: Path) -> None:
+    """Operational patch: ``/api/pnl-curve`` returns equity snapshots
+    captured by ``record_equity_snapshot``."""
+    state = DashboardState(rules_path=tmp_path / "absent.json")
+    state.health = HealthState(reconciliation_complete=True)
+
+    # Two snapshots representing a small profit run.
+    account = AccountState(equity_usdt=10_000.0)
+    account.realized_pnl_today_usdt = 0.0
+    state.account = account
+    state.record_equity_snapshot()
+
+    account.equity_usdt = 10_500.0
+    account.realized_pnl_today_usdt = 500.0
+    state.record_equity_snapshot()
+
+    app = web.Application()
+    install_dashboard(app, state, mode_label="DRY-RUN")
+    async with TestClient(TestServer(app)) as client:
+        r = await client.get("/api/pnl-curve")
+        assert r.status == 200
+        body = await r.json()
+        assert isinstance(body, list)
+        assert len(body) == 2
+        # Most recent snapshot is at the end (FIFO append).
+        assert body[-1]["equity_usdt"] == pytest.approx(10_500.0)
+        assert body[-1]["realized_pnl_today_usdt"] == pytest.approx(500.0)
+        # Required fields present on every point.
+        for p in body:
+            assert "ts" in p and "equity_usdt" in p
+            assert "open_positions" in p
+
+
+@pytest.mark.asyncio
+async def test_dashboard_pnl_curve_skips_zero_or_missing_account(
+    tmp_path: Path,
+) -> None:
+    """Defensive: ``record_equity_snapshot`` must not push points when
+    the account is unwired or equity is zero (boot-time states). The
+    curve stays empty under those conditions."""
+    state = DashboardState(rules_path=tmp_path / "absent.json")
+    state.health = HealthState(reconciliation_complete=True)
+
+    # No account wired yet -> no snapshot.
+    state.record_equity_snapshot()
+    assert len(state.equity_curve) == 0
+
+    # Account with zero equity -> still no snapshot.
+    state.account = AccountState(equity_usdt=0.0)
+    state.record_equity_snapshot()
+    assert len(state.equity_curve) == 0
+
+    # Healthy account -> snapshot pushed.
+    state.account = AccountState(equity_usdt=500.0)
+    state.record_equity_snapshot()
+    assert len(state.equity_curve) == 1
+
+
+@pytest.mark.asyncio
+async def test_dashboard_external_flows_endpoint(tmp_path: Path) -> None:
+    """``/api/external-flows`` exposes recent deposit/withdrawal events
+    captured by the WithdrawalDetector wiring."""
+    state = DashboardState(rules_path=tmp_path / "absent.json")
+    state.health = HealthState(reconciliation_complete=True)
+
+    state.push_external_flow({
+        "ts": 1234.0, "kind": "withdrawal_detected",
+        "delta_usdt": -5_000.0, "venue_balance": 5_000.0,
+        "notes": "operator wire to bank",
+    })
+    state.push_external_flow({
+        "ts": 1300.0, "kind": "deposit_detected",
+        "delta_usdt": 2_000.0, "venue_balance": 7_000.0,
+    })
+
+    app = web.Application()
+    install_dashboard(app, state, mode_label="DRY-RUN")
+    async with TestClient(TestServer(app)) as client:
+        r = await client.get("/api/external-flows")
+        body = await r.json()
+        assert len(body) == 2
+        kinds = {x["kind"] for x in body}
+        assert kinds == {"withdrawal_detected", "deposit_detected"}
+
+
+@pytest.mark.asyncio
+async def test_dashboard_html_includes_chart_assets(tmp_path: Path) -> None:
+    """The page must include the Chart.js CDN reference and the
+    canvas element so the PnL curve renders."""
+    state = DashboardState(rules_path=tmp_path / "absent.json")
+    state.health = HealthState(reconciliation_complete=True)
+    app = web.Application()
+    install_dashboard(app, state, mode_label="DRY-RUN")
+    async with TestClient(TestServer(app)) as client:
+        r = await client.get("/dashboard")
+        text = await r.text()
+        assert 'id="pnlchart"' in text
+        assert "chart.js" in text.lower() or "Chart" in text
+        assert "/api/pnl-curve" in text
+        assert "/api/external-flows" in text

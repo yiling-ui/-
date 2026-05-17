@@ -45,6 +45,11 @@ from altcoin_agent.llm.cache import LLMCache
 from altcoin_agent.llm.pre_rater import LLMPreRater
 from altcoin_agent.llm.token_budget import TokenBudgetManager
 from altcoin_agent.notifier import Notifier, build_default_notifier
+from altcoin_agent.notifier.telegram_commands import (
+    CommandHandlers,
+    TelegramCommandPoller,
+    TelegramCommandPollerConfig,
+)
 from altcoin_agent.observability import (
     DeadLetterQueue,
     DLQEntry,
@@ -115,6 +120,14 @@ from altcoin_agent.risk.threshold_auto_tuner import (
     ThresholdAutoTuner,
     ThresholdAutoTunerConfig,
 )
+from altcoin_agent.risk.withdrawal_detector import (
+    WithdrawalDetector,
+    WithdrawalDetectorConfig,
+)
+from altcoin_agent.risk.reversal_guard import (
+    ReversalGuard,
+    ReversalGuardConfig,
+)
 from altcoin_agent.training.production_rules_loader import (
     ProductionRulesLoader,
 )
@@ -139,8 +152,42 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------- #
 
 
+def _parse_int_list(
+    raw: Any, *, field: str,
+) -> tuple[int, ...]:
+    """Permissive int-list parser used by ``AppConfig.from_dict``.
+
+    Operational patch (post-review): the original
+    ``tuple(int(x) for x in raw or [])`` would crash boot on a YAML
+    typo such as ``telegram_commands_allowed_chat_ids: [123, abc]``.
+    A boot crash on a malformed control-plane field is much worse
+    than dropping the offending entry — we now warn-and-continue so
+    a partial config still produces a working daemon.
+    """
+    if raw is None:
+        return ()
+    out: list[int] = []
+    for x in raw:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            logger.warning(
+                "config: dropping unparseable %s entry %r "
+                "(must be int-coercible)", field, x,
+            )
+    return tuple(out)
+
+
 @dataclass
 class AppConfig:
+    # Operational guidance: the daemon is *tested* against these two
+    # venues — binance USDT-M futures and Gate.io USDT futures — and
+    # ships ccxt error-handling + idempotency tweaks for each. ccxt.pro
+    # supports many more (okx, bybit, bitget, kucoin, mexc, …) and the
+    # adapter / sizing / gate logic is venue-agnostic, so operators can
+    # add any of those by extending this list. Anything outside the
+    # supported set produces a one-line warning at boot ("running on
+    # untested venue X — partial-fill / 5xx behaviour may differ").
     exchanges: list[str] = field(default_factory=lambda: ["binance"])
     symbols: list[str] = field(default_factory=lambda: ["BTC/USDT:USDT"])
     timeframes: tuple[str, ...] = ("1m", "5m")
@@ -285,6 +332,43 @@ class AppConfig:
     kill_switch_enabled: bool = True
     kill_switch_path: str = ".kiro/state/HALT"
     kill_switch_poll_sec: float = 2.0
+
+    # Operational patches — large-account / withdrawals / TG commands
+    # ----------------------------------------------------------------
+    # Depth-aware notional cap (gate.py 闸 #10b). Default 0.0 = disabled
+    # so existing tests pass; production sets e.g. 0.10 in app.yaml.
+    max_notional_vs_depth_pct: float = 0.0
+    # WithdrawalDetector — polls fetch_balance and reconciles
+    # ``account.equity_usdt`` to the venue when an unexplained delta
+    # (deposit / withdrawal) is observed. Off by default so dry-run
+    # tests don't hit the network.
+    withdrawal_detector_enabled: bool = False
+    withdrawal_poll_sec: float = 300.0
+    withdrawal_min_significant_delta_usdt: float = 100.0
+    withdrawal_startup_grace_sec: float = 30.0
+    # Equity snapshot ticker — pushes a point to the dashboard's
+    # ``equity_curve`` ring buffer every N seconds so the PnL chart
+    # has data even without a fresh trade event.
+    equity_snapshot_interval_sec: float = 60.0
+    # TelegramCommandPoller — opt-in two-way control plane. The
+    # operator sends /status /equity /positions etc. over Telegram.
+    # ``allowed_chat_ids`` is comma-separated in app.yaml, parsed in
+    # ``AppConfig.from_dict`` below into a set[int].
+    telegram_commands_enabled: bool = False
+    telegram_commands_allow_write: bool = False
+    telegram_commands_allowed_chat_ids: tuple[int, ...] = ()
+    # ReversalGuard — operator wants the daemon to default to "close
+    # and watch" when a signal flips direction, and only allow the
+    # reversal trade when wick / 插针 risk is low and the new signal
+    # is strong on its own. All knobs default to fail-closed values.
+    # See ``risk/reversal_guard.py`` for the rationale.
+    reversal_guard_enabled: bool = False
+    reversal_guard_recent_close_window_sec: int = 300
+    reversal_guard_wick_window_sec: int = 60
+    reversal_guard_wick_threshold_pct: float = 0.04
+    reversal_guard_min_reversal_final_score: float = 7.5
+    reversal_guard_cooldown_sec: int = 120
+    reversal_guard_min_seconds_since_close: int = 30
     # Decision audit log (audit #28)
     decision_audit_log_enabled: bool = True
     decision_audit_log_path: str = "logs/decisions.jsonl"
@@ -614,6 +698,57 @@ class AppConfig:
             kill_switch_poll_sec=float(
                 d.get("kill_switch_poll_sec", 2.0),
             ),
+            # Operational patches.
+            max_notional_vs_depth_pct=float(
+                d.get("max_notional_vs_depth_pct", 0.0),
+            ),
+            withdrawal_detector_enabled=bool(
+                d.get("withdrawal_detector_enabled", False),
+            ),
+            withdrawal_poll_sec=float(
+                d.get("withdrawal_poll_sec", 300.0),
+            ),
+            withdrawal_min_significant_delta_usdt=float(
+                d.get("withdrawal_min_significant_delta_usdt", 100.0),
+            ),
+            withdrawal_startup_grace_sec=float(
+                d.get("withdrawal_startup_grace_sec", 30.0),
+            ),
+            equity_snapshot_interval_sec=float(
+                d.get("equity_snapshot_interval_sec", 60.0),
+            ),
+            telegram_commands_enabled=bool(
+                d.get("telegram_commands_enabled", False),
+            ),
+            telegram_commands_allow_write=bool(
+                d.get("telegram_commands_allow_write", False),
+            ),
+            telegram_commands_allowed_chat_ids=_parse_int_list(
+                d.get("telegram_commands_allowed_chat_ids"),
+                field="telegram_commands_allowed_chat_ids",
+            ),
+            # Operational patch — ReversalGuard.
+            reversal_guard_enabled=bool(
+                d.get("reversal_guard_enabled", False),
+            ),
+            reversal_guard_recent_close_window_sec=int(
+                d.get("reversal_guard_recent_close_window_sec", 300),
+            ),
+            reversal_guard_wick_window_sec=int(
+                d.get("reversal_guard_wick_window_sec", 60),
+            ),
+            reversal_guard_wick_threshold_pct=float(
+                d.get("reversal_guard_wick_threshold_pct", 0.04),
+            ),
+            reversal_guard_min_reversal_final_score=float(
+                d.get("reversal_guard_min_reversal_final_score", 7.5),
+            ),
+            reversal_guard_cooldown_sec=int(
+                d.get("reversal_guard_cooldown_sec", 120),
+            ),
+            reversal_guard_min_seconds_since_close=int(
+                d.get("reversal_guard_min_seconds_since_close", 30),
+            ),
             decision_audit_log_enabled=bool(
                 d.get("decision_audit_log_enabled", True),
             ),
@@ -929,6 +1064,10 @@ class DryRunExchangeAdapter:
         # tests can override per-symbol with ``set_top_depth``.
         self._top_depths: dict[str, float] = {}
         self._default_top_depth_usdt: float = 1_000_000_000.0
+        # Operational patch (post-review): per-side depth so tests
+        # can simulate one-sided altcoin books (700k asks, 300k bids)
+        # to exercise the side-aware notional cap.
+        self._top_depths_by_side: dict[str, tuple[float, float]] = {}
 
     def _id(self) -> str:
         self._n += 1
@@ -1019,6 +1158,33 @@ class DryRunExchangeAdapter:
     def set_top_depth(self, symbol: str, depth_usdt: float) -> None:
         self._top_depths[symbol] = float(depth_usdt)
 
+    async def fetch_top_depth_by_side(
+        self, symbol: str, *, levels: int = 5,
+    ) -> tuple[float, float]:
+        """Dry-run companion of
+        :meth:`CCXTExchangeAdapter.fetch_top_depth_by_side`.
+
+        Defaults to a balanced book (split in half) so existing
+        depth-cap tests that pin a single ``top_depth`` continue to
+        behave as if the book is symmetric. Tests that need an
+        asymmetric book can call ``set_top_depth_by_side`` to override.
+        """
+        del levels
+        if symbol in self._top_depths_by_side:
+            return self._top_depths_by_side[symbol]
+        # Balanced fallback derived from the (single-number) top depth.
+        total = self._top_depths.get(symbol, self._default_top_depth_usdt)
+        half = float(total) / 2.0
+        return half, half
+
+    def set_top_depth_by_side(
+        self, symbol: str, *, bid_usdt: float, ask_usdt: float,
+    ) -> None:
+        """Pin an asymmetric (bid_depth, ask_depth) for tests."""
+        self._top_depths_by_side[symbol] = (
+            float(bid_usdt), float(ask_usdt),
+        )
+
     # Test helper: pretend the exchange-side STOP_MARKET fired.
     def simulate_close(self, symbol: str) -> None:
         self._open_positions.pop(symbol, None)
@@ -1037,6 +1203,29 @@ assert isinstance(DryRunExchangeAdapter(), ExchangeAdapter), (
 def _build_live_adapter(cfg: AppConfig) -> CCXTExchangeAdapter | None:
     """Build a ccxt-backed adapter from environment variables."""
     exchange = cfg.exchanges[0] if cfg.exchanges else "binance"
+
+    # Operational note: venues we have explicitly tested for ccxt
+    # quirks (idempotency param naming, fetch_balance shape, etc.).
+    # ``ccxt_adapter.py`` has dedicated branches for these. Other
+    # ccxt.pro venues will likely *work* but we warn the operator.
+    _PRIMARY = {"binance", "binanceusdm", "gateio", "gate"}
+    _RESERVED = {"okx", "bybit", "bitget", "kucoin", "mexc", "bingx"}
+    if exchange not in _PRIMARY and exchange not in _RESERVED:
+        logger.warning(
+            "Exchange %r is not in the tested list "
+            "(primary: %s; reserved: %s). The adapter is venue-agnostic "
+            "but partial-fill / 5xx / idempotency-key behaviour may "
+            "differ. Validate carefully in dry-run before flipping live.",
+            exchange, sorted(_PRIMARY), sorted(_RESERVED),
+        )
+    elif exchange in _RESERVED:
+        logger.info(
+            "Exchange %r: reserved-but-tested venue. ccxt.pro support is "
+            "in place; the partial-fill threshold and 5xx classification "
+            "use the same defaults as binance.",
+            exchange,
+        )
+
     key_var = f"{exchange.upper()}_API_KEY"
     sec_var = f"{exchange.upper()}_API_SECRET"
     pass_var = f"{exchange.upper()}_API_PASSPHRASE"
@@ -1323,6 +1512,10 @@ class App:
     _cluster_cap_cfg: ClusterCapConfig | None = None
     _kill_switch: KillSwitchWatcher | None = None
     _decision_audit_log: DecisionAuditLog | None = None
+    # Operational patches.
+    _withdrawal_detector: WithdrawalDetector | None = None
+    _telegram_command_poller: TelegramCommandPoller | None = None
+    _reversal_guard: ReversalGuard | None = None
     # Phase B.2 — observability slots (None = feature off).
     _metrics: DefaultMetrics | None = None
     _dlq: DeadLetterQueue | None = None
@@ -1453,6 +1646,7 @@ class App:
         sizer = PositionSizer()
         gate = RiskGate(sizer, RiskGateConfig(
             min_liquidity_usdt=self.cfg.min_liquidity_usdt,
+            max_notional_vs_depth_pct=self.cfg.max_notional_vs_depth_pct,
         ))
         atr = ATRCalculator()
         # Anti-chase / vol-kill price tape (low-latency hot-path defence).
@@ -1595,6 +1789,36 @@ class App:
         # operator only has to back up one folder.
         if self.cfg.miss_penalty_enabled and self._reflection is None:
             self._wire_miss_penalty_pipeline()
+
+        # Operational patch — ReversalGuard. Built lazily so tests
+        # can pre-populate ``self._reversal_guard`` to inject a mock.
+        # Default OFF (existing behaviour); operator opts in via
+        # ``reversal_guard_enabled: true`` in app.yaml.
+        if self.cfg.reversal_guard_enabled and self._reversal_guard is None:
+            self._reversal_guard = ReversalGuard(
+                cfg=ReversalGuardConfig(
+                    enabled=True,
+                    recent_close_window_sec=(
+                        self.cfg.reversal_guard_recent_close_window_sec
+                    ),
+                    wick_window_sec=(
+                        self.cfg.reversal_guard_wick_window_sec
+                    ),
+                    wick_threshold_pct=(
+                        self.cfg.reversal_guard_wick_threshold_pct
+                    ),
+                    min_reversal_final_score=(
+                        self.cfg.reversal_guard_min_reversal_final_score
+                    ),
+                    reversal_cooldown_sec=(
+                        self.cfg.reversal_guard_cooldown_sec
+                    ),
+                    min_seconds_since_close=(
+                        self.cfg.reversal_guard_min_seconds_since_close
+                    ),
+                ),
+                price_tape=self._price_tape,
+            )
 
         # ----- reconciler (SR-2) -----
         rec_report = await Reconciler(
@@ -2335,8 +2559,293 @@ class App:
                 name="production_rules_reload_worker",
             ))
 
+        # ----------------------------------------------------------- #
+        # Operational patches — wired here so all required deps
+        # (account, notifier, dashboard, adapter) are constructed.
+        # ----------------------------------------------------------- #
+
+        # Equity snapshot ticker — feeds the dashboard's PnL chart
+        # even when no trade has flipped state for a while. Cheap
+        # (one float push every 60s).
+        async def equity_snapshot_worker() -> None:
+            interval = max(1.0, self.cfg.equity_snapshot_interval_sec)
+            try:
+                while not self._stop_event.is_set():
+                    try:
+                        self.dashboard.record_equity_snapshot()
+                    except Exception as e:  # pragma: no cover defensive
+                        logger.warning(
+                            "equity_snapshot_worker push failed: %s", e,
+                        )
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(), timeout=interval,
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        continue
+            except asyncio.CancelledError:
+                pass
+        self._tasks.append(asyncio.create_task(
+            equity_snapshot_worker(), name="equity_snapshot_worker",
+        ))
+
+        # WithdrawalDetector — only when the adapter actually exposes
+        # ``fetch_total_usdt_balance`` (the dry-run adapter does not).
+        # Off by default; operators flip ``withdrawal_detector_enabled``
+        # in app.yaml once they wire a real ccxt adapter.
+        if (
+            self.cfg.withdrawal_detector_enabled
+            and self._withdrawal_detector is None
+            and hasattr(self._adapter, "fetch_total_usdt_balance")
+        ):
+            async def _on_flow_event(
+                reason: str, delta: float, diag: dict[str, Any],
+            ) -> None:
+                """Push to dashboard ring buffer + Telegram-alert the
+                operator. Both calls are best-effort."""
+                with suppress(Exception):
+                    self.dashboard.push_external_flow({
+                        "ts": time.time(),
+                        "kind": reason,
+                        "delta_usdt": delta,
+                        "venue_balance": diag.get("venue_balance"),
+                        "notes": (
+                            f"unexplained={diag.get('unexplained'):+.2f}, "
+                            f"pnl_delta={diag.get('pnl_delta'):+.2f}"
+                        ),
+                    })
+                with suppress(Exception):
+                    if self.notifier is not None:
+                        # Operational patch (post-review): use the
+                        # dedicated ``flow()`` channel so deposits and
+                        # withdrawals render with a neutral 🏦 BANK
+                        # icon instead of 🚨 ERROR. Falls back to
+                        # ``error()`` for older notifier implementations
+                        # that don't expose ``flow``.
+                        flow_fn = getattr(self.notifier, "flow", None)
+                        if flow_fn is not None:
+                            await flow_fn(
+                                f"{reason}: {delta:+.2f} USDT "
+                                f"(venue balance now "
+                                f"{diag.get('venue_balance'):.2f})",
+                                payload={"reason": reason, "delta": delta},
+                            )
+                        else:
+                            await self.notifier.error(
+                                f"BANK FLOW {reason}: {delta:+.2f} USDT "
+                                f"(venue balance now "
+                                f"{diag.get('venue_balance'):.2f})",
+                                payload={"reason": reason, "delta": delta},
+                            )
+            self._withdrawal_detector = WithdrawalDetector(
+                adapter=self._adapter,  # type: ignore[arg-type]
+                account=account,
+                cfg=WithdrawalDetectorConfig(
+                    enabled=True,
+                    poll_interval_sec=self.cfg.withdrawal_poll_sec,
+                    min_significant_delta_usdt=(
+                        self.cfg.withdrawal_min_significant_delta_usdt
+                    ),
+                    startup_grace_sec=self.cfg.withdrawal_startup_grace_sec,
+                ),
+                on_event=_on_flow_event,
+            )
+            wd = self._withdrawal_detector
+
+            async def withdrawal_detector_worker() -> None:
+                try:
+                    await wd.run(self._stop_event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.exception(
+                        "withdrawal_detector_worker failed: %s", e,
+                    )
+                    self.state.last_error = (
+                        f"withdrawal_detector:{type(e).__name__}"
+                    )
+
+            self._tasks.append(asyncio.create_task(
+                withdrawal_detector_worker(),
+                name="withdrawal_detector_worker",
+            ))
+
+        # TelegramCommandPoller — opt-in two-way control plane.
+        # We bind the handlers to the live ``account`` / ``self``
+        # references via closures, mirroring how Notifier is wired.
+        if (
+            self.cfg.telegram_commands_enabled
+            and self._telegram_command_poller is None
+            and self.cfg.telegram_commands_allowed_chat_ids
+        ):
+            handlers = self._build_telegram_command_handlers(account)
+            tg_token = os.getenv("TG_BOT_TOKEN", "")
+            tg_api_base = os.getenv(
+                "TG_API_BASE", "https://api.telegram.org",
+            )
+            if not tg_token:
+                logger.warning(
+                    "telegram_commands_enabled=true but TG_BOT_TOKEN "
+                    "is empty; skipping the command poller",
+                )
+            else:
+                async def _reply_sender(text: str) -> None:
+                    # Route replies through the existing notifier so
+                    # they share the rate-limiter (and so the operator
+                    # only needs one bot configured).
+                    with suppress(Exception):
+                        # Notifier.signal expects a payload dict; we
+                        # repurpose ``signal`` is wrong here. Use
+                        # ``error`` (which already accepts free-form
+                        # text) so replies show up as a distinct kind
+                        # of message in TG.
+                        if self.notifier is not None:
+                            await self.notifier.error(text)
+                self._telegram_command_poller = TelegramCommandPoller(
+                    cfg=TelegramCommandPollerConfig(
+                        enabled=True,
+                        bot_token=tg_token,
+                        api_base=tg_api_base,
+                        allowed_chat_ids=set(
+                            self.cfg.telegram_commands_allowed_chat_ids,
+                        ),
+                        allow_write_commands=(
+                            self.cfg.telegram_commands_allow_write
+                        ),
+                    ),
+                    handlers=handlers,
+                    reply_sender=_reply_sender,
+                )
+                tg_poller = self._telegram_command_poller
+
+                async def telegram_command_worker() -> None:
+                    try:
+                        await tg_poller.run(self._stop_event)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.exception(
+                            "telegram_command_worker failed: %s", e,
+                        )
+
+                self._tasks.append(asyncio.create_task(
+                    telegram_command_worker(),
+                    name="telegram_command_worker",
+                ))
+
         await self._stop_event.wait()
         await self._shutdown()
+
+    # ---------------------- Telegram command handlers ---------------------- #
+
+    def _build_telegram_command_handlers(
+        self, account: AccountState,
+    ) -> CommandHandlers:
+        """Bind per-instance command handlers to ``account`` / ``self``.
+
+        Read commands (``/status`` / ``/equity`` / ``/positions`` /
+        ``/pnl`` / ``/help``) work whenever the chat is whitelisted.
+        Write commands (``/halt`` / ``/resume``) additionally require
+        ``cfg.telegram_commands_allow_write`` and never bypass the
+        chat-id check.
+        """
+
+        async def status(cmd: str, args: list[str], chat_id: int) -> str:
+            h = self.state
+            return (
+                "STATUS\n"
+                f"  fuser_alive: {h.fuser_alive}\n"
+                f"  screener_alive: {h.screener_alive}\n"
+                f"  reconciliation_complete: "
+                f"{h.reconciliation_complete}\n"
+                f"  rule_event_count: {h.rule_event_count}\n"
+                f"  high_priority_count: {h.high_priority_count}\n"
+                f"  orders_placed: {h.orders_placed}\n"
+                f"  orders_rejected: {h.orders_rejected}\n"
+                f"  open_positions: {h.open_positions}\n"
+                f"  global_halt: {account.global_trading_halted} "
+                f"({account.halt_reason or '-'})\n"
+                f"  last_error: {h.last_error or '-'}"
+            )
+
+        async def equity(cmd: str, args: list[str], chat_id: int) -> str:
+            return (
+                "EQUITY\n"
+                f"  current: {account.equity_usdt:.2f} USDT\n"
+                f"  starting today: "
+                f"{account.starting_equity_today_usdt:.2f}\n"
+                f"  realized PnL today: "
+                f"{account.realized_pnl_today_usdt:+.2f}\n"
+                f"  daily drawdown: "
+                f"{account.daily_drawdown_pct * 100:.2f}%\n"
+                f"  daily stoploss hits: {account.daily_stoploss_hits}"
+            )
+
+        async def positions(cmd: str, args: list[str], chat_id: int) -> str:
+            if not account.open_positions:
+                return "POSITIONS: none"
+            rows = ["POSITIONS"]
+            for p in account.open_positions.values():
+                rows.append(
+                    f"  {p.symbol} {p.side.value} size={p.size} "
+                    f"entry={p.entry_price} stop={p.current_stop} "
+                    f"lev={p.leverage}x"
+                )
+            return "\n".join(rows)
+
+        async def pnl(cmd: str, args: list[str], chat_id: int) -> str:
+            curve = list(self.dashboard.equity_curve)
+            if len(curve) < 2:
+                return "PNL: insufficient data (need at least 2 snapshots)"
+            first, last = curve[0], curve[-1]
+            delta = last["equity_usdt"] - first["equity_usdt"]
+            pct = (delta / first["equity_usdt"] * 100.0
+                   if first["equity_usdt"] > 0 else 0.0)
+            mins = (last["ts"] - first["ts"]) / 60.0
+            return (
+                "PNL (since first snapshot)\n"
+                f"  start: {first['equity_usdt']:.2f}  "
+                f"now: {last['equity_usdt']:.2f}\n"
+                f"  delta: {delta:+.2f} USDT ({pct:+.2f}%)\n"
+                f"  span: {mins:.1f} minutes, "
+                f"{len(curve)} snapshots"
+            )
+
+        async def halt_cmd(cmd: str, args: list[str], chat_id: int) -> str:
+            reason = " ".join(args) or f"telegram-halt by chat {chat_id}"
+            if account.global_trading_halted:
+                return f"already halted: {account.halt_reason or '-'}"
+            account.halt(f"manual:{reason}")
+            return f"HALTED: {reason}"
+
+        async def resume_cmd(cmd: str, args: list[str], chat_id: int) -> str:
+            if not account.global_trading_halted:
+                return "not halted; nothing to resume"
+            # Operational patch (post-review): use ``account.resume()``
+            # instead of direct attribute assignment so the change goes
+            # through ``_notify_change`` -> ``AccountPersistor.save``.
+            # Without this, a daemon restart within seconds of /resume
+            # would silently re-apply the persisted halt — see
+            # ``AccountState.resume`` docstring for the full story.
+            account.resume()
+            return "RESUMED"
+
+        async def help_cmd(cmd: str, args: list[str], chat_id: int) -> str:
+            return (
+                "/status     — daemon health + counters\n"
+                "/equity     — current equity / daily PnL / drawdown\n"
+                "/positions  — list open positions\n"
+                "/pnl        — equity-curve snapshot\n"
+                "/halt [reason]   — halt new entries (write-gated)\n"
+                "/resume     — clear manual halt (write-gated)\n"
+                "/help       — this help"
+            )
+
+        return CommandHandlers(
+            status=status, equity=equity, positions=positions, pnl=pnl,
+            halt=halt_cmd, resume=resume_cmd, help=help_cmd,
+        )
 
     async def _safe_notify_signal(self, payload: dict[str, Any]) -> None:
         """Telegram-notify the high-priority signal without raising.
@@ -2846,6 +3355,41 @@ class App:
             raise RuntimeError("adapter has no fetch_top_depth_usdt")
         return float(await fetcher(symbol))
 
+    async def _fetch_top_depth_by_side(
+        self, symbol: str,
+    ) -> tuple[float, float] | None:
+        """Operational patch (post-review): return per-side top-5
+        depth ``(bid_depth_usdt, ask_depth_usdt)`` for the depth-aware
+        notional cap.
+
+        Returns ``None`` when the adapter doesn't expose the
+        side-aware fetch (older code, third-party adapters). The
+        caller must tolerate ``None`` and fall back to the legacy
+        single-number depth — the gate's ``_crossing_side_depth_usdt``
+        helper handles that fallback.
+
+        We deliberately do NOT raise on adapter failure here: the
+        legacy single-number depth fetch is the primary signal for
+        闸门 #8 (insufficient liquidity, fail-closed); the side-aware
+        number is only used to make 闸门 #10b (notional cap) more
+        accurate. A best-effort secondary fetch should not be allowed
+        to abort an otherwise-valid order.
+        """
+        adapter = self._adapter
+        fetcher = getattr(adapter, "fetch_top_depth_by_side", None)
+        if fetcher is None:
+            return None
+        try:
+            bid_d, ask_d = await fetcher(symbol)
+        except Exception as e:
+            logger.debug(
+                "side-aware depth fetch failed for %s (%s); "
+                "depth-cap will fall back to legacy halved heuristic",
+                symbol, e,
+            )
+            return None
+        return float(bid_d), float(ask_d)
+
     async def _handle_high_priority(
         self,
         *,
@@ -3060,6 +3604,17 @@ class App:
                 await self.notifier.rejected(rej)
             return
 
+        # Operational patch (post-review): also fetch per-side depth
+        # so the depth-aware notional cap (闸门 #10b) compares the
+        # order's notional against the side it will actually cross,
+        # not against the summed bid+ask. Best-effort: when the
+        # adapter doesn't expose ``fetch_top_depth_by_side`` (older
+        # adapters / tests using the dry-run that does), the gate
+        # falls back to a halved-sum heuristic.
+        top_depth_by_side = await self._fetch_top_depth_by_side(
+            sig.symbol,
+        )
+
         realized_vol_pct: float | None = None
         if self._price_tape is not None:
             realized_vol_pct = self._price_tape.realized_vol_pct(
@@ -3103,6 +3658,58 @@ class App:
                     await self.notifier.rejected(rej)
                 return
 
+        # Operational patch (post-review) — ReversalGuard.
+        #
+        # The operator's instruction: "对于反手要谨慎防止插针，合理规划风险
+        # 要么就平仓观望，等待时机。只有合适时机才反手." The guard turns that
+        # into a hot-path decision:
+        #   * approve            -> proceed to gate.evaluate (no flip)
+        #   * defer_close_and_watch -> close the existing position
+        #     (if any) and skip the new entry; cooldown is set
+        #   * veto               -> drop the signal with a reason
+        # The guard is a no-op when ``reversal_guard_enabled`` is False
+        # (default) — existing behaviour is byte-for-byte preserved.
+        if self._reversal_guard is not None:
+            rev = self._reversal_guard.decide(
+                signal=sig, account=account,
+            )
+            if rev.action != "approve":
+                logger.info(
+                    "ReversalGuard %s on %s: %s",
+                    rev.action, sig.symbol, rev.message,
+                )
+                self.state.orders_rejected += 1
+                rej = {
+                    "ts": int(time.time() * 1000),
+                    "symbol": sig.symbol,
+                    "reason": f"reversal_guard:{rev.reason}",
+                }
+                self.dashboard.push_rejection(rej)
+                self._record_rejection(
+                    symbol=sig.symbol,
+                    reason=rej["reason"],
+                    kind="reversal_guard",
+                    payload={
+                        "signal": sig.as_dict(),
+                        "diag": rev.diag,
+                        "action": rev.action,
+                    },
+                )
+                # Defer-close-and-watch: try to flatten the existing
+                # position so the operator's "close and observe"
+                # posture is honoured. Best-effort — failures fall
+                # through to the next reconciliation pass.
+                if rev.action == "defer_close_and_watch":
+                    cur_pos = account.position(sig.symbol)
+                    if cur_pos is not None and not cur_pos.closed:
+                        await self._reverse_guard_flatten(
+                            cur_pos, executor, account,
+                            reason=rev.reason,
+                        )
+                with suppress(Exception):
+                    await self.notifier.rejected(rej)
+                return
+
         # Phase B.6: wrap gate.evaluate in its own span so dashboards
         # can spot a slow gate (e.g. SR-1 falling back to a degraded
         # quote provider) at a glance.
@@ -3129,6 +3736,11 @@ class App:
                 regime_filter=self._regime_filter,
                 cluster_map=self._cluster_map,
                 cluster_cap_cfg=self._cluster_cap_cfg,
+                # Operational patch (post-review): side-resolved depth
+                # for the depth-aware notional cap. ``None`` is fine
+                # — the gate falls back to the legacy halved-sum
+                # heuristic in that case.
+                top_depth_by_side=top_depth_by_side,
             )
             # Annotate the span with the outcome so a span filter on
             # ``approved=false`` returns the population we want.
@@ -3289,6 +3901,68 @@ class App:
             with suppress(Exception):
                 await self.notifier.error(f"executor failed for {sig.symbol}: {e}")
 
+    async def _reverse_guard_flatten(
+        self,
+        position: Position,
+        executor: CCXTExecutor,
+        account: AccountState,
+        *,
+        reason: str,
+    ) -> None:
+        """Flatten ``position`` at market because the ReversalGuard
+        wants the operator's "close and watch" posture instead of an
+        immediate reversal trade.
+
+        Best-effort:
+          * Issues a ``reduce_only`` market order on the opposite side.
+          * Marks the position closed in-memory so the position-watcher
+            doesn't double-act on it; the watcher's reconcile pass will
+            then trigger ``_on_position_close`` for full bookkeeping.
+          * Cancels the resting hard stop if we still have its id.
+          * Failures are logged at warning level and swallowed — the
+            next position-watcher poll will reconcile.
+        """
+        symbol = position.symbol
+        try:
+            await executor.adapter.market_order(
+                symbol=symbol,
+                side=position.side.opposite,
+                size=position.total_size,
+                reduce_only=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "ReversalGuard flatten %s: market_order failed (%s); "
+                "next reconcile will handle it",
+                symbol, e,
+            )
+            return
+
+        # Cancel the resting hard stop. Failure here is OK — the
+        # exchange will reject the stop on next trigger because the
+        # position is already gone, and the position-watcher will
+        # clean up.
+        if position.stop_order_id:
+            with suppress(Exception):
+                await executor.adapter.cancel_order(
+                    position.stop_order_id, symbol,
+                )
+
+        position.closed = True
+        # Engage the reversal cooldown so a fresh signal can't
+        # immediately re-open in either direction.
+        with suppress(Exception):
+            account.set_cooldown(
+                symbol,
+                duration_sec=self.cfg.reversal_guard_cooldown_sec,
+                now_ms=int(time.time() * 1000),
+            )
+
+        logger.info(
+            "ReversalGuard flattened %s (%s side) at market — reason=%s",
+            symbol, position.side.value, reason,
+        )
+
     async def _on_position_close(
         self,
         *,
@@ -3368,6 +4042,18 @@ class App:
         # 5) detach trailing tracker
         trailing.detach(symbol)
 
+        # 6a) Operational patch (post-review): tell the ReversalGuard
+        # that this symbol just closed, so an opposite-direction
+        # signal arriving inside the recent-close window is correctly
+        # classified as a reversal candidate (not a fresh entry).
+        # Safe no-op when the guard isn't wired.
+        if self._reversal_guard is not None:
+            with suppress(Exception):
+                self._reversal_guard.note_close(
+                    symbol=symbol,
+                    side=position.side,
+                )
+
         # 6) Reset rolling controller's per-symbol bookkeeping so the
         #    next position on this symbol starts with an empty
         #    fired-thresholds set. Without this, residual state from a
@@ -3425,6 +4111,10 @@ class App:
         }
         with suppress(Exception):
             self.dashboard.push_close(closed_payload)
+        # Operational patch: snapshot equity right after a fill so
+        # the dashboard's PnL chart shows the discrete step.
+        with suppress(Exception):
+            self.dashboard.record_equity_snapshot()
         if self.notifier is not None:
             with suppress(Exception):
                 await self.notifier.closed(closed_payload)

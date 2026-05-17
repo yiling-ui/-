@@ -317,6 +317,32 @@ class CCXTExchangeAdapter:
         We sum ``price * size`` over the first ``levels`` rows of bids
         and asks and return the total. Raises ``RuntimeError`` if the
         venue doesn't return a usable book; the caller MUST fail-closed.
+
+        Operational patch (post-review): callers that want the
+        depth-aware notional cap to be honest about one-sided books
+        should also fetch ``fetch_top_depth_by_side`` and pass the
+        tuple to ``RiskGate.evaluate`` via ``top_depth_by_side``.
+        Summing the two sides as this method does is the right
+        liquidity-floor signal (闸门 #8) but the wrong cap signal
+        (闸门 #10b).
+        """
+        bid_depth, ask_depth = await self.fetch_top_depth_by_side(
+            symbol, levels=levels,
+        )
+        total = bid_depth + ask_depth
+        if total <= 0:
+            raise RuntimeError(f"empty order book for {symbol}")
+        return total
+
+    async def fetch_top_depth_by_side(
+        self, symbol: str, *, levels: int = 5,
+    ) -> tuple[float, float]:
+        """Same as :meth:`fetch_top_depth_usdt` but returns
+        ``(bid_depth_usdt, ask_depth_usdt)`` so the caller can apply
+        the depth-aware notional cap (闸门 #10b) against the side
+        the order will actually cross. Either side may be 0.0 if
+        the venue returns an empty list; the caller must handle that
+        defensively. Raises only on a structurally-broken response.
         """
         if not hasattr(self.client, "fetch_order_book"):
             raise RuntimeError(
@@ -326,12 +352,14 @@ class CCXTExchangeAdapter:
             symbol, levels,
         )
         if not isinstance(ob, dict):
-            raise RuntimeError(f"unexpected order-book shape for {symbol}: {ob!r}")
-        total = 0.0
-        for side_key in ("bids", "asks"):
+            raise RuntimeError(
+                f"unexpected order-book shape for {symbol}: {ob!r}",
+            )
+        bid_total = 0.0
+        ask_total = 0.0
+        for side_key, sink in (("bids", "bid"), ("asks", "ask")):
             rows = ob.get(side_key) or []
             for row in rows[:levels]:
-                # ccxt rows: [price, size, ...]
                 if not row or len(row) < 2:
                     continue
                 try:
@@ -340,10 +368,11 @@ class CCXTExchangeAdapter:
                 except (TypeError, ValueError):
                     continue
                 if price > 0 and size > 0:
-                    total += price * size
-        if total <= 0:
-            raise RuntimeError(f"empty order book for {symbol}")
-        return total
+                    if sink == "bid":
+                        bid_total += price * size
+                    else:
+                        ask_total += price * size
+        return bid_total, ask_total
 
     async def fetch_open_orders(self) -> list[dict[str, Any]]:
         raw = await self.client.fetch_open_orders()
@@ -359,6 +388,94 @@ class CCXTExchangeAdapter:
                 "side": (o.get("side") or "").lower(),
             })
         return out
+
+    async def fetch_total_usdt_balance(self) -> float:
+        """Total USDT-equivalent balance for ``WithdrawalDetector``.
+
+        For a USDT-margined perpetuals account we want a number that:
+          * tracks the operator's bank-flow (deposits / withdrawals
+            move it 1:1),
+          * already includes unrealised PnL on open positions (so the
+            detector's "unexplained delta" calculus only needs to net
+            against *realised* PnL flowing through ``account``).
+
+        Both Binance USDT-M futures and Gate.io USDT futures return a
+        wallet-and-margin object via ``fetch_balance()``. The shape
+        differs a little but ccxt unifies enough of it that we can
+        prefer ``info.totalWalletBalance + info.totalUnrealizedProfit``
+        on Binance, ``info.total_initial_margin + info.cross_wallet_balance``
+        on Gate, and a generic ``USDT.total`` fallback elsewhere.
+
+        Raises ``RuntimeError`` on transient errors so the
+        ``WithdrawalDetector`` swallows the round and retries; never
+        returns 0 on error (0 would look like a full withdrawal).
+        """
+        if not hasattr(self.client, "fetch_balance"):
+            raise RuntimeError(
+                f"{self.exchange_name} client has no fetch_balance",
+            )
+        bal = await self.client.fetch_balance()  # type: ignore[attr-defined]
+        if not isinstance(bal, dict):
+            raise RuntimeError(f"unexpected balance shape: {bal!r}")
+
+        # Venue-specific extraction (defensively, with fallback).
+        info = bal.get("info") or {}
+        # Binance USDT-M futures: ``totalWalletBalance`` is the wallet
+        # in USDT; ``totalUnrealizedProfit`` is unrealised PnL on
+        # all open positions. Their sum is the "marginBalance" the
+        # account-holder sees in the UI.
+        if self.exchange_name == "binance":
+            try:
+                wallet = float(info.get("totalWalletBalance") or 0.0)
+                upnl = float(info.get("totalUnrealizedProfit") or 0.0)
+                total = wallet + upnl
+                if total > 0:
+                    return total
+            except (TypeError, ValueError):
+                pass
+        if self.exchange_name == "gateio" or self.exchange_name == "gate":
+            # Gate.io futures returns ``total`` and ``available`` per
+            # currency; for cross-margin the wallet equity is in
+            # ``info.cross_wallet_balance`` plus ``info.unrealised_pnl``.
+            try:
+                cross_wb = float(info.get("cross_wallet_balance") or 0.0)
+                upnl = float(info.get("unrealised_pnl") or 0.0)
+                total = cross_wb + upnl
+                if total > 0:
+                    return total
+            except (TypeError, ValueError):
+                pass
+
+        # Generic fallback: ccxt unifies ``USDT.total`` to the
+        # net-of-margin total balance for most venues.
+        usdt = bal.get("USDT") or bal.get("usdt") or {}
+        if isinstance(usdt, dict):
+            for key in ("total", "free"):
+                v = usdt.get(key)
+                if v is not None:
+                    try:
+                        out = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if out > 0:
+                        return out
+
+        # ccxt sometimes puts the unified totals under ``total[USDT]``.
+        totals = bal.get("total") or {}
+        if isinstance(totals, dict):
+            v = totals.get("USDT")
+            if v is not None:
+                try:
+                    out = float(v)
+                except (TypeError, ValueError):
+                    out = 0.0
+                if out > 0:
+                    return out
+
+        raise RuntimeError(
+            f"no usable USDT balance in fetch_balance response on "
+            f"{self.exchange_name}: keys={list(bal.keys())}",
+        )
 
 
 # ------------------------------------------------------------------ #
