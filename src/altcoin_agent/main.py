@@ -529,14 +529,22 @@ class DryRunExchangeAdapter:
         # tests can override per-symbol with ``set_top_depth``.
         self._top_depths: dict[str, float] = {}
         self._default_top_depth_usdt: float = 1_000_000_000.0
+        # TICKET-004: per-symbol fill-trade list for the
+        # ``_on_position_close`` real-VWAP path. Empty by default;
+        # tests pin via ``set_fill_trades``.
+        self._my_trades: dict[str, list[dict[str, Any]]] = {}
 
     def _id(self) -> str:
         self._n += 1
         return f"dryrun-{self._n}"
 
-    async def market_order(self, symbol, side, size, *, price=None, reduce_only=False):  # noqa: ANN001
+    async def market_order(self, symbol, side, size, *, price=None, reduce_only=False, client_order_id=None):  # noqa: ANN001
         oid = self._id()
-        rec = {"id": oid, "symbol": symbol, "side": side.value, "size": size,
+        rec = {"id": oid,
+               "client_order_id": client_order_id,
+               "symbol": symbol, "side": side.value, "size": size,
+               "amount": size, "filled": size, "remaining": 0.0,
+               "status": "closed",
                "price": price, "reduce_only": reduce_only,
                "average": price or 0.0}
         self.market_orders.append(rec)
@@ -552,17 +560,24 @@ class DryRunExchangeAdapter:
                 "contracts": float(size),
                 "entryPrice": float(price or 0.0),
             }
-        logger.info("[DRY-RUN] MARKET %s %s %s @ %s reduce=%s",
-                    side.value.upper(), size, symbol, price, reduce_only)
+        logger.info("[DRY-RUN] MARKET %s %s %s @ %s reduce=%s cid=%s",
+                    side.value.upper(), size, symbol, price, reduce_only,
+                    client_order_id)
         return rec
 
-    async def place_stop_order(self, symbol, side, size, stop_price, reduce_only=True):  # noqa: ANN001
+    async def place_stop_order(self, symbol, side, size, stop_price, reduce_only=True, *, client_order_id=None):  # noqa: ANN001
         oid = self._id()
-        rec = {"id": oid, "symbol": symbol, "side": side.value, "size": size,
-               "stop_price": stop_price, "reduce_only": reduce_only}
+        rec = {"id": oid,
+               "client_order_id": client_order_id,
+               "symbol": symbol, "side": side.value, "size": size,
+               "amount": size, "filled": 0.0, "remaining": size,
+               "status": "open",
+               "stop_price": stop_price, "reduce_only": reduce_only,
+               "average": 0.0, "price": 0.0}
         self.stop_orders.append(rec)
-        logger.info("[DRY-RUN] STOP-MARKET %s %s %s @ %s",
-                    side.value.upper(), size, symbol, stop_price)
+        logger.info("[DRY-RUN] STOP-MARKET %s %s %s @ %s cid=%s",
+                    side.value.upper(), size, symbol, stop_price,
+                    client_order_id)
         return rec
 
     async def cancel_order(self, order_id, symbol):  # noqa: ANN001
@@ -617,6 +632,40 @@ class DryRunExchangeAdapter:
     # Test helper: pretend the exchange-side STOP_MARKET fired.
     def simulate_close(self, symbol: str) -> None:
         self._open_positions.pop(symbol, None)
+
+    # ------------------- TICKET-004: fill-trade lookup -------------------
+    # The dry-run adapter doesn't have a real trade feed, but exposing the
+    # method (returning the empty list by default) lets ``App._on_position_close``
+    # exercise the production code path. Tests can pre-populate per-symbol
+    # via ``set_fill_trades``.
+
+    async def fetch_my_trades(
+        self, *, symbol: str, since_ms: int,
+        client_order_id: str | None = None, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        del limit
+        rows = self._my_trades.get(symbol, [])
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            if r.get("timestamp", 0) < since_ms:
+                continue
+            if client_order_id and r.get("client_order_id") not in (
+                client_order_id, None,
+            ):
+                continue
+            out.append(dict(r))
+        return out
+
+    def set_fill_trades(
+        self, symbol: str, trades: list[dict[str, Any]],
+    ) -> None:
+        """Test helper: pin a list of fill trades for ``symbol``.
+
+        Each trade is a dict with at least ``timestamp`` (ms),
+        ``price``, ``amount`` and ``side``. Optional ``client_order_id``
+        lets tests filter by parent order.
+        """
+        self._my_trades[symbol] = list(trades)
 
 
 assert isinstance(DryRunExchangeAdapter(), ExchangeAdapter), (
@@ -923,6 +972,25 @@ class App:
         mode = self._mode_label()
         logger.info("Altcoin Agent V1.0 starting (mode=%s)", mode)
 
+        # TICKET-003: LIVE/PAPER mode requires persistence. Without it
+        # an OOM kill at -5% mid-day silently re-arms the daily-DD
+        # breaker at 0%, so the next session can lose ANOTHER 6%
+        # before the breaker fires (=11% combined drawdown vs the
+        # configured 6% cap). We refuse to start if the operator
+        # disabled it for real-money modes.
+        if (
+            not self.cfg.dry_run
+            and not self.cfg.account_persistence_enabled
+        ):
+            logger.critical(
+                "Refusing to start in non-dry-run mode with "
+                "account_persistence_enabled=False. The daily-DD breaker "
+                "and consecutive-loss tracking would silently re-arm at "
+                "zero on every restart. Either set "
+                "account_persistence_enabled=True or run with --dry-run.",
+            )
+            raise SystemExit(4)
+
         if self.notifier is None:
             self.notifier = build_default_notifier()
         logger.info("Notifier: %s", self.notifier.name)
@@ -975,15 +1043,32 @@ class App:
             )
         if self._persistor is not None:
             restored = self._persistor.restore_into(account)
+            # TICKET-003: corrupt snapshot -> fail-closed boot. The
+            # persistor has already set ``account.account_state_corrupt``
+            # and ``account.halt(reason="account_state_corrupt")`` so
+            # even if the operator force-clears one, the other catches
+            # it. Refusing to start beats silently re-arming.
+            if account.account_state_corrupt:
+                logger.critical(
+                    "ACCOUNT STATE FILE IS CORRUPT (%s). Refusing to "
+                    "start. Inspect the file: if PnL state can be "
+                    "manually reconstructed, repair it; otherwise "
+                    "delete it after explicitly reconciling against "
+                    "the venue's reporting tools.",
+                    self._persistor.path,
+                )
+                raise SystemExit(5)
             if restored:
                 logger.info(
                     "AccountState restored from %s: equity=%.2f, "
-                    "today_pnl=%.2f, stops_today=%d, halted=%s",
+                    "today_pnl=%.2f, stops_today=%d, halted=%s, "
+                    "open_positions=%d",
                     self._persistor.path,
                     account.equity_usdt,
                     account.realized_pnl_today_usdt,
                     account.daily_stoploss_hits,
                     account.global_trading_halted,
+                    len(account.open_positions),
                 )
             else:
                 logger.info(
@@ -1073,6 +1158,15 @@ class App:
             poll_interval_sec=self.cfg.position_watcher_poll_sec,
             miss_threshold=self.cfg.position_watcher_miss_threshold,
         )
+
+        # TICKET-004: when the executor issues an emergency close
+        # (partial-fill cleanup, stop-replacement failure, naked-position
+        # close), it forwards a reason hint to the watcher so the
+        # subsequent close event is labelled accurately ("emergency_close_*"
+        # vs the generic default "exchange_close_detected"). The hint is
+        # consumed on first use; future close events on the same symbol
+        # fall back to the default.
+        executor.on_emergency_close = position_watcher.hint_close_reason
 
         # ----- queue + components -----
         signal_q: asyncio.Queue[SignalEvent] = asyncio.Queue(maxsize=1000)
@@ -1875,6 +1969,91 @@ class App:
             with suppress(Exception):
                 await self.notifier.error(f"executor failed for {sig.symbol}: {e}")
 
+    async def _lookup_real_fill_price(self, position: Position) -> float:
+        """TICKET-004: VWAP across reduce_only fills since the position opened.
+
+        Resolution order:
+          1. ``adapter.fetch_my_trades(symbol, since_ms=opened_at_ts_ms,
+             client_order_id=position.stop_client_order_id)`` if available.
+             We prefer the stop's cid because the *close* fills come from
+             whichever order actually closed the position (the resting
+             stop on a stop-out, or an executor-issued emergency
+             ``market_order(reduce_only=True)`` that DOES NOT carry
+             the stop's cid — see fallback below).
+          2. Same call with ``client_order_id=None`` to capture any
+             reduce_only trade since open. Filtered to side opposite the
+             position (``buy`` for SHORT close, ``sell`` for LONG close)
+             and ``reduce_only=True`` if the venue echoes that hint.
+          3. Fall back to ``position.current_stop`` and log so a missing
+             fetch_my_trades surface is visible in production.
+
+        Returns the VWAP (USDT-price). Never raises — close handling is
+        purely bookkeeping; an erroring fill-price lookup must not abort
+        the close handler.
+        """
+        adapter = self._adapter
+        if adapter is None or not hasattr(adapter, "fetch_my_trades"):
+            return position.current_stop
+        try:
+            trades = await adapter.fetch_my_trades(  # type: ignore[union-attr]
+                symbol=position.symbol,
+                since_ms=position.opened_at_ts_ms,
+                client_order_id=position.stop_client_order_id,
+                limit=100,
+            )
+            if not trades:
+                # Fallback: close may have come from an emergency market
+                # order whose cid we did not persist. Try the unfiltered
+                # call and pick reduce_only trades on the closing side.
+                trades = await adapter.fetch_my_trades(  # type: ignore[union-attr]
+                    symbol=position.symbol,
+                    since_ms=position.opened_at_ts_ms,
+                    client_order_id=None,
+                    limit=100,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "_lookup_real_fill_price(%s): fetch_my_trades failed (%s) "
+                "— falling back to current_stop",
+                position.symbol, e,
+            )
+            return position.current_stop
+        # Filter: we want the trades that REDUCED the position. For a
+        # LONG close that's side=="sell"; for a SHORT close it's
+        # side=="buy". Some venues don't echo a reduce_only flag on the
+        # trade object so we don't filter on it.
+        closing_side = "sell" if position.side == Side.LONG else "buy"
+        relevant = [
+            t for t in trades
+            if str(t.get("side") or "").lower() == closing_side
+        ]
+        if not relevant:
+            logger.info(
+                "_lookup_real_fill_price(%s): no closing-side trades found "
+                "since open; falling back to current_stop",
+                position.symbol,
+            )
+            return position.current_stop
+        total_qty = 0.0
+        total_cost = 0.0
+        for t in relevant:
+            try:
+                qty = abs(float(t.get("amount") or 0.0))
+                price = float(t.get("price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0 or price <= 0:
+                continue
+            total_qty += qty
+            total_cost += qty * price
+        if total_qty <= 0:
+            logger.info(
+                "_lookup_real_fill_price(%s): degenerate trade rows; "
+                "falling back to current_stop", position.symbol,
+            )
+            return position.current_stop
+        return total_cost / total_qty
+
     async def _on_position_close(
         self,
         *,
@@ -1918,12 +2097,18 @@ class App:
         to record it.
         """
         symbol = position.symbol
-        # Best-effort fill price: the resting stop is what the exchange
-        # most likely filled at. Live integrations can later replace this
-        # with a real fetch_my_trades lookup — for now we record the
-        # expected stop fill so the daily-DD math is *directionally*
-        # correct rather than zero (the previous behaviour).
-        fill_price = position.current_stop
+        # TICKET-004: real fill price.
+        # Pre-fix this used ``position.current_stop`` directly — that's
+        # the *expected* stop fill, which decouples ``realized_pnl_today_usdt``
+        # from what actually settled. Manual closes, liquidations, and
+        # emergency closes all reported a fake stop-equal fill.
+        # We now ask the venue for the actual fills since
+        # ``opened_at_ts_ms``, filtered to reduce_only trades for our
+        # cid where possible, and compute a size-weighted VWAP. When
+        # the adapter doesn't have ``fetch_my_trades`` (legacy mock,
+        # cold cache) we fall back to ``current_stop`` and log so the
+        # degradation is visible.
+        fill_price = await self._lookup_real_fill_price(position)
         r_unit = position.r_unit
 
         # Multi-leg PnL: use weighted-avg entry and aggregate size so a

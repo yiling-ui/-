@@ -15,19 +15,64 @@ Rolling positions:
     posture as ``open`` applies: if we cannot resize the stop, we
     EMERGENCY-CLOSE the entire position (legs are inseparable on the
     venue), set the symbol cooldown, and raise.
+
+TICKET-001 (clientOrderId idempotency):
+    Every market entry and every STOP_MARKET carries a venue-side
+    ``clientOrderId`` that we generate locally and persist on
+    ``Position.client_order_id`` / ``Position.stop_client_order_id``.
+    Network retries inside ``CCXTExchangeAdapter`` reuse the same cid
+    so a duplicate-create attempt is rejected by the venue (or returns
+    the original order). The adapter additionally calls
+    ``fetch_order(client_order_id=...)`` between retries to short-circuit
+    "did the previous request actually land?" — see ``risk/retry.py``.
+
+TICKET-002 (partial-fill detection on the real path):
+    The adapter's ``_normalize_order`` now exposes ``amount`` /
+    ``filled`` / ``remaining`` / ``status`` so the
+    ``min_fill_ratio`` check actually runs against venue truth on
+    every code path (legacy mocks that returned a flat dict are still
+    accepted via the ``decision.size`` fallback).
+
+TICKET-005 (retry classification):
+    Lives in the adapter; the executor sees clean success / clean
+    failure. The executor's own per-call retry loop is therefore
+    GONE — keeping it would double-retry transient errors and make
+    the wall-clock budget unbounded.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from dataclasses import dataclass
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from altcoin_agent.risk.gate import RiskDecision
 from altcoin_agent.risk.state import AccountState, Position, PositionLeg, Side
 
 logger = logging.getLogger(__name__)
+
+
+# TICKET-001: cid generator. Format: ``alt`` + 23 hex chars = 26 chars
+# total. Starts with a letter (Binance + OKX requirement), uses only
+# alphanumerics (Gate.io's ``text`` field allows ``_-.`` too but we
+# don't need them and it keeps the cid uniformly safe across venues).
+_CID_PREFIX = "alt"
+_CID_HEX_LEN = 23
+
+
+def _new_client_order_id(prefix: str = _CID_PREFIX) -> str:
+    return f"{prefix}{uuid.uuid4().hex[:_CID_HEX_LEN]}"
+
+
+# TICKET-004: the executor signals close hints to the position-watcher
+# so the close handler can later attribute the close to the right
+# bucket (stop_filled / liquidation / manual_close / emergency_close).
+# Default reason "exchange_close_detected" stays in place for the
+# common "STOP_MARKET filled, watcher noticed it" path so existing
+# tests / callers don't need to change.
+EmergencyCloseHint = Callable[[str, str], None]
 
 
 class ExecutionError(RuntimeError):
@@ -46,6 +91,7 @@ class ExchangeAdapter(Protocol):
         *,
         price: float | None = None,
         reduce_only: bool = False,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def place_stop_order(
@@ -55,6 +101,8 @@ class ExchangeAdapter(Protocol):
         size: float,
         stop_price: float,
         reduce_only: bool = True,
+        *,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
@@ -68,18 +116,33 @@ class ExchangeAdapter(Protocol):
 
 @dataclass
 class CCXTExecutor:
-    """ccxt-backed executor (works with any adapter satisfying the protocol)."""
+    """ccxt-backed executor (works with any adapter satisfying the protocol).
+
+    Args:
+        adapter: a ccxt-style adapter. Retry policy lives there
+            (TICKET-005); the executor sees clean success / failure.
+        exchange_name: the venue label persisted on ``Position.exchange``.
+        place_stop_retries: deprecated; kept for back-compat with tests
+            that pass it. Real retry is in the adapter now. Default 0.
+        stop_failure_cooldown_sec: seconds the symbol stays in cooldown
+            after a stop-placement failure or partial-fill emergency-close.
+        min_fill_ratio: TICKET-002. Lower bound on (filled / requested)
+            below which we treat the entry as failed and emergency-close
+            whatever did fill. 0.95 tolerates normal lot-size truncation.
+        on_emergency_close: TICKET-004 hook. Called as
+            ``on_emergency_close(symbol, reason)`` after an executor-side
+            emergency close so the PositionWatcher can attribute the
+            subsequent disappear-from-exchange event correctly. Optional.
+    """
 
     adapter: ExchangeAdapter
     exchange_name: str = "binance"
-    place_stop_retries: int = 2
+    place_stop_retries: int = 0       # legacy; retry is in the adapter now
     stop_failure_cooldown_sec: int = 4 * 3600
-    # Audit #16: minimum acceptable fill ratio. Below this we treat
-    # the entry as a failed market order and emergency-close whatever
-    # did fill. 0.95 is conservative enough to tolerate normal
-    # rounding/lot-size truncation but tight enough to catch a real
-    # IOC partial fill on a thin book.
     min_fill_ratio: float = 0.95
+    on_emergency_close: EmergencyCloseHint | None = field(default=None)
+
+    # ------------------- public API ------------------- #
 
     async def open(
         self,
@@ -97,7 +160,14 @@ class CCXTExecutor:
         if decision.initial_stop is None:
             raise ExecutionError("decision missing initial_stop")
 
-        # 1) leverage
+        # TICKET-001: cid we'll thread through both the entry market
+        # order and the resting stop. Different cids for the two
+        # orders so the adapter's idempotency probe can disambiguate.
+        entry_cid = _new_client_order_id()
+        stop_cid = _new_client_order_id()
+
+        # 1) leverage — adapter handles retries; transient errors come
+        # back as exceptions only after the policy has given up.
         await self.adapter.set_leverage(symbol, decision.leverage)
 
         # 2) market entry
@@ -107,38 +177,37 @@ class CCXTExecutor:
             size=decision.size,
             price=current_price,
             reduce_only=False,
+            client_order_id=entry_cid,
         )
         avg_price = float(
             entry_resp.get("average") or entry_resp.get("price") or current_price
         )
 
-        # Audit #16: partial-fill detection. ccxt returns ``filled`` on
-        # most venues; when the venue (or our adapter) does not, fall
-        # back to the order's ``amount`` so legacy adapters preserve
-        # current behaviour. A fill below ``min_fill_ratio`` of the
-        # requested size is treated as a failure: we emergency-close
-        # whatever did fill (using the actually-filled qty as the
-        # reduce_only size), set a cooldown, and raise. This keeps
-        # the position book honest in altcoin scenarios where the
-        # IOC market order can wipe one level and stop.
-        try:
-            filled_raw = entry_resp.get("filled")
-            if filled_raw is None:
-                # Fall back to the response's "amount" (full original
-                # size when missing -> ratio == 1.0).
-                filled_raw = entry_resp.get("amount", decision.size)
-            filled = abs(float(filled_raw))
-        except (TypeError, ValueError):
-            filled = float(decision.size)
+        # TICKET-002: status + fill ratio -- two independent gates.
+        # Status check first because a "canceled" / "rejected" entry has
+        # an unambiguous answer (zero fill, no recovery needed). The
+        # ratio check is the second line: status is silent on some
+        # venues (it's "" until the order is moved out of the book) so
+        # we still need fill_ratio for the partial-on-thin-book case.
+        status = (entry_resp.get("status") or "").lower()
+        if status in ("canceled", "rejected", "expired"):
+            logger.critical(
+                "Entry %s status=%s on %s — order did not land; aborting open",
+                entry_cid, status, symbol,
+            )
+            account.set_cooldown(
+                symbol, self.stop_failure_cooldown_sec, _now_ms(),
+            )
+            raise ExecutionError(f"entry_not_filled:{status}")
 
-        fill_ratio = (
-            filled / decision.size if decision.size > 0 else 0.0
-        )
+        filled = self._extract_filled_qty(entry_resp, decision.size)
+        fill_ratio = filled / decision.size if decision.size > 0 else 0.0
+
         if fill_ratio < self.min_fill_ratio:
             logger.critical(
-                "Partial fill on %s: requested=%.6f filled=%.6f "
+                "Partial fill on %s (cid=%s): requested=%.6f filled=%.6f "
                 "ratio=%.4f < %.4f — emergency closing the partial leg",
-                symbol, decision.size, filled, fill_ratio,
+                symbol, entry_cid, decision.size, filled, fill_ratio,
                 self.min_fill_ratio,
             )
             if filled > 0:
@@ -149,14 +218,16 @@ class CCXTExecutor:
                         size=filled,
                         price=current_price,
                         reduce_only=True,
+                        client_order_id=_new_client_order_id(),
                     )
                 except Exception as e:
                     logger.critical(
                         "EMERGENCY CLOSE of partial fill failed for %s: %s "
                         "— manual intervention required", symbol, e,
                     )
+            self._emit_close_hint(symbol, "emergency_close_partial_fill")
             account.set_cooldown(
-                symbol, self.stop_failure_cooldown_sec, now_ms_default(),
+                symbol, self.stop_failure_cooldown_sec, _now_ms(),
             )
             raise ExecutionError(
                 f"partial_fill_below_threshold:{fill_ratio:.4f}",
@@ -169,35 +240,27 @@ class CCXTExecutor:
         # or rejected outright (Bybit/Gate) at trigger time. Worse, the local
         # ``Position.size`` would lie about the true exposure, throwing off
         # PnL math, leverage cap re-checks, and add_leg's stop resize.
-        # Pin actual_size to the venue truth and use it everywhere downstream.
         actual_size = filled if filled > 0 else float(decision.size)
 
-        # 3) hard stop on the exchange — RETRY then fail-closed close.
+        # 3) hard stop on the exchange. Adapter handles transient retries.
+        # We read the resp's cid back rather than blindly trusting our
+        # generated value — some venues echo a transformed cid (gate.io
+        # may strip its "t-" prefix on the way back) and we want to
+        # persist the canonical form for later fetch_order lookups.
         stop_side = decision.side.opposite
-        stop_resp: dict[str, Any] | None = None
-        last_err: Exception | None = None
-        for attempt in range(self.place_stop_retries + 1):
-            try:
-                stop_resp = await self.adapter.place_stop_order(
-                    symbol=symbol,
-                    side=stop_side,
-                    size=actual_size,
-                    stop_price=decision.initial_stop,
-                    reduce_only=True,
-                )
-                break
-            except Exception as e:
-                last_err = e
-                logger.warning(
-                    "stop placement attempt %d failed: %s", attempt + 1, e,
-                )
-                await asyncio.sleep(0.5 * (2 ** attempt))
-
-        if stop_resp is None:
-            # CRITICAL: we have an open exposure with no hard stop.
+        try:
+            stop_resp = await self.adapter.place_stop_order(
+                symbol=symbol,
+                side=stop_side,
+                size=actual_size,
+                stop_price=decision.initial_stop,
+                reduce_only=True,
+                client_order_id=stop_cid,
+            )
+        except Exception as e:
             logger.critical(
-                "STOP placement failed for %s after %d attempts (%s) — closing",
-                symbol, self.place_stop_retries + 1, last_err,
+                "STOP placement failed for %s after retry budget (%s) — emergency-closing",
+                symbol, e,
             )
             try:
                 await self.adapter.market_order(
@@ -206,17 +269,20 @@ class CCXTExecutor:
                     size=actual_size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=_new_client_order_id(),
                 )
-            except Exception as e:
+            except Exception as e2:
                 logger.critical(
                     "EMERGENCY CLOSE also failed for %s: %s — manual intervention required",
-                    symbol, e,
+                    symbol, e2,
                 )
-            account.set_cooldown(symbol, self.stop_failure_cooldown_sec, now_ms_default())
-            raise ExecutionError(f"stop_placement_failed:{last_err}")
+            self._emit_close_hint(symbol, "emergency_close_stop_failed")
+            account.set_cooldown(symbol, self.stop_failure_cooldown_sec, _now_ms())
+            raise ExecutionError(f"stop_placement_failed:{e}")
 
         # 4) record the position — using actual_size so the local book
-        # reflects venue truth.
+        # reflects venue truth; cid persisted so fetch_order can find
+        # the stop on a later restart / tighten chain.
         pos = Position(
             symbol=symbol,
             exchange=self.exchange_name,
@@ -227,16 +293,19 @@ class CCXTExecutor:
             initial_stop=decision.initial_stop,
             current_stop=decision.initial_stop,
             stop_order_id=str(stop_resp.get("id") or ""),
+            client_order_id=str(
+                entry_resp.get("client_order_id") or entry_cid
+            ),
+            stop_client_order_id=str(
+                stop_resp.get("client_order_id") or stop_cid
+            ),
             trace_id=trace_id,
         )
         # Rolling-positions bookkeeping: leg 0 is the original entry.
-        # Subsequent ``add_leg`` calls append; trailing/sizing always
-        # reads from ``legs`` when present (``total_size`` /
-        # ``avg_entry_price`` fall back to the legacy fields when
-        # ``legs`` is empty, so existing code paths remain identical).
         pos.legs.append(PositionLeg(
             leg_id=0, side=decision.side, size=actual_size,
             entry_price=avg_price, margin_source="initial",
+            client_order_id=pos.client_order_id,
         ))
         account.open_positions[symbol] = pos
         return pos
@@ -267,10 +336,6 @@ class CCXTExecutor:
         and ``position.size`` (the legacy field) is updated to the new
         ``total_size`` so downstream code that hasn't been migrated to
         the legs API still sees the right aggregate.
-
-        Raises ``ExecutionError`` on any unrecoverable failure. The
-        caller is expected to log + notify; the position has already
-        been emergency-closed in that case.
         """
         if position.closed:
             raise ExecutionError("add_leg called on closed position")
@@ -280,6 +345,7 @@ class CCXTExecutor:
             raise ExecutionError("add_leg requires account for cooldown")
 
         old_size = position.total_size
+        leg_cid = _new_client_order_id()
 
         # 1) market order on the SAME side as the existing position.
         entry_resp = await self.adapter.market_order(
@@ -288,36 +354,31 @@ class CCXTExecutor:
             size=size,
             price=current_price,
             reduce_only=False,
+            client_order_id=leg_cid,
         )
         avg_price = float(
             entry_resp.get("average") or entry_resp.get("price") or current_price
         )
 
-        # Audit (third pass) #3: pin actual_leg_size to venue truth.
-        # ``add_leg`` historically used the requested ``size``; if the
-        # IOC market order partially filled (common in thin altcoin
-        # books) the legacy code resized the venue-side stop to cover
-        # phantom contracts, eventually triggering reduce_only rejections
-        # and an emergency-close of the entire (winning) position. We
-        # now read the real ``filled`` and propagate it everywhere
-        # downstream (PositionLeg.size, position.size, stop_resize size).
-        try:
-            filled_raw = entry_resp.get("filled")
-            if filled_raw is None:
-                filled_raw = entry_resp.get("amount", size)
-            filled = abs(float(filled_raw))
-        except (TypeError, ValueError):
-            filled = float(size)
+        # TICKET-002 status guard.
+        leg_status = (entry_resp.get("status") or "").lower()
+        if leg_status in ("canceled", "rejected", "expired"):
+            logger.critical(
+                "add_leg %s on %s status=%s — leg did not land",
+                leg_cid, position.symbol, leg_status,
+            )
+            account.set_cooldown(
+                position.symbol, self.stop_failure_cooldown_sec, _now_ms(),
+            )
+            raise ExecutionError(f"add_leg_not_filled:{leg_status}")
+
+        filled = self._extract_filled_qty(entry_resp, size)
         actual_leg_size = filled if filled > 0 else float(size)
         if actual_leg_size < size * self.min_fill_ratio:
-            # Severe partial fill on the leg — same fail-closed posture
-            # as ``open``: close just the partial leg and bail. The
-            # caller (RollingController) will see the ExecutionError
-            # and may auto-disable rolling.
             logger.critical(
-                "add_leg partial fill on %s: requested=%.6f filled=%.6f "
-                "ratio=%.4f — closing partial leg only",
-                position.symbol, size, actual_leg_size,
+                "add_leg partial fill on %s (cid=%s): requested=%.6f "
+                "filled=%.6f ratio=%.4f — closing partial leg only",
+                position.symbol, leg_cid, size, actual_leg_size,
                 actual_leg_size / max(size, 1e-9),
             )
             try:
@@ -327,6 +388,7 @@ class CCXTExecutor:
                     size=actual_leg_size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=_new_client_order_id(),
                 )
             except Exception as e:
                 logger.critical(
@@ -335,18 +397,12 @@ class CCXTExecutor:
                     position.symbol, e,
                 )
             account.set_cooldown(
-                position.symbol, self.stop_failure_cooldown_sec, now_ms_default(),
+                position.symbol, self.stop_failure_cooldown_sec, _now_ms(),
             )
             raise ExecutionError(
                 f"add_leg_partial_fill:{actual_leg_size / max(size, 1e-9):.4f}",
             )
 
-        # 2) Replace the resting stop so it covers the new aggregate size.
-        # We piggyback on tighten_hard_stop's cancel+place+restore-on-failure
-        # semantics, but pass through the EXISTING current_stop unless the
-        # caller asked for a different one. The new stop's size (which the
-        # venue actually cares about) is read from ``position.size``, so
-        # we update that BEFORE the call.
         next_leg_id = (max((L.leg_id for L in position.legs), default=-1) + 1)
         leg = PositionLeg(
             leg_id=next_leg_id,
@@ -355,10 +411,11 @@ class CCXTExecutor:
             entry_price=avg_price,
             margin_source="rolled_unrealized",
             trigger_score=trigger_score,
+            client_order_id=str(
+                entry_resp.get("client_order_id") or leg_cid
+            ),
         )
         position.legs.append(leg)
-        # Keep the legacy ``size`` field in sync. The trailing FSM and
-        # stop-placement code path read ``position.size`` directly.
         position.size = old_size + actual_leg_size
 
         target_stop = (
@@ -368,10 +425,6 @@ class CCXTExecutor:
         )
         ok = await self.tighten_hard_stop(position, target_stop)
         if not ok:
-            # CRITICAL: a leg is in but stop is now smaller than total
-            # exposure (or completely missing). Single venue-side stop
-            # cannot protect a partial position; emergency-close the
-            # whole thing.
             logger.critical(
                 "add_leg: stop resize FAILED for %s — emergency-closing all "
                 "%d legs (total_size=%.6f)",
@@ -384,6 +437,7 @@ class CCXTExecutor:
                     size=position.size,
                     price=current_price,
                     reduce_only=True,
+                    client_order_id=_new_client_order_id(),
                 )
             except Exception as e:
                 logger.critical(
@@ -391,8 +445,11 @@ class CCXTExecutor:
                     "manual intervention required",
                     position.symbol, e,
                 )
+            self._emit_close_hint(
+                position.symbol, "emergency_close_add_leg_stop_resize_failed",
+            )
             account.set_cooldown(
-                position.symbol, self.stop_failure_cooldown_sec, now_ms_default(),
+                position.symbol, self.stop_failure_cooldown_sec, _now_ms(),
             )
             position.closed = True
             raise ExecutionError(
@@ -413,13 +470,22 @@ class CCXTExecutor:
         old_id = position.stop_order_id
         old_stop = position.current_stop
         stop_side = position.side.opposite
+        new_stop_cid = _new_client_order_id()
 
+        # The cancel is best-effort; the adapter has its own retry
+        # budget for transient errors. A genuine fatal (the stop was
+        # already filled, or the venue rejected the cancel) will
+        # surface here and we still try to place the new one because
+        # the resting stop being absent is a much worse failure mode
+        # than a duplicate.
         try:
             if old_id:
                 await self.adapter.cancel_order(old_id, position.symbol)
         except Exception as e:
-            logger.warning("cancel of old stop %s failed: %s — trying replace anyway",
-                           old_id, e)
+            logger.warning(
+                "cancel of old stop %s failed: %s — trying replace anyway",
+                old_id, e,
+            )
 
         try:
             new_resp = await self.adapter.place_stop_order(
@@ -428,14 +494,21 @@ class CCXTExecutor:
                 size=position.size,
                 stop_price=new_stop,
                 reduce_only=True,
+                client_order_id=new_stop_cid,
             )
             position.current_stop = new_stop
             position.stop_order_id = str(new_resp.get("id") or "")
+            position.stop_client_order_id = str(
+                new_resp.get("client_order_id") or new_stop_cid
+            )
             return True
         except Exception as e:
-            logger.error("replace stop failed for %s @ %s: %s",
-                         position.symbol, new_stop, e)
+            logger.error(
+                "replace stop failed for %s @ %s: %s",
+                position.symbol, new_stop, e,
+            )
             # Try to restore the old stop so the position isn't naked.
+            restore_cid = _new_client_order_id()
             try:
                 restored = await self.adapter.place_stop_order(
                     symbol=position.symbol,
@@ -443,10 +516,16 @@ class CCXTExecutor:
                     size=position.size,
                     stop_price=old_stop,
                     reduce_only=True,
+                    client_order_id=restore_cid,
                 )
                 position.stop_order_id = str(restored.get("id") or "")
-                logger.warning("restored old stop @ %s on %s after replace failure",
-                               old_stop, position.symbol)
+                position.stop_client_order_id = str(
+                    restored.get("client_order_id") or restore_cid
+                )
+                logger.warning(
+                    "restored old stop @ %s on %s after replace failure",
+                    old_stop, position.symbol,
+                )
                 return False
             except Exception as e2:
                 logger.critical(
@@ -454,9 +533,59 @@ class CCXTExecutor:
                     position.symbol, e2,
                 )
                 position.stop_order_id = None
+                position.stop_client_order_id = None
                 return False
 
+    # ------------------- internals ------------------- #
 
-def now_ms_default() -> int:
+    @staticmethod
+    def _extract_filled_qty(resp: dict[str, Any], requested: float) -> float:
+        """Read the filled quantity from a normalised response.
+
+        Preference: ``filled`` (the post-TICKET-002 canonical key) ->
+        ``amount`` (legacy key from older mocks) -> ``requested`` (our
+        intent, used as a last-resort safety net for adapters that
+        echo neither).
+        """
+        for key in ("filled", "amount"):
+            v = resp.get(key)
+            if v is None:
+                continue
+            try:
+                f = abs(float(v))
+            except (TypeError, ValueError):
+                continue
+            # NaN / inf guard
+            if f != f or f in (float("inf"), float("-inf")):
+                continue
+            return f
+        return float(requested)
+
+    def _emit_close_hint(self, symbol: str, reason: str) -> None:
+        """Forward a close-reason hint to the PositionWatcher.
+
+        TICKET-004: this is how the close handler later reports
+        ``reason="emergency_close_*"`` instead of the generic default.
+        Hooks are best-effort; an exception inside the hint sink must
+        never escalate into a failed emergency close.
+        """
+        if self.on_emergency_close is None:
+            return
+        try:
+            self.on_emergency_close(symbol, reason)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "on_emergency_close hook raised for %s/%s: %s",
+                symbol, reason, e,
+            )
+
+
+def _now_ms() -> int:
     import time
     return int(time.time() * 1000)
+
+
+# Back-compat alias retained for any external callers that imported
+# the legacy spelling.
+def now_ms_default() -> int:
+    return _now_ms()

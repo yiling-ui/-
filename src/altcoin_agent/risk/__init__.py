@@ -58,6 +58,7 @@ from altcoin_agent.risk.persistence import AccountPersistor
 from altcoin_agent.risk.position_watcher import CloseCallback, PositionWatcher
 from altcoin_agent.risk.reconciler import Reconciler, ReconcilerReport
 from altcoin_agent.risk.regime_filter import RegimeFilter, RegimeFilterConfig
+from altcoin_agent.risk.retry import RetryPolicy
 from altcoin_agent.risk.rolling import (
     RollDecision,
     RollingConfig,
@@ -90,6 +91,7 @@ __all__ = [
     "ReconcilerReport",
     "RegimeFilter",
     "RegimeFilterConfig",
+    "RetryPolicy",
     "RiskDecision",
     "RiskGate",
     "RiskGateConfig",
