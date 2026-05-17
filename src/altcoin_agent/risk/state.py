@@ -31,6 +31,14 @@ class PositionLeg:
       * ``margin_source`` is "initial" for leg 0 and "rolled_unrealized"
         for additions.
       * ``size`` is in base units, exactly like ``Position.size``.
+
+    TICKET-001/015: ``client_order_id`` is the venue-side cid of the
+    market order that opened this leg. Persisted alongside the leg so
+    a restart can call ``adapter.fetch_order(client_order_id=...)`` to
+    detect leg-level fills that landed mid-restart, and so the
+    learning loop can join legs to their actual fills via
+    ``fetch_my_trades``. ``None`` is permitted for legacy positions
+    rebuilt without a cid.
     """
 
     leg_id: int
@@ -40,6 +48,7 @@ class PositionLeg:
     entry_ts_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     margin_source: str = "initial"   # "initial" | "rolled_unrealized"
     trigger_score: float | None = None  # FusedSignal.final_score at time of roll
+    client_order_id: str | None = None  # TICKET-001 / 015
 
 
 @dataclass
@@ -62,6 +71,16 @@ class Position:
     initial_stop: float               # the stop set at entry — never changes
     current_stop: float               # the stop currently resting on the exchange
     stop_order_id: str | None = None  # exchange-side hard-stop id, must always exist
+    # TICKET-001 / 015: idempotency keys we control. The market entry
+    # carries ``client_order_id``; the resting STOP_MARKET carries
+    # ``stop_client_order_id``. Both are persisted so a restart in the
+    # middle of a tighten/replace chain can call
+    # ``adapter.fetch_order(client_order_id=...)`` to detect fills
+    # without re-issuing the order. ``None`` permitted for legacy
+    # positions rebuilt by a Reconciler that didn't see the cid (e.g.
+    # manual user trades).
+    client_order_id: str | None = None
+    stop_client_order_id: str | None = None
     opened_at_ts_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     trace_id: str | None = None
     closed: bool = False
@@ -136,6 +155,12 @@ class AccountState:
     reconciliation_complete: bool = False
     global_trading_halted: bool = False
     halt_reason: str | None = None
+    # TICKET-003: sticky flag set by ``AccountPersistor.restore_into``
+    # when the on-disk snapshot is corrupt. ``main.App.run`` aborts
+    # boot when this is True so a half-flushed snapshot can't be
+    # silently re-zeroed (and the daily-DD circuit breaker re-armed at
+    # 0/$equity instead of 6%/$equity).
+    account_state_corrupt: bool = False
     # Bug #3 fix: ISO date string ("YYYY-MM-DD", UTC) of the last day we
     # rolled over. ``None`` means "never rolled over" — the next call to
     # ``maybe_roll_over_day`` will simply stamp today without resetting
