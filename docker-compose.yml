@@ -3,6 +3,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Optional mirror overrides for restricted networks. Set via env or .env:
+        #   APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+        #   PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+        #   PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+        APT_MIRROR: "${APT_MIRROR:-}"
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-}"
+        PIP_TRUSTED_HOST: "${PIP_TRUSTED_HOST:-}"
     image: altcoin-agent:v1.0
     container_name: altcoin-agent
     restart: always
