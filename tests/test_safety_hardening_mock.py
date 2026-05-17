@@ -318,13 +318,15 @@ class _PartialFillAdapter:
         self.calls: list[dict] = []
 
     async def market_order(self, symbol, side, size, *, price=None,
-                           reduce_only=False):  # noqa: ANN001
+                           reduce_only=False, client_order_id=None):  # noqa: ANN001
         self.calls.append({
             "symbol": symbol, "side": side.value, "size": size,
             "price": price, "reduce_only": reduce_only,
+            "client_order_id": client_order_id,
         })
         return {
             "id": f"o-{len(self.calls)}",
+            "client_order_id": client_order_id,
             "symbol": symbol, "average": price or 1.0, "price": price or 1.0,
             "filled": size * self.fill_ratio,
             "amount": size,
@@ -802,12 +804,14 @@ class _NakedTightenAdapter:
         self.market_orders: list[dict] = []
 
     async def market_order(self, symbol, side, size, *, price=None,
-                           reduce_only=False):  # noqa: ANN001
+                           reduce_only=False, client_order_id=None):  # noqa: ANN001
         self.market_orders.append({
             "symbol": symbol, "side": side.value, "size": size,
             "price": price, "reduce_only": reduce_only,
+            "client_order_id": client_order_id,
         })
-        return {"id": "x", "average": price or 0.0}
+        return {"id": "x", "average": price or 0.0,
+                "amount": size, "filled": size, "status": "closed"}
 
     async def place_stop_order(self, *a, **kw):  # noqa: ANN001
         return {"id": "stop"}

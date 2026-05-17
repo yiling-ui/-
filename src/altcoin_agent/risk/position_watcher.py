@@ -55,12 +55,24 @@ class PositionWatcher:
         account: AccountState whose open_positions we monitor.
         on_close: coroutine invoked once per detected close, with the
             Position object that was just closed plus a short reason
-            string (``"exchange_close_detected"`` today).
+            string. The default reason is ``"exchange_close_detected"``;
+            when the executor signals an in-flight emergency close via
+            :meth:`hint_close_reason`, that hint wins for the next
+            close event on that symbol.
         poll_interval_sec: how often to poll. Default 5s; reduce in tests.
         miss_threshold: consecutive misses required before declaring a
             position closed. Default 2 — at the default poll interval that
             is a 10s debounce, comfortably longer than typical exchange
             propagation lag.
+
+    TICKET-004 close-reason routing:
+        ``hint_close_reason(symbol, reason)`` is called by the executor
+        the moment it issues an emergency close (partial fill cleanup,
+        stop-replacement failure, naked-position close, etc.). The
+        next close event on that symbol will report the hinted reason
+        instead of the generic default. The dict is single-use:
+        consuming the hint pops it. Hints not consumed within the
+        watcher's lifetime are simply ignored.
     """
 
     adapter: ExchangeAdapter
@@ -69,6 +81,22 @@ class PositionWatcher:
     poll_interval_sec: float = 5.0
     miss_threshold: int = 2
     _miss_counts: dict[str, int] = field(default_factory=dict)
+    # TICKET-004: short-lived hints from the executor.
+    close_reason_hints: dict[str, str] = field(default_factory=dict)
+
+    def hint_close_reason(self, symbol: str, reason: str) -> None:
+        """Tell the watcher how to label the *next* close on ``symbol``.
+
+        Called by the executor right after it issues an emergency
+        ``market_order(reduce_only=True)``. The watcher will see the
+        position vanish from ``fetch_positions`` shortly after and
+        invoke ``on_close`` with the hinted reason. Calling this twice
+        before the close fires keeps the most recent hint (operator
+        intent: "the latest reason is the one that matters").
+        """
+        if not symbol or not reason:
+            return
+        self.close_reason_hints[symbol] = reason
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Main loop. Returns when ``stop_event`` is set."""
@@ -141,8 +169,14 @@ class PositionWatcher:
             self.account.open_positions.pop(symbol, None)
             position.closed = True
             closed.append(position)
+            # TICKET-004: prefer an executor-supplied hint when present.
+            # ``pop`` so the same hint can't be reused on a future
+            # re-entry of the same symbol.
+            reason = self.close_reason_hints.pop(
+                symbol, "exchange_close_detected",
+            )
             try:
-                await self.on_close(position, "exchange_close_detected")
+                await self.on_close(position, reason)
             except Exception as e:
                 logger.exception(
                     "on_close handler failed for %s: %s",
