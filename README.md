@@ -164,6 +164,46 @@ See [`.kiro/steering/trading_logic.md`](.kiro/steering/trading_logic.md):
 * **SR-4 bot-spam / sybil defense** — LLM is instructed to detect
   coordinated homogeneous shilling and cap confidence accordingly.
 
+## LLM verdict is advisory, not gating (TICKET-014)
+
+The fuser's high-priority gate fires on the **rule score alone**. When
+`rule_score >= high_priority_threshold` (default 85) the `FusedSignal`
+is dispatched and the executor places the order on the next loop tick;
+the daemon does **not** wait for the LLM to weigh in.
+
+Reasoning: typical altcoin pump bursts move 5%+ inside 500ms, well
+inside any realistic LLM round-trip. Waiting for the LLM would forfeit
+the winning entry. An LLM verdict that arrives **after** the order has
+landed cannot retract the trade — its only effects are:
+
+* the trailing FSM continues to manage the position via the
+  exchange-side `STOP_MARKET`, capping the worst case;
+* the next signal on the same symbol sees the LLM-modulated
+  `final_score` (so a strongly-disagreeing post-arrival verdict
+  damps the *next* high-priority promotion);
+* the close-event-driven post-mortem learning loop persists the
+  feature combination's hit/miss so future occurrences score lower.
+
+Operational consequence: do not interpret a "REJECTED by LLM" log line
+that appears after an `OPENED` line as a missed bug. It's the
+documented behaviour. If you need rules-AND-LLM-must-agree semantics,
+that is a separate `StrictFuser` build and explicitly out of scope for
+V1.0.
+
+## Operational health metrics (TICKET-016)
+
+The dashboard's `/api/state` and the Prometheus `/metrics` endpoint
+both expose a small set of leading-indicator gauges so an on-call
+operator can triage in seconds:
+
+| Metric | Leading indicator for |
+|---|---|
+| `persistor_save_failures` | Persistence layer is dropping writes (daily-DD breaker may not survive a restart) |
+| `position_watcher_lag_sec` | Phantom positions (close not detected) |
+| `llm_degraded_count` | LLM provider outage / budget exhaustion |
+| `emergency_close_count` | Venue / network instability driving forced closes |
+| `stop_replace_failure_count` | Trailing tighten misses (precedes naked-position emergency closes) |
+
 ## Module map
 
 | File | Responsibility |

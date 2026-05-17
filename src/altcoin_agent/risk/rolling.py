@@ -215,6 +215,16 @@ class RollingController:
     notify_roll: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     notify_error: Callable[[str, dict[str, Any] | None], Awaitable[None]] | None = None
 
+    # TICKET-007: optional safety-module providers. When the App wires
+    # them (production), the same anti-chase / vol-kill / regime /
+    # cluster gates that protect entries also protect rolling adds.
+    # When None (legacy tests / dry-run), evaluate_rolling falls
+    # through them as no-ops, so existing behaviour is unchanged.
+    price_tape: Any | None = None
+    regime_filter: Any | None = None
+    cluster_map: Any | None = None
+    cluster_cap_cfg: Any | None = None
+
     _fired_levels: dict[str, set[float]] = field(default_factory=dict)
     """symbol -> R levels that already triggered for the CURRENT position
     on that symbol. Cleared by ``reset_for_symbol`` on close."""
@@ -388,6 +398,11 @@ class RollingController:
             realized_vol_pct=realized_vol_pct,
             trigger_price=mark,
             now_ms=now_ms,
+            # TICKET-007: forward the same safety modules entry uses.
+            price_tape=self.price_tape,
+            regime_filter=self.regime_filter,
+            cluster_map=self.cluster_map,
+            cluster_cap_cfg=self.cluster_cap_cfg,
         )
         if not gate_decision.approved:
             return RollDecision(

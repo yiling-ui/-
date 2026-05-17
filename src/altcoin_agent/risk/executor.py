@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -278,7 +278,7 @@ class CCXTExecutor:
                 )
             self._emit_close_hint(symbol, "emergency_close_stop_failed")
             account.set_cooldown(symbol, self.stop_failure_cooldown_sec, _now_ms())
-            raise ExecutionError(f"stop_placement_failed:{e}")
+            raise ExecutionError(f"stop_placement_failed:{e}") from e
 
         # 4) record the position — using actual_size so the local book
         # reflects venue truth; cid persisted so fetch_order can find
