@@ -53,7 +53,7 @@ from altcoin_agent.ai_engine import (
     SocialPost,
 )
 from altcoin_agent.fuser import ScoreFuser
-from altcoin_agent.learning_engine import RuleStore, run_post_mortem
+from altcoin_agent.learning_engine import EventResult, RuleStore, run_post_mortem
 from altcoin_agent.screener import (
     FundingSnapshot,
     OISnapshot,
@@ -364,8 +364,22 @@ class LLMConsultor:
 
 @dataclass
 class DelayedPostMortemScheduler:
-    """Schedules a learning_engine post-mortem ``delay_sec`` after a
-    position opens. Tracks tasks so they can be cancelled on shutdown.
+    """Drives the learning_engine post-mortem.
+
+    Two entry points, in order of preference:
+
+    * :meth:`record` — **production path**. Fires the post-mortem
+      IMMEDIATELY when a real position closes, with the realised PnL,
+      realised R, fill price, and close reason supplied by the trading
+      loop. ``dynamic_rules.json`` updates are anchored to what the
+      trade actually did, not to synthesised market data.
+
+    * :meth:`schedule` — **legacy / replay path**. Sleeps ``delay_sec``
+      and then runs a market-slice post-mortem. Kept for the offline
+      backtest harness and the existing time-based tests; **must not be
+      used from the live trading loop** because it decouples the
+      learning event from the real close (and therefore from the real
+      realised PnL). Production callers must use :meth:`record` instead.
 
     All exceptions inside the post-mortem are swallowed — the learning
     loop is best-effort and must never poison the trading loop.
@@ -375,6 +389,109 @@ class DelayedPostMortemScheduler:
     engine: DeepSeekEngine | None = None
     delay_sec: int = 3600
     _tasks: set[asyncio.Task] = field(default_factory=set)
+
+    # ----- production path (close-event-driven) ----- #
+
+    def record(
+        self,
+        *,
+        symbol: str,
+        entry_ts_ms: int,
+        close_ts_ms: int,
+        side: str,
+        entry_price: float,
+        fill_price: float,
+        realized_pnl_usdt: float,
+        realized_r: float,
+        close_reason: str,
+    ) -> asyncio.Task:
+        """Audit-fix Req #4: file a real post-mortem off a real close.
+
+        The realised direction is derived from the side the trader took
+        (``"pump"`` for LONG, ``"dump"`` for SHORT) and the realised
+        magnitude is the actual fractional PnL of the trade. We hand
+        ``run_post_mortem`` an explicit ``EventResult`` so it skips the
+        synthetic OKX-slice computation and attributes hits/misses to
+        what we actually realised on the venue.
+
+        Returns an asyncio.Task so callers can ``await`` it in tests.
+        Failures are logged and swallowed.
+        """
+        # Map trader's intended side -> learning-engine direction.
+        expected_direction = "pump" if side.lower() == "long" else "dump"
+        # Magnitude expressed as a signed fraction of entry price, to
+        # match the existing EventResult contract (fractional move).
+        if entry_price > 0:
+            if expected_direction == "pump":
+                magnitude_pct = (fill_price - entry_price) / entry_price
+            else:
+                magnitude_pct = (entry_price - fill_price) / entry_price
+        else:
+            magnitude_pct = 0.0
+        minutes_held = max(0, (close_ts_ms - entry_ts_ms) // 60_000)
+        realized_result = EventResult(
+            direction=expected_direction,  # type: ignore[arg-type]
+            magnitude_pct=magnitude_pct,
+            minutes_to_extremum=minutes_held,
+            realized_at_ts_ms=close_ts_ms,
+        )
+
+        task = asyncio.create_task(
+            self._run_now(
+                symbol=symbol,
+                entry_ts_ms=entry_ts_ms,
+                close_ts_ms=close_ts_ms,
+                expected_direction=expected_direction,
+                realized_result=realized_result,
+                realized_pnl_usdt=realized_pnl_usdt,
+                realized_r=realized_r,
+                close_reason=close_reason,
+            ),
+            name=f"post_mortem_record:{symbol}:{close_ts_ms}",
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def _run_now(
+        self,
+        *,
+        symbol: str,
+        entry_ts_ms: int,
+        close_ts_ms: int,
+        expected_direction: str,
+        realized_result: EventResult,
+        realized_pnl_usdt: float,
+        realized_r: float,
+        close_reason: str,
+    ) -> None:
+        try:
+            kwargs: dict[str, Any] = {
+                "symbol": symbol,
+                "target_ts_ms": close_ts_ms,
+                "store": self.store,
+                "engine": self.engine,
+                "entry_ts_ms": entry_ts_ms,
+                "expected_direction": expected_direction,
+                "realized_result": realized_result,
+            }
+            report = await run_post_mortem(**kwargs)
+            logger.info(
+                "post-mortem RECORDED for %s: pnl_usdt=%.4f R=%.2f "
+                "reason=%s dir=%s mag=%.4f picks=%s",
+                symbol, realized_pnl_usdt, realized_r, close_reason,
+                report.result.direction, report.result.magnitude_pct,
+                [(p.feature_name, p.bucket) for p in report.picks],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "post-mortem record failed for %s (reason=%s): %s",
+                symbol, close_reason, e,
+            )
+
+    # ----- legacy / replay path (time-based) ----- #
 
     def schedule(
         self,
@@ -386,12 +503,11 @@ class DelayedPostMortemScheduler:
     ) -> asyncio.Task:
         """Schedule a delayed post-mortem.
 
-        Bug #2 fix: the live post-mortem path now passes ``entry_ts_ms``
-        (the moment we actually opened the position) and
-        ``expected_direction`` ("pump" for LONG / "dump" for SHORT) so
-        ``run_post_mortem`` slices ``[entry - 4h, entry + 1h]``, evaluates
-        the move strictly post-entry, and files the rule update under the
-        trader's intended direction even when the trade lost.
+        DEPRECATED for production use. Kept for the offline backtest
+        harness and the existing time-based tests. The realised result is
+        synthesised from market data (not the actual trade), so this path
+        MUST NOT be wired into the live trading loop. Use :meth:`record`
+        from ``_on_position_close`` instead.
         """
         task = asyncio.create_task(
             self._run(

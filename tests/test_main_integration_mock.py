@@ -515,3 +515,135 @@ async def test_bug3_rollover_worker_runs_periodically() -> None:
         # runs in production.
         names = {t.get_name() for t in app._tasks}
         assert "daily_rollover_worker" in names
+
+
+
+# --------------------------------------------------------------------- #
+# Audit-fix Req #4 invariant
+# --------------------------------------------------------------------- #
+#
+# The self-evolution learning loop must be CLOSE-event driven:
+#   * opening a position must NOT touch the RuleStore (no fixed-time
+#     post-mortem scheduled at open),
+#   * a real exchange-side close (detected via PositionWatcher) MUST
+#     trigger ``DelayedPostMortemScheduler.record(...)`` with the
+#     realised PnL / fill price so ``dynamic_rules.json`` reflects what
+#     the trade actually did.
+#
+# These tests pin both halves of that contract end-to-end.
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_open_does_not_record_post_mortem_close_does() -> None:
+    """End-to-end invariant: open a position, assert nothing has been
+    recorded yet (no fixed-time timer was scheduled at open), then drive
+    the watcher-detected close and assert the post-mortem fired with a
+    realised PnL anchored to ``position.opened_at_ts_ms`` and the
+    closing fill price."""
+    cfg = AppConfig(
+        healthz_port=18099, dry_run=True, graceful_timeout_sec=2.0,
+        initial_equity_usdt=10_000.0, min_liquidity_usdt=100_000.0,
+        position_watcher_poll_sec=0.05,
+        position_watcher_miss_threshold=1,
+    )
+    async with _running_app(cfg) as app:
+        adapter = app._adapter
+        assert isinstance(adapter, DryRunExchangeAdapter)
+        adapter.set_mark_price("RAVEUSDT", 1.0)
+
+        # Stub the post-mortem with a recorder so we can observe what
+        # was passed to ``record()``. The real DelayedPostMortemScheduler
+        # would call into ``run_post_mortem`` -> OKX REST; we don't want
+        # network traffic in this test.
+        recorded_calls: list[dict] = []
+
+        class _StubPostMortem:
+            def record(self, **kwargs):
+                recorded_calls.append(kwargs)
+                # Match the real return type so the caller can ``await`` if it wants.
+                async def _noop():
+                    return None
+                return asyncio.create_task(_noop())
+
+        app._post_mortem = _StubPostMortem()  # type: ignore[assignment]
+
+        sig = FusedSignal(
+            symbol="RAVEUSDT", exchange="binance", ts=1,
+            direction=Direction.LONG, rule_score=90.0, llm_score=92.0,
+            final_score=95.0, is_high_priority=True, blocked=False,
+            block_reason=None, trigger_price=1.0,
+        )
+        from altcoin_agent.main import TrailingController
+        from altcoin_agent.risk import (
+            ATRCalculator,
+            CCXTExecutor,
+            PositionSizer,
+            PositionWatcher,
+            RiskGate,
+            RiskGateConfig,
+            TrailingStopFSM,
+        )
+        from altcoin_agent.risk.state import AccountState
+
+        sizer = PositionSizer()
+        gate = RiskGate(sizer, RiskGateConfig(min_liquidity_usdt=100_000.0))
+        executor = CCXTExecutor(adapter=adapter)
+        account = AccountState(
+            equity_usdt=10_000.0, starting_equity_today_usdt=10_000.0,
+        )
+        account.reconciliation_complete = True
+        trailing = TrailingController(
+            fsm=TrailingStopFSM(), atr=ATRCalculator(),
+            executor=executor, account=account, health=app.state,
+        )
+
+        # ---- OPEN ----
+        await app._handle_high_priority(
+            sig=sig, gate=gate, executor=executor,
+            trailing=trailing, account=account,
+        )
+        position = account.position("RAVEUSDT")
+        assert position is not None
+        # Invariant #1: opening did NOT record any post-mortem.
+        assert recorded_calls == [], (
+            "open handler must not record a post-mortem; the learning "
+            "loop is close-event driven"
+        )
+        # Counter must remain at 0 after open.
+        assert app.state.post_mortems_recorded == 0
+
+        # ---- exchange-side close (STOP_MARKET fired) ----
+        adapter.simulate_close("RAVEUSDT")
+
+        async def _close_cb(p, reason):
+            await app._on_position_close(
+                position=p, reason=reason,
+                trailing=trailing, account=account,
+            )
+        watcher = PositionWatcher(
+            adapter=adapter, account=account, on_close=_close_cb,
+            poll_interval_sec=0.01, miss_threshold=1,
+        )
+        await watcher.poll_once()
+
+        # ---- CLOSE: invariant #2 — post-mortem recorded WITH realised PnL ----
+        assert len(recorded_calls) == 1, (
+            "close handler must record exactly one post-mortem with the "
+            "realised trade outcome"
+        )
+        call = recorded_calls[0]
+        assert call["symbol"] == "RAVEUSDT"
+        assert call["side"].lower() == "long"
+        assert call["entry_ts_ms"] == position.opened_at_ts_ms
+        assert call["close_ts_ms"] >= position.opened_at_ts_ms
+        # Stopped out -> negative PnL must propagate to the learning loop.
+        assert call["realized_pnl_usdt"] < 0
+        assert call["realized_r"] <= 0
+        # Fill price must be the resting stop (the close price the
+        # exchange reported); the entry price must be the avg entry.
+        assert call["entry_price"] == pytest.approx(position.avg_entry_price)
+        assert call["fill_price"] == pytest.approx(position.current_stop)
+        assert call["close_reason"] == "exchange_close_detected"
+        # Counter incremented exactly once.
+        assert app.state.post_mortems_recorded == 1
