@@ -42,6 +42,94 @@ from typing import Any, Protocol
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------- #
+# Rate limiter — token bucket
+# --------------------------------------------------------------------- #
+
+
+@dataclass
+class RateLimiter:
+    """Token-bucket rate limiter for ccxt downloads.
+
+    Binance Futures REST publishes a 1200-weight-per-minute window;
+    ``fetch_ohlcv`` weighs 1, so 20 req/s leaves a comfortable margin.
+    Rather than hard-code the venue limit we expose ``max_rate`` and
+    ``capacity`` so the CLI can tune them per exchange.
+
+    Implementation is the canonical token bucket: each ``acquire``
+    refills tokens proportional to elapsed time, blocks (via the
+    injected ``sleep_fn``) until at least one token is available, then
+    decrements. The ``time_fn`` / ``sleep_fn`` injection points keep
+    the limiter trivially testable without monkey-patching the time
+    module.
+    """
+
+    max_rate: float = 10.0          # tokens per second
+    capacity: float = 20.0          # max tokens stored (burst budget)
+    _tokens: float = field(default=0.0)
+    _last_refill_ts: float = field(default=0.0)
+    time_fn: Any = field(default=time.time, repr=False)
+    sleep_fn: Any = field(default=time.sleep, repr=False)
+
+    def __post_init__(self) -> None:
+        # Start full so the first ``capacity`` calls aren't throttled.
+        self._tokens = float(self.capacity)
+        self._last_refill_ts = float(self.time_fn())
+
+    def acquire(self, tokens: float = 1.0) -> float:
+        """Block until ``tokens`` are available, then consume them.
+
+        Returns the seconds slept (0.0 if no wait was needed). Useful
+        for tests + observability metrics.
+        """
+        if tokens <= 0:
+            return 0.0
+        if tokens > self.capacity:
+            # Asking for more than the bucket can hold; clamp to
+            # ``capacity`` so we don't sleep forever on a misuse.
+            tokens = self.capacity
+
+        # Tiny epsilon to absorb fp drift on long-running clocks.
+        # Without it, callers that drive the limiter via a high-magnitude
+        # wall clock (``time.time()`` ~ 1.7e9) accumulate ~1e-7 of
+        # arithmetic error per refill, which can leave ``_tokens`` at
+        # 0.99999... forever and spin the loop. 1e-9 is well below any
+        # rate the limiter is meant to enforce in practice.
+        EPS = 1e-9
+        slept_total = 0.0
+        for _ in range(64):  # bounded so a misconfigured clock can't wedge us
+            self._refill()
+            if self._tokens + EPS >= tokens:
+                self._tokens = max(0.0, self._tokens - tokens)
+                return slept_total
+            # Sleep just long enough to earn the missing tokens.
+            deficit = tokens - self._tokens
+            wait = deficit / self.max_rate if self.max_rate > 0 else 0.0
+            if wait <= 0:
+                # max_rate <= 0 -> limiter disabled; pretend tokens
+                # are infinite. This is the "no throttle" knob.
+                self._tokens = max(self._tokens, tokens)
+                continue
+            self.sleep_fn(wait)
+            slept_total += wait
+        # Fallback: 64 iterations couldn't satisfy the request -- almost
+        # certainly a misconfigured ``time_fn``/``sleep_fn`` pair.
+        # Consume whatever's there and return; better to under-throttle
+        # than to spin forever.
+        self._tokens = max(0.0, self._tokens - tokens)
+        return slept_total
+
+    def _refill(self) -> None:
+        now = float(self.time_fn())
+        elapsed = max(0.0, now - self._last_refill_ts)
+        self._last_refill_ts = now
+        if self.max_rate <= 0:
+            return
+        self._tokens = min(
+            self.capacity, self._tokens + elapsed * self.max_rate,
+        )
+
+
 # Timeframe -> ms per bar. Used to chunk fetch_ohlcv (Binance returns
 # at most 1500 bars per call).
 TIMEFRAME_MS: dict[str, int] = {
@@ -103,6 +191,11 @@ class HistoricalDataLoader:
     inter_call_sleep_sec: float = 0.25
     chunk_limit: int = DEFAULT_LIMIT
     sleep_fn: Any = field(default=time.sleep, repr=False)
+    # Optional token-bucket limiter. When set, ``acquire(1)`` runs
+    # before every fetch_ohlcv call; this is the canonical knob the
+    # ``fetch_history`` CLI uses to stay under exchange rate caps
+    # without hand-tuning ``inter_call_sleep_sec``.
+    rate_limiter: RateLimiter | None = None
 
     # ---- public API ---- #
 
@@ -225,6 +318,8 @@ class HistoricalDataLoader:
         bars: list[list[float]] = []
         cursor = start_ms
         while cursor < end_ms:
+            if self.rate_limiter is not None:
+                self.rate_limiter.acquire(1.0)
             try:
                 chunk = self.fetcher.fetch_ohlcv(
                     symbol, timeframe, cursor, self.chunk_limit
@@ -344,5 +439,6 @@ __all__ = [
     "DEFAULT_LIMIT",
     "HistoricalDataLoader",
     "KlineFetcher",
+    "RateLimiter",
     "TIMEFRAME_MS",
 ]
