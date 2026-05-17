@@ -133,8 +133,16 @@ class AppConfig:
     llm_queue_max: int = 256
     # Online post-mortem (self-evolution)
     post_mortem_delay_sec: int = 3600     # 1h after open
-    # Position-watcher (close lifecycle)
-    position_watcher_poll_sec: float = 5.0
+    # Position-watcher (close lifecycle).
+    # TICKET-008: previously defaulted to 5.0s × miss_threshold=2 = 10s
+    # before a close was confirmed. With the unified RetryPolicy
+    # (TICKET-005) the executor's reduce_only emergency close now
+    # also kicks the watcher synchronously (see
+    # ``TrailingController._emergency_close_naked``), so the poll
+    # cadence drives only the *passive* path. 1.5s × 2 = 3s
+    # debounce, comfortably above ccxt's typical fetch_positions
+    # latency on a healthy network.
+    position_watcher_poll_sec: float = 1.5
     position_watcher_miss_threshold: int = 2
     # Bug #3 fix: trading-day rollover.
     # ``rollover_anchor_utc_hour`` (0-23) defines when one trading day
@@ -275,7 +283,7 @@ class AppConfig:
             llm_queue_max=int(d.get("llm_queue_max", 256)),
             post_mortem_delay_sec=int(d.get("post_mortem_delay_sec", 3600)),
             position_watcher_poll_sec=float(
-                d.get("position_watcher_poll_sec", 5.0),
+                d.get("position_watcher_poll_sec", 1.5),
             ),
             position_watcher_miss_threshold=int(
                 d.get("position_watcher_miss_threshold", 2),
@@ -402,10 +410,59 @@ class HealthState:
     llm_consults_skipped: int = 0
     post_mortems_recorded: int = 0
     last_error: str | None = None
+    # TICKET-016 — operational health counters surfaced on
+    # ``/healthz`` (JSON), ``/metrics`` (Prometheus text), and the
+    # dashboard's ``/api/state``. Each is a leading indicator for a
+    # specific outage class so an on-call operator can triage in
+    # seconds:
+    #   * ``persistor_save_failures``: persistence layer is dropping
+    #     writes — the daily-DD breaker may not survive a restart.
+    #     Surfaced from ``AccountPersistor.consecutive_save_failures``
+    #     by ``_sync_persistor_health`` after every save site.
+    #   * ``position_watcher_lag_sec``: time since last successful
+    #     ``fetch_positions``. Spikes here precede phantom positions.
+    #     Read live in ``healthz``/``metrics`` from
+    #     ``PositionWatcher.last_poll_wall_ts``.
+    #   * ``llm_degraded_count``: number of LLM consult outcomes
+    #     that returned a synthetic neutral verdict (timeout, parse
+    #     error, budget exhaustion, total-budget deadline). Bumped
+    #     by ``LLMEngine.judge``'s degradation path.
+    #   * ``emergency_close_count``: rate of executor / trailing
+    #     emergency closes. A sustained climb usually means a
+    #     specific venue is unhappy.
+    #   * ``stop_replace_failure_count``: per-tighten failures on
+    #     the trailing path — a leading indicator for
+    #     ``emergency_close_count``.
+    persistor_save_failures: int = 0
+    position_watcher_lag_sec: float = 0.0
+    llm_degraded_count: int = 0
+    emergency_close_count: int = 0
+    stop_replace_failure_count: int = 0
 
 
-async def make_health_app(state: HealthState) -> web.Application:
+async def make_health_app(
+    state: HealthState,
+    *,
+    refresh_metrics: Callable[[], None] | None = None,
+) -> web.Application:
+    """Build the /healthz + /metrics aiohttp app.
+
+    ``refresh_metrics`` is an optional zero-arg sync hook the App wires
+    to refresh dynamic gauges (TICKET-016: persistor save failures,
+    position-watcher lag) right before each scrape. The hook MUST
+    not raise — failures are caught here so a bad refresh hook
+    cannot 500 the probe.
+    """
+    async def _refresh_safe() -> None:
+        if refresh_metrics is None:
+            return
+        try:
+            refresh_metrics()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("healthz refresh hook failed: %s", e)
+
     async def healthz(_request: web.Request) -> web.Response:
+        await _refresh_safe()
         ok = (
             state.fuser_alive
             and state.screener_alive
@@ -429,6 +486,14 @@ async def make_health_app(state: HealthState) -> web.Application:
             "post_mortems_recorded": state.post_mortems_recorded,
             "last_signal_ts": state.last_signal_ts,
             "last_error": state.last_error,
+            # TICKET-016 health metrics.
+            "persistor_save_failures": state.persistor_save_failures,
+            "position_watcher_lag_sec": round(
+                state.position_watcher_lag_sec, 2,
+            ),
+            "llm_degraded_count": state.llm_degraded_count,
+            "emergency_close_count": state.emergency_close_count,
+            "stop_replace_failure_count": state.stop_replace_failure_count,
         }
         return web.json_response(body, status=200 if ok else 503)
 
@@ -439,6 +504,7 @@ async def make_health_app(state: HealthState) -> web.Application:
         # All metrics are gauges (counters that only increase are also
         # valid gauges); no labels for V1 simplicity. Follow-up PR can
         # add per-symbol labels once the cardinality budget is set.
+        await _refresh_safe()
         lines: list[str] = []
 
         def gauge(name: str, value: float, help_text: str) -> None:
@@ -482,6 +548,17 @@ async def make_health_app(state: HealthState) -> web.Application:
               "Total post-mortem learning passes recorded after a real close")
         gauge("last_signal_ts", state.last_signal_ts,
               "Wall-clock ts of most-recent screener event")
+        # TICKET-016 — operational health.
+        gauge("persistor_save_failures", state.persistor_save_failures,
+              "Consecutive AccountPersistor.save failures (0 == healthy)")
+        gauge("position_watcher_lag_sec", state.position_watcher_lag_sec,
+              "Seconds since last successful PositionWatcher poll")
+        gauge("llm_degraded_count", state.llm_degraded_count,
+              "Total LLM consults that returned a degraded neutral verdict")
+        gauge("emergency_close_count", state.emergency_close_count,
+              "Total executor / trailing emergency closes")
+        gauge("stop_replace_failure_count", state.stop_replace_failure_count,
+              "Total trailing tighten_hard_stop failures")
         return web.Response(
             text="\n".join(lines) + "\n",
             content_type="text/plain",
@@ -718,6 +795,16 @@ def _build_live_adapter(cfg: AppConfig) -> CCXTExchangeAdapter | None:
 class _Tracked:
     position: Position
     state: TrailingState = TrailingState.INIT
+    # TICKET-009: when a tighten/restore chain fully fails the
+    # position is naked. Rather than emergency-close on the very
+    # next bar (which conflates "transient venue 502" with "really
+    # naked"), we record the wall-clock timestamp the position went
+    # naked. Subsequent kline ticks first try to recover by calling
+    # ``tighten_hard_stop`` again (which will retry the place via
+    # the adapter's RetryPolicy); only after ``naked_grace_sec``
+    # have elapsed without a successful re-attach do we
+    # emergency-close. ``None`` == not naked.
+    naked_since_ts_ms: int | None = None
 
 
 @dataclass
@@ -755,6 +842,22 @@ class TrailingController:
     rolling_depth_provider: Callable[[str], Awaitable[float]] | None = None
     rolling_vol_provider: Callable[[str], Awaitable[float | None]] | None = None
     rolling_dry_run_fallback_vol_pct: float = 0.04
+    # TICKET-009: degrade-then-emergency-close window. When the
+    # tighten chain fully fails (replace AND restore) we mark the
+    # position naked and keep retrying via the FSM tick. Only after
+    # this many seconds without a successful re-attach do we
+    # emergency-close. Default 30s = roughly 30 bars at 1m, long
+    # enough to ride out a transient 502 / DDoS protection burst
+    # but short enough to clamp on a real outage.
+    naked_grace_sec: float = 30.0
+    # TICKET-008: PositionWatcher we kick after every reduce_only
+    # close so the close handler runs RIGHT NOW instead of waiting
+    # up to ``poll_interval_sec``.
+    position_watcher: PositionWatcher | None = None
+    # TICKET-016: counter the dashboard exposes so operators can
+    # see the rate of naked-position emergency closes at a glance
+    # (the rate of stop_replace_failure_count is a leading
+    # indicator for venue/health issues).
     _by_symbol: dict[str, _Tracked] = field(default_factory=dict)
 
     def attach(self, position: Position) -> None:
@@ -762,6 +865,57 @@ class TrailingController:
 
     def detach(self, symbol: str) -> None:
         self._by_symbol.pop(symbol, None)
+
+    async def _emergency_close_naked(
+        self, *, tracked: _Tracked, bar: Kline,
+    ) -> None:
+        """TICKET-009 helper: emergency-close a position whose stop is
+        confirmed-gone (``stop_order_id is None``) and whose grace
+        window has elapsed.
+
+        Steps mirror what the previous in-line block did: market
+        reduce_only, mark the position closed, free the concurrency
+        slot, engage the symbol cooldown, kick the watcher so its
+        close callback runs immediately, and bump the dashboard
+        counters. Failures inside the close are logged but do not
+        propagate (we already concluded the position must close;
+        raising would leave the daemon spinning on a stale entry).
+        """
+        symbol = tracked.position.symbol
+        self.health.last_error = (
+            f"trailing naked emergency-close {symbol}"
+        )
+        try:
+            await self.executor.adapter.market_order(
+                symbol=symbol,
+                side=tracked.position.side.opposite,
+                size=tracked.position.total_size,
+                price=bar.close,
+                reduce_only=True,
+            )
+            tracked.position.closed = True
+            tracked.naked_since_ts_ms = None
+            self.account.open_positions.pop(symbol, None)
+            self.account.set_cooldown(
+                symbol,
+                self.executor.stop_failure_cooldown_sec,
+                int(bar.ts),
+            )
+            # TICKET-016 metric.
+            self.health.emergency_close_count += 1
+            # TICKET-008: nudge the watcher so the close handler
+            # fires THIS poll instead of next interval.
+            if self.position_watcher is not None:
+                self.position_watcher.hint_close_reason(
+                    symbol, "emergency_close_trailing_naked",
+                )
+                self.position_watcher.kick()
+        except Exception as e:
+            logger.critical(
+                "EMERGENCY CLOSE on naked trailing failed "
+                "for %s: %s — manual intervention required",
+                symbol, e,
+            )
 
     async def on_kline(self, exchange: str, symbol: str, bar: Kline) -> None:
         atr = self.atr.update(exchange, symbol, bar)
@@ -780,62 +934,63 @@ class TrailingController:
             if ok:
                 logger.info("trailing %s: %s -> stop %s (atr=%.5f)",
                             symbol, reason, new_stop, atr)
+                # TICKET-009: a successful tighten clears any prior
+                # naked state — we have a stop on the book again.
+                tracked.naked_since_ts_ms = None
             else:
-                # Audit #15: tighten failed. The executor's
-                # ``tighten_hard_stop`` returns False in two materially
-                # different cases:
+                # Audit #15 / TICKET-009: tighten failed. Two cases:
                 #   (a) replace failed but the OLD stop is back on the
-                #       book — the position is still protected, just at
-                #       a wider stop than the FSM wanted. We log a
-                #       warning and continue.
+                #       book — the position is still protected, just
+                #       at a wider stop than the FSM wanted. We log a
+                #       warning, clear any prior naked state (the
+                #       position is no longer naked), and continue.
                 #   (b) replace failed AND the restore failed. The
                 #       position is **naked** (no resting stop) and
-                #       ``stop_order_id`` is None. SR-2 fail-closed
-                #       posture demands we close it now rather than
-                #       wait for the next bar; we emergency-close at
-                #       market and let the position-watcher fire the
-                #       close callback on its next poll.
+                #       ``stop_order_id`` is None.
+                #
+                # Pre-TICKET-009 the case-(b) handler emergency-closed
+                # immediately on every bar. With the unified
+                # RetryPolicy now wrapping every adapter call
+                # (TICKET-005), a single 502 already gets multiple
+                # retries inside the adapter — so the executor's False
+                # is now a much rarer signal that something is really
+                # wrong. But it is STILL not "guaranteed wrong":
+                # the operator wants us to give the network one more
+                # chance. We therefore degrade gracefully:
+                #   * record ``naked_since_ts_ms`` on first detection;
+                #   * keep ticking the FSM, which will keep calling
+                #     ``tighten_hard_stop`` (which the adapter's
+                #     policy handles); on success we clear the flag.
+                #   * Only after ``naked_grace_sec`` SECONDS have
+                #     elapsed without recovery do we emergency-close.
                 if tracked.position.stop_order_id is None:
-                    logger.critical(
-                        "trailing %s: tighten FAILED and restore FAILED "
-                        "— position is NAKED, emergency-closing now",
-                        symbol,
-                    )
-                    self.health.last_error = (
-                        f"trailing naked emergency-close {symbol}"
-                    )
-                    try:
-                        await self.executor.adapter.market_order(
-                            symbol=symbol,
-                            side=tracked.position.side.opposite,
-                            size=tracked.position.total_size,
-                            price=bar.close,
-                            reduce_only=True,
+                    self.health.stop_replace_failure_count += 1
+                    if tracked.naked_since_ts_ms is None:
+                        tracked.naked_since_ts_ms = int(bar.ts)
+                        logger.error(
+                            "trailing %s: tighten FAILED and restore "
+                            "FAILED — position is NAKED at ts=%s; "
+                            "grace window=%.1fs before emergency-close",
+                            symbol, bar.ts, self.naked_grace_sec,
                         )
-                        tracked.position.closed = True
-                        # Audit (third pass) #10: free up the concurrency
-                        # slot and engage the same 4h cooldown the
-                        # executor uses on stop-failure paths. Without
-                        # this, the symbol would still occupy a slot in
-                        # ``account.open_positions`` for up to
-                        # ``position_watcher_poll_sec`` (default 5s) —
-                        # long enough for a fresh high-priority signal
-                        # on the same symbol to be allowed in.
-                        # ``_on_position_close`` will see the entry was
-                        # already removed and just runs its bookkeeping.
-                        self.account.open_positions.pop(symbol, None)
-                        self.account.set_cooldown(
-                            symbol,
-                            self.executor.stop_failure_cooldown_sec,
-                            int(bar.ts),
+                        self.health.last_error = (
+                            f"trailing naked grace {symbol}"
                         )
-                    except Exception as e:
+                    elapsed_sec = (
+                        int(bar.ts) - tracked.naked_since_ts_ms
+                    ) / 1000.0
+                    if elapsed_sec >= self.naked_grace_sec:
                         logger.critical(
-                            "EMERGENCY CLOSE on naked trailing failed "
-                            "for %s: %s — manual intervention required",
-                            symbol, e,
+                            "trailing %s: NAKED grace expired "
+                            "(%.1fs >= %.1fs) — emergency-closing now",
+                            symbol, elapsed_sec, self.naked_grace_sec,
+                        )
+                        await self._emergency_close_naked(
+                            tracked=tracked, bar=bar,
                         )
                 else:
+                    # Case (a): old stop is still on the book.
+                    tracked.naked_since_ts_ms = None
                     logger.warning(
                         "trailing %s: tighten FAILED (%s); old stop "
                         "restored, position still protected",
@@ -844,6 +999,7 @@ class TrailingController:
                     self.health.last_error = (
                         f"trailing tighten restored on {symbol}"
                     )
+                    self.health.stop_replace_failure_count += 1
 
         # Rolling-positions evaluation. We run it AFTER the trailing tick
         # so that whatever the FSM just did to the stop is the baseline
@@ -1158,6 +1314,11 @@ class App:
             poll_interval_sec=self.cfg.position_watcher_poll_sec,
             miss_threshold=self.cfg.position_watcher_miss_threshold,
         )
+        # TICKET-008: let the trailing controller kick the watcher
+        # the moment it issues a reduce_only close, so the close
+        # callback fires on the very next poll instead of waiting up
+        # to ``poll_interval_sec``.
+        trailing.position_watcher = position_watcher
 
         # TICKET-004: when the executor issues an emergency close
         # (partial-fill cleanup, stop-replacement failure, naked-position
@@ -1332,6 +1493,15 @@ class App:
                 quote_provider=_rolling_quote,
                 notify_roll=_notify_roll,
                 notify_error=_notify_roll_error,
+                # TICKET-007: same safety modules ``_handle_high_priority``
+                # forwards to ``gate.evaluate``. Each is None when the
+                # operator opted out via cfg.* flags, in which case
+                # ``evaluate_rolling`` no-ops the corresponding gate —
+                # identical fail-open semantics to the entry path.
+                price_tape=self._price_tape,
+                regime_filter=self._regime_filter,
+                cluster_map=self._cluster_map,
+                cluster_cap_cfg=self._cluster_cap_cfg,
             )
             trailing.rolling = self._rolling
             # Audit (third pass) #2: wire the same live depth + vol
@@ -1432,7 +1602,31 @@ class App:
         # non-loopback address without a token. Operators that need
         # remote access SSH-tunnel to 127.0.0.1:8081 or set a token in
         # their .env file.
-        health_app = await make_health_app(self.state)
+
+        # TICKET-016 metric refresh: pulled at scrape time so the
+        # ``/healthz`` and ``/metrics`` snapshots reflect the live
+        # state of the persistor and the watcher. The hook never
+        # touches the trading bus and is best-effort (failures are
+        # caught inside ``make_health_app``).
+        def _refresh_health_metrics() -> None:
+            if self._persistor is not None:
+                self.state.persistor_save_failures = (
+                    self._persistor.consecutive_save_failures
+                )
+            pw = position_watcher
+            if pw is not None and pw.last_poll_wall_ts > 0:
+                self.state.position_watcher_lag_sec = max(
+                    0.0, time.time() - pw.last_poll_wall_ts,
+                )
+            # TICKET-011/016: surface engine-level degradation count.
+            if self._llm_engine is not None:
+                self.state.llm_degraded_count = (
+                    self._llm_engine.degraded_count
+                )
+
+        health_app = await make_health_app(
+            self.state, refresh_metrics=_refresh_health_metrics,
+        )
         self._runner = web.AppRunner(health_app)
         await self._runner.setup()
         health_site = web.TCPSite(
@@ -2167,6 +2361,14 @@ class App:
         self.state.closed_positions += 1
         self.state.last_close_ts = time.time()
         self.state.open_positions = len(account.open_positions)
+        # TICKET-016: count emergency closes so the dashboard surfaces
+        # the rate. ``reason`` is the string the watcher reported,
+        # which is either the executor's hinted ``emergency_close_*``
+        # bucket (TICKET-004) or the generic ``exchange_close_detected``
+        # for the common stop-out path. Anything starting with
+        # ``emergency_close_`` is operator-actionable.
+        if isinstance(reason, str) and reason.startswith("emergency_close_"):
+            self.state.emergency_close_count += 1
 
         legs_info = (
             f" legs={len(position.legs)}"
@@ -2217,6 +2419,13 @@ class App:
                     realized_pnl_usdt=realized_pnl_usdt,
                     realized_r=realized_r,
                     close_reason=reason,
+                    # TICKET-010: feed the position's leverage so
+                    # ``magnitude_pct`` reflects realised R, not raw
+                    # price delta. Without this a 5x trade that gained
+                    # 1.5% on price (= 7.5% on equity) was being
+                    # bucketed as ``pos_small`` alongside a 1.5%
+                    # unleveraged blip.
+                    leverage=position.leverage,
                 )
                 self.state.post_mortems_recorded += 1
 

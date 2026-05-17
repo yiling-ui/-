@@ -21,6 +21,7 @@ SHORT side has a tighter cap (default 10x) than LONG (default 15x).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from altcoin_agent.risk.state import Side
@@ -60,12 +61,41 @@ class PositionSizer:
         side_cap = (
             cfg.max_leverage_long if side == Side.LONG else cfg.max_leverage_short
         )
+        # TICKET-012: NaN / inf defence on realized_vol_pct.
+        # The price-tape Parkinson estimator is well-behaved on any
+        # tape with at least two ticks, but a stale / corrupt feed
+        # could feed us NaN (0/0 mid). Without this guard the entire
+        # ``vol_adj`` term collapses to NaN and the returned leverage
+        # is NaN, which the gate then quietly clamps to side_cap —
+        # the worst possible outcome (max leverage on a broken
+        # vol estimate).
+        if (
+            realized_vol_pct is None
+            or not math.isfinite(float(realized_vol_pct))
+            or realized_vol_pct <= 0
+        ):
+            realized_vol_pct = cfg.target_vol_pct
+        # TICKET-012: same guard for top5_depth_usdt and fused_score.
+        # Liquidity / score that come back as NaN should not silently
+        # short-circuit ``liq_adj`` / ``conf_norm`` to ``min(1.0, NaN)``
+        # = NaN -> fall through to side_cap.
+        if (
+            top5_depth_usdt is None
+            or not math.isfinite(float(top5_depth_usdt))
+            or top5_depth_usdt < 0
+        ):
+            top5_depth_usdt = 0.0
+        if not math.isfinite(float(fused_score)):
+            fused_score = 0.0
         anchor = cfg.score_anchor
         conf_norm = max(0.0, min(1.0, (fused_score - anchor) / max(100.0 - anchor, 1e-9)))
         vol_adj = min(1.0, cfg.target_vol_pct / max(realized_vol_pct, 1e-4))
         liq_adj = min(1.0, top5_depth_usdt / max(cfg.liq_full_depth_usdt, 1.0))
         spread = side_cap - cfg.min_leverage
         leverage = cfg.min_leverage + spread * conf_norm * vol_adj * liq_adj
+        # Final NaN guard — defence-in-depth.
+        if not math.isfinite(leverage):
+            leverage = cfg.min_leverage
         return float(max(cfg.min_leverage, min(side_cap, leverage)))
 
     # ----------------------------- sizing ----------------------------- #
