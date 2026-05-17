@@ -1329,15 +1329,6 @@ class App:
         # fall back to the default.
         executor.on_emergency_close = position_watcher.hint_close_reason
 
-        # TICKET-004: when the executor issues an emergency close
-        # (partial-fill cleanup, stop-replacement failure, naked-position
-        # close), it forwards a reason hint to the watcher so the
-        # subsequent close event is labelled accurately ("emergency_close_*"
-        # vs the generic default "exchange_close_detected"). The hint is
-        # consumed on first use; future close events on the same symbol
-        # fall back to the default.
-        executor.on_emergency_close = position_watcher.hint_close_reason
-
         # ----- queue + components -----
         signal_q: asyncio.Queue[SignalEvent] = asyncio.Queue(maxsize=1000)
         kline_q: asyncio.Queue[tuple[str, str, Kline]] = asyncio.Queue(maxsize=1000)
