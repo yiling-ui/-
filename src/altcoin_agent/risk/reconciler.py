@@ -1,148 +1,194 @@
-"""
-reconciler.py — startup state alignment (SR-2).
+"""reconciler.py — startup state alignment (SR-2).
 
-The very first action of the executor's lifecycle is to compare the
-exchange's view of positions/orders to our local state and surface
-inconsistencies. Until the reconciler reports success, the gate refuses
-all new entries.
+On daemon startup we cannot trust local in-memory state. We:
+  1. Pull all open positions from the exchange.
+  2. For positions we DO know about locally, verify the size/side and warn on diff.
+  3. For ORPHAN positions (on the exchange but not in our state), refuse to
+     close them automatically (they may be manual user trades) BUT we DO
+     attempt to attach a protective stop if one is missing -- 'orphan with
+     no stop' is the single most dangerous state.
 
-Behaviour:
-    - Pull positions from every exchange.
-    - Diff vs `account.open_positions`.
-    - Anything on the exchange but not local -> ORPHAN.
-        Default action: place a breakeven stop on the exchange and emit
-        a human-actionable alert. The orphan is NOT auto-closed.
-    - Cancel any open orders that have no local record.
-
-The exchange interaction is encapsulated behind a small Protocol so the
-real implementation (ccxt) and tests (in-memory fake) share the same code.
+If reconciliation fails for any reason we keep ``account.reconciliation_complete``
+as False; the gate then refuses ALL orders. This is fail-closed by design.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING
 
-from altcoin_agent.risk.state import AccountState, Side
+from altcoin_agent.risk.state import AccountState
+
+if TYPE_CHECKING:
+    from altcoin_agent.risk.executor import ExchangeAdapter
 
 logger = logging.getLogger(__name__)
-
-
-class ExchangeReconcileAdapter(Protocol):
-    async def fetch_positions(self) -> list[dict[str, Any]]: ...
-    async def fetch_open_orders(self) -> list[dict[str, Any]]: ...
-    async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
-    async def place_stop_order(
-        self, symbol: str, side: Side, size: float, stop_price: float, reduce_only: bool = True,
-    ) -> dict[str, Any]: ...
-
-
-@dataclass
-class OrphanPosition:
-    exchange: str
-    symbol: str
-    side: Side
-    size_contracts: float
-    entry_price: float
-    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class ReconcilerReport:
     success: bool
-    orphans: list[OrphanPosition] = field(default_factory=list)
-    cancelled_orders: list[str] = field(default_factory=list)
-    stops_placed: list[str] = field(default_factory=list)
+    exchange_name: str
+    positions_seen: int = 0
+    orphans_found: int = 0
+    orphans_protected: int = 0
+    diffs: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
+    def __str__(self) -> str:
+        return (
+            f"Reconciler[{self.exchange_name}] success={self.success} "
+            f"positions={self.positions_seen} orphans={self.orphans_found} "
+            f"protected={self.orphans_protected} "
+            f"diffs={len(self.diffs)} errors={len(self.errors)}"
+        )
 
-@dataclass
+
 class Reconciler:
-    """One reconciler instance per exchange."""
+    """One-shot per startup. Idempotent."""
 
-    exchange_name: str
-    adapter: ExchangeReconcileAdapter
+    def __init__(self, *, exchange_name: str, adapter: ExchangeAdapter):
+        self.exchange_name = exchange_name
+        self.adapter = adapter
 
-    async def run(
-        self,
-        account: AccountState,
-        breakeven_stop_buffer_pct: float = 0.005,  # 0.5% pad to avoid immediate trigger
-    ) -> ReconcilerReport:
-        report = ReconcilerReport(success=True)
-
-        # 1) positions
+    async def run(self, account: AccountState) -> ReconcilerReport:
+        report = ReconcilerReport(success=False, exchange_name=self.exchange_name)
         try:
-            ex_positions = await self.adapter.fetch_positions()
+            exch_positions = await self.adapter.fetch_positions()
+            exch_orders = await self.adapter.fetch_open_orders()
         except Exception as e:
-            report.success = False
-            report.errors.append(f"fetch_positions: {e}")
+            report.errors.append(f"fetch_failed:{type(e).__name__}:{e}")
+            logger.error("Reconciler fetch failed: %s", e)
             return report
 
-        local_keys = {(p.exchange, p.symbol) for p in account.open_positions if not p.closed}
-        for raw in ex_positions:
-            symbol = str(raw.get("symbol"))
-            size = float(raw.get("contracts") or raw.get("size") or 0.0)
-            if size == 0:
-                continue
-            side = Side.LONG if size > 0 else Side.SHORT
-            entry = float(raw.get("entryPrice") or raw.get("entry_price") or 0.0)
+        report.positions_seen = len(exch_positions)
+        local_symbols = set(account.open_positions.keys())
 
-            if (self.exchange_name, symbol) in local_keys:
-                continue  # known position, no orphan
-
-            orphan = OrphanPosition(
-                exchange=self.exchange_name,
-                symbol=symbol,
-                side=side,
-                size_contracts=abs(size),
-                entry_price=entry,
-                raw=raw,
-            )
-            report.orphans.append(orphan)
-            logger.warning("ORPHAN POSITION detected: %s %s size=%s @ %s",
-                           self.exchange_name, symbol, size, entry)
-
-            # Default action: place breakeven stop on the exchange. Better to
-            # have a stop than no stop. Buffer so we don't trigger immediately
-            # on the next tick.
-            buffer = entry * breakeven_stop_buffer_pct
-            stop_price = entry - buffer if side == Side.LONG else entry + buffer
+        for raw in exch_positions:
             try:
-                order = await self.adapter.place_stop_order(
-                    symbol=symbol,
-                    side=Side.SHORT if side == Side.LONG else Side.LONG,
-                    size=abs(size),
-                    stop_price=stop_price,
-                    reduce_only=True,
-                )
-                report.stops_placed.append(str(order.get("id")))
+                symbol = str(raw.get("symbol") or raw.get("info", {}).get("symbol") or "")
+                size_raw = raw.get("contracts") or raw.get("size") or 0.0
+                size = abs(float(size_raw))
+                side_str = str(raw.get("side") or "").lower()
+                if size <= 0:
+                    continue
+
+                if symbol in local_symbols:
+                    local = account.open_positions[symbol]
+                    if abs(local.size - size) / max(local.size, 1e-9) > 0.01:
+                        msg = f"size_diff:{symbol} local={local.size} exch={size}"
+                        report.diffs.append(msg)
+                        logger.warning("Reconciler %s", msg)
+                    if local.side.value != side_str:
+                        msg = f"side_diff:{symbol} local={local.side.value} exch={side_str}"
+                        report.diffs.append(msg)
+                        logger.warning("Reconciler %s", msg)
+                else:
+                    # Orphan: not in our state. Don't close — could be manual.
+                    report.orphans_found += 1
+                    if not self._has_protective_stop(symbol, exch_orders):
+                        protected = await self._attach_emergency_stop(raw)
+                        if protected:
+                            report.orphans_protected += 1
             except Exception as e:
-                report.errors.append(f"place_breakeven_stop({symbol}): {e}")
-                # Even if we cant place a stop here, we don't fail the whole
-                # reconciler — the alert above is the human-actionable signal.
+                report.errors.append(f"row_error:{e}")
+                logger.warning("Reconciler row error: %s", e)
 
-        # 2) orphan orders
-        try:
-            ex_orders = await self.adapter.fetch_open_orders()
-        except Exception as e:
-            report.errors.append(f"fetch_open_orders: {e}")
-            return report
-
-        # Anything not associated with a current position -> cancel.
-        # (We don't track order ids locally yet; we are conservative and
-        # only cancel orders explicitly tagged as "stale" by the adapter.)
-        for raw in ex_orders:
-            order_id = str(raw.get("id"))
-            symbol = str(raw.get("symbol"))
-            tag = str(raw.get("clientOrderId") or "")
-            if tag.startswith("stale-"):
-                try:
-                    await self.adapter.cancel_order(order_id, symbol)
-                    report.cancelled_orders.append(order_id)
-                except Exception as e:
-                    report.errors.append(f"cancel_order({order_id}): {e}")
-
-        # The reconciler succeeds even when orphans exist — the gate stays
-        # closed only if `success=False`. Orphans surface via the alert path.
+        report.success = not report.errors
+        account.reconciliation_complete = report.success
         return report
+
+    # ---------------- helpers ---------------- #
+
+    @staticmethod
+    def _has_protective_stop(symbol: str, orders: list[dict]) -> bool:
+        for o in orders:
+            o_symbol = o.get("symbol", "")
+            o_type = str(o.get("type", "")).lower()
+            o_reduce = bool(o.get("reduceOnly") or o.get("reduce_only"))
+            if o_symbol == symbol and "stop" in o_type and o_reduce:
+                return True
+        return False
+
+    async def _attach_emergency_stop(self, raw_position: dict) -> bool:
+        """Best-effort: place a wide protective stop on an orphan.
+
+        Audit #17: the previous version always used 5% adverse from
+        entry. On a 10x leveraged orphan that is 50% of equity wiped
+        out before the stop fires; on a 25x position (Binance default
+        for altcoin perp users) it is 125% — i.e. liquidation before
+        stop. We now translate the equity-side guardrail (default
+        ``max_equity_loss_pct=0.30``) to a price distance scaled by
+        the venue-reported leverage. A position with no leverage info
+        (rare; most adapters always populate it) falls back to the
+        old 5% to keep behaviour conservative.
+        """
+        try:
+            symbol = str(raw_position.get("symbol") or "")
+            side_str = str(raw_position.get("side") or "long").lower()
+            size = abs(float(raw_position.get("contracts") or raw_position.get("size") or 0.0))
+            entry = float(
+                raw_position.get("entryPrice") or raw_position.get("avgPrice") or 0.0
+            )
+            if not symbol or size <= 0 or entry <= 0:
+                return False
+            from altcoin_agent.risk.state import Side
+            pos_side = Side.LONG if side_str == "long" else Side.SHORT
+            # Stop distance = min(5% absolute, max_equity_loss_pct / leverage).
+            # On a 10x position with max_equity_loss=30%, that's 3% adverse;
+            # on 5x it's 6% (clamped to 5%); on no-leverage info we keep 5%.
+            max_equity_loss_pct = 0.30
+            absolute_cap_pct = 0.05
+            # Audit (third pass) #8: ccxt unifies many but not all
+            # ``fetch_positions`` fields. ``leverage`` is reliably
+            # present at the top level only on a subset of venues (and
+            # types: spot has no leverage; cross-margin has it under
+            # ``crossLeverage`` on some adapters). On Binance USDT-M
+            # and Bybit v5 the actual value lives under
+            # ``info.leverage``; OKX uses ``info.lever``. We probe all
+            # three so the leverage-aware stop actually fires in
+            # production (the previous code degraded to 5% on every
+            # real venue).
+            lev = 0.0
+            for candidate in (
+                raw_position.get("leverage"),
+                (raw_position.get("info") or {}).get("leverage"),
+                (raw_position.get("info") or {}).get("lever"),
+                (raw_position.get("info") or {}).get("crossLeverage"),
+            ):
+                if candidate is None:
+                    continue
+                try:
+                    lev = float(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if lev > 0:
+                    break
+            if lev > 0:
+                lev_aware = max_equity_loss_pct / lev
+                stop_pct = min(absolute_cap_pct, lev_aware)
+            else:
+                stop_pct = absolute_cap_pct
+            if pos_side == Side.LONG:
+                stop_price = entry * (1.0 - stop_pct)
+                stop_side = Side.SHORT
+            else:
+                stop_price = entry * (1.0 + stop_pct)
+                stop_side = Side.LONG
+            await self.adapter.place_stop_order(
+                symbol=symbol,
+                side=stop_side,
+                size=size,
+                stop_price=stop_price,
+                reduce_only=True,
+            )
+            logger.warning(
+                "Reconciler attached emergency stop on orphan %s %s @ %s "
+                "(stop_pct=%.4f, leverage=%.2f)",
+                symbol, side_str, stop_price, stop_pct, lev,
+            )
+            return True
+        except Exception as e:
+            logger.error("Reconciler emergency-stop failed: %s", e)
+            return False

@@ -1,20 +1,19 @@
-"""
-trailing.py — trailing stop FSM.
+"""trailing.py — TrailingStopFSM.
 
 State machine:
-    INIT       -> ARMED        on entry fill (initial stop already at OB edge)
-    ARMED      -> BREAKEVEN    when unrealized_r >= 1.0
-    BREAKEVEN  -> TRAILING     when unrealized_r >= 2.0 (start ATR trailing)
-    TRAILING   -> TRAILING     stop tightens via cancel+replace; never widens
-    *          -> CLOSED       on exit fill / liquidation / manual
+    INIT -> ARMED -> BREAKEVEN -> TRAILING -> {TARGET_REACHED | CLOSED}
 
-Invariant (proved by `_propose`):
-    For LONG:  new_stop >= prev_stop  (monotone non-decreasing)
-    For SHORT: new_stop <= prev_stop  (monotone non-increasing)
+Transitions:
+    INIT       -> ARMED      on first tick after entry
+    ARMED      -> BREAKEVEN  when |unrealized PnL| >= 1R: stop -> entry
+    BREAKEVEN  -> TRAILING   when |unrealized PnL| >= 2R: stop -> price -/+ atr_mult * ATR
+    TRAILING   -> TRAILING   each tick: stop monotonically tightens toward price
+    TRAILING   -> TARGET_REACHED  on SHORT: when (entry - price)/entry >= short_target_cap_pct
+                                  -> stop is pinned just above price to force fill
 
-The FSM ONLY proposes new stop levels. Actually placing them on the
-exchange via cancel+replace lives in the executor, because if the replace
-fails we MUST keep the old hard stop in force (SR-2).
+Hard invariant (proved by construction):
+    LONG  positions: stop is monotonically NON-DECREASING.
+    SHORT positions: stop is monotonically NON-INCREASING.
 """
 
 from __future__ import annotations
@@ -30,21 +29,22 @@ class TrailingState(str, Enum):
     ARMED = "armed"
     BREAKEVEN = "breakeven"
     TRAILING = "trailing"
+    TARGET_REACHED = "target_reached"
     CLOSED = "closed"
 
 
 @dataclass
 class TrailingStopFSM:
-    """
-    Pure logic. Inputs: position + current price + ATR. Output: optional
-    new_stop suggestion. The FSM never lowers the protective level for
-    longs or raises it for shorts.
+    """Stateless per call: caller passes Position and gets back (state, new_stop).
+
+    `new_stop` is None when no replacement should be placed (state has not
+    moved or the proposed stop would weaken the existing one).
     """
 
-    breakeven_r: float = 1.0
-    trail_start_r: float = 2.0
     atr_multiplier: float = 2.0
-    state: TrailingState = TrailingState.ARMED
+    breakeven_at_r: float = 1.0
+    trailing_at_r: float = 2.0
+    short_target_cap_pct: float = 0.70   # SHORT: force-close at -70% from entry
 
     def tick(
         self,
@@ -52,54 +52,67 @@ class TrailingStopFSM:
         position: Position,
         current_price: float,
         atr: float,
-    ) -> tuple[TrailingState, float | None]:
-        """
-        Returns (new_state, new_stop_or_None).
+        current_state: TrailingState,
+    ) -> tuple[TrailingState, float | None, str]:
+        """Return (next_state, proposed_stop or None, reason).
 
-        ``None`` means: no change required.
+        Caller is responsible for: keeping the state, calling cancel+replace
+        on the exchange, and refusing to apply a None stop.
         """
-        if position.closed or self.state == TrailingState.CLOSED:
-            return TrailingState.CLOSED, None
+        if position.closed or current_state == TrailingState.CLOSED:
+            return TrailingState.CLOSED, None, "position_closed"
 
-        r_unit = position.stop_distance
+        r_unit = position.r_unit
         if r_unit <= 0:
-            return self.state, None
+            return current_state, None, "no_r_unit"
 
-        # signed unrealized R
         if position.side == Side.LONG:
-            unrealized_r = (current_price - position.entry_price) / r_unit
+            unrealized = (current_price - position.entry_price) / r_unit
         else:
-            unrealized_r = (position.entry_price - current_price) / r_unit
+            unrealized = (position.entry_price - current_price) / r_unit
+
+        # SHORT-only: target cap (force close near -70%).
+        if position.side == Side.SHORT:
+            drop_pct = (position.entry_price - current_price) / position.entry_price
+            if drop_pct >= self.short_target_cap_pct:
+                pinned = self._pin_stop_just_against_price(position, current_price)
+                if self._monotonic_ok(position, pinned):
+                    return TrailingState.TARGET_REACHED, pinned, (
+                        f"short_target_cap_reached:{drop_pct:.2%}"
+                    )
+                return TrailingState.TARGET_REACHED, None, (
+                    "short_target_cap_already_armed"
+                )
+
+        # ----- normal progression -----
+        if current_state == TrailingState.INIT:
+            return TrailingState.ARMED, None, "armed"
 
         # ARMED -> BREAKEVEN
-        if self.state == TrailingState.ARMED and unrealized_r >= self.breakeven_r:
-            new_stop = self._propose(position, position.entry_price)
-            if new_stop is not None:
-                self.state = TrailingState.BREAKEVEN
-                return self.state, new_stop
+        if current_state in (TrailingState.ARMED,) and unrealized >= self.breakeven_at_r:
+            new_stop = position.entry_price
+            if self._monotonic_ok(position, new_stop):
+                return TrailingState.BREAKEVEN, new_stop, "breakeven"
+            return TrailingState.BREAKEVEN, None, "breakeven_no_op"
 
-        # BREAKEVEN -> TRAILING (transition can happen directly from ARMED if a
-        # bar gaps past 2R)
-        if self.state in (TrailingState.ARMED, TrailingState.BREAKEVEN) and unrealized_r >= self.trail_start_r:
-            candidate = self._atr_stop(position, current_price, atr)
-            new_stop = self._propose(position, candidate)
-            if new_stop is not None:
-                self.state = TrailingState.TRAILING
-                return self.state, new_stop
+        # BREAKEVEN -> TRAILING
+        if current_state == TrailingState.BREAKEVEN and unrealized >= self.trailing_at_r:
+            proposed = self._atr_stop(position, current_price, atr)
+            if self._monotonic_ok(position, proposed):
+                return TrailingState.TRAILING, proposed, "enter_trailing"
+            return TrailingState.TRAILING, None, "enter_trailing_no_op"
 
-        # TRAILING — keep tightening
-        if self.state == TrailingState.TRAILING:
-            candidate = self._atr_stop(position, current_price, atr)
-            new_stop = self._propose(position, candidate)
-            if new_stop is not None:
-                return TrailingState.TRAILING, new_stop
+        # TRAILING: tighten toward price each tick.
+        if current_state == TrailingState.TRAILING:
+            proposed = self._atr_stop(position, current_price, atr)
+            if self._monotonic_ok(position, proposed):
+                return TrailingState.TRAILING, proposed, "tighten"
+            return TrailingState.TRAILING, None, "tighten_no_op"
 
-        return self.state, None
+        # No state transition.
+        return current_state, None, "no_change"
 
-    def close(self) -> None:
-        self.state = TrailingState.CLOSED
-
-    # ---------------------- helpers ---------------------- #
+    # ---------------- helpers ---------------- #
 
     def _atr_stop(self, position: Position, price: float, atr: float) -> float:
         if position.side == Side.LONG:
@@ -107,13 +120,15 @@ class TrailingStopFSM:
         return price + self.atr_multiplier * atr
 
     @staticmethod
-    def _propose(position: Position, candidate: float) -> float | None:
-        """Apply the monotone-tighten invariant."""
-        if position.side == Side.LONG:
-            if candidate <= position.current_hard_stop:
-                return None
-            return candidate
-        # SHORT: stop tightens DOWN, so new_stop must be LOWER than current
-        if candidate >= position.current_hard_stop:
-            return None
-        return candidate
+    def _pin_stop_just_against_price(pos: Position, price: float) -> float:
+        """For SHORT target-cap: pin the stop just above current price."""
+        if pos.side == Side.LONG:
+            return price * 0.9995    # 5 bps below
+        return price * 1.0005        # 5 bps above
+
+    @staticmethod
+    def _monotonic_ok(pos: Position, new_stop: float) -> bool:
+        """LONG: new_stop must be >= current_stop. SHORT: <=."""
+        if pos.side == Side.LONG:
+            return new_stop >= pos.current_stop
+        return new_stop <= pos.current_stop

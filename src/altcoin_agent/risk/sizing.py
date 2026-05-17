@@ -1,172 +1,139 @@
-"""
-sizing.py — position sizing + dynamic leverage.
+"""sizing.py — Position sizing & dynamic leverage.
 
-Implements the user-agreed leverage formula:
+Risk-parity sizing:
+    risk_amount   = equity * max_risk_per_trade
+    stop_distance = |entry - initial_stop|
+    notional_usdt = risk_amount / stop_distance * entry
+    size          = notional_usdt / contract_value
 
-    leverage = clip(5 + 10 * conf_norm * vol_adj * liq_adj, 5, 15)
-
-with short-side capped at 10. ``conf_norm`` is the part of fused score above
-85, normalised to [0,1]. ``vol_adj`` falls inversely with realised volatility.
-``liq_adj`` falls inversely with shallow orderbook depth.
-
-Position size uses risk-parity:
-
-    size_quote = (equity * risk_pct) / stop_distance_pct
-
-where ``stop_distance_pct = abs(entry - initial_stop) / entry``. The size is
-then bumped through leverage to a notional and rounded down to the contract
-step.
+Dynamic leverage (per architect call):
+    leverage = clip(min_leverage + (max - min) * conf_norm * vol_adj * liq_adj,
+                    min_leverage, side_cap)
+where:
+    conf_norm = (fused_score - high_priority_threshold)
+                / (100 - high_priority_threshold), clipped to [0, 1]
+    vol_adj   = min(1.0, target_vol_pct / max(realized_vol_pct, eps))
+                — high realized vol -> smaller leverage
+    liq_adj   = min(1.0, top5_depth_usdt / liq_full_depth_usdt)
+                — thin book -> smaller leverage
+SHORT side has a tighter cap (default 10x) than LONG (default 15x).
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 from altcoin_agent.risk.state import Side
 
 
-@dataclass(frozen=True)
-class OrderIntent:
-    """A directional intent ready for sizing — the output of fuser+gate."""
-
-    symbol: str
-    exchange: str
-    side: Side
-    trigger_ts: int
-    trigger_price: float
-    entry_price: float        # the live price at intent creation (used for sizing)
-    initial_stop: float
-    fused_score: float        # 0..100 from fuser
-    confidence: float         # 0..1 from LLM/fuser blend (informational)
-
-
 @dataclass
 class DynamicLeverageConfig:
-    base: float = 5.0
-    span: float = 10.0
     min_leverage: float = 5.0
     max_leverage_long: float = 15.0
-    max_leverage_short: float = 10.0   # SR: shorts capped lower (mean-reversion risk)
-    promote_threshold: float = 85.0    # below this, never trade (gate rejects earlier)
-
-
-def compute_dynamic_leverage(
-    *,
-    side: Side,
-    fused_score: float,
-    realized_volatility_pct: float,
-    book_depth_usdt_top5: float,
-    min_liquidity_usdt: float = 200_000.0,
-    target_volatility_pct: float = 0.02,  # 2% / 1h ATR target
-    cfg: DynamicLeverageConfig | None = None,
-) -> float:
-    """
-    Pure function. Returns a leverage in [min, max-by-side].
-
-    - conf_norm: part of score above promote_threshold, scaled to [0,1].
-    - vol_adj:   target / max(realized, target)  -> ≤ 1, smaller when volatile.
-    - liq_adj:   min(1, depth / min_liquidity)  -> smaller when book is thin.
-    """
-    cfg = cfg or DynamicLeverageConfig()
-
-    if fused_score < cfg.promote_threshold:
-        return cfg.min_leverage
-
-    conf_norm = max(0.0, min(1.0, (fused_score - cfg.promote_threshold) / (100.0 - cfg.promote_threshold)))
-
-    rv = max(realized_volatility_pct, 1e-6)
-    vol_adj = min(1.0, target_volatility_pct / rv)
-
-    if min_liquidity_usdt <= 0:
-        liq_adj = 1.0
-    else:
-        liq_adj = max(0.0, min(1.0, book_depth_usdt_top5 / min_liquidity_usdt))
-
-    raw = cfg.base + cfg.span * conf_norm * vol_adj * liq_adj
-    side_cap = cfg.max_leverage_short if side == Side.SHORT else cfg.max_leverage_long
-    return max(cfg.min_leverage, min(side_cap, raw))
-
-
-@dataclass
-class SizingResult:
-    leverage: float
-    risk_amount_usdt: float
-    notional_usdt: float
-    size_contracts: float
-    stop_distance: float
+    max_leverage_short: float = 10.0
+    target_vol_pct: float = 0.05         # 5%/h ATR is "neutral"
+    liq_full_depth_usdt: float = 200_000.0  # depth at which liq_adj = 1.0
+    score_anchor: float = 85.0
 
 
 @dataclass
 class PositionSizer:
-    """
-    Risk-parity sizing with the dynamic leverage above.
+    max_risk_per_trade: float = 0.015      # 1.5% of equity
+    min_notional_usdt: float = 20.0        # exchange-side minimum
+    leverage_cfg: DynamicLeverageConfig = None  # type: ignore[assignment]
 
-    Args:
-        max_risk_per_trade: fraction of equity at risk per trade (default 1.5%)
-        contract_step:      smallest tradable contract increment
-        min_notional_usdt:  exchange-imposed min order size
-    """
+    def __post_init__(self) -> None:
+        if self.leverage_cfg is None:
+            self.leverage_cfg = DynamicLeverageConfig()
 
-    max_risk_per_trade: float = 0.015
-    leverage_cfg: DynamicLeverageConfig | None = None
-    contract_step: float = 0.001
-    min_notional_usdt: float = 5.0
+    # ----------------------------- leverage ----------------------------- #
 
-    def compute(
+    def compute_leverage(
         self,
         *,
-        intent: OrderIntent,
-        equity_usdt: float,
-        realized_volatility_pct: float,
-        book_depth_usdt_top5: float,
-        min_liquidity_usdt: float = 200_000.0,
-    ) -> SizingResult:
-        if equity_usdt <= 0:
-            raise ValueError("equity_usdt must be positive")
-
-        if intent.entry_price <= 0:
-            raise ValueError("entry_price must be positive")
-
-        stop_dist = abs(intent.entry_price - intent.initial_stop)
-        if stop_dist <= 0:
-            raise ValueError("initial_stop must differ from entry_price")
-
-        leverage = compute_dynamic_leverage(
-            side=intent.side,
-            fused_score=intent.fused_score,
-            realized_volatility_pct=realized_volatility_pct,
-            book_depth_usdt_top5=book_depth_usdt_top5,
-            min_liquidity_usdt=min_liquidity_usdt,
-            cfg=self.leverage_cfg,
+        side: Side,
+        fused_score: float,
+        realized_vol_pct: float,
+        top5_depth_usdt: float,
+    ) -> float:
+        cfg = self.leverage_cfg
+        side_cap = (
+            cfg.max_leverage_long if side == Side.LONG else cfg.max_leverage_short
         )
+        anchor = cfg.score_anchor
+        conf_norm = max(0.0, min(1.0, (fused_score - anchor) / max(100.0 - anchor, 1e-9)))
+        vol_adj = min(1.0, cfg.target_vol_pct / max(realized_vol_pct, 1e-4))
+        liq_adj = min(1.0, top5_depth_usdt / max(cfg.liq_full_depth_usdt, 1.0))
+        spread = side_cap - cfg.min_leverage
+        leverage = cfg.min_leverage + spread * conf_norm * vol_adj * liq_adj
+        return float(max(cfg.min_leverage, min(side_cap, leverage)))
+
+    # ----------------------------- sizing ----------------------------- #
+
+    def compute_size(
+        self,
+        *,
+        equity_usdt: float,
+        entry_price: float,
+        initial_stop: float,
+        leverage: float | None = None,
+    ) -> tuple[float, float, float]:
+        """Returns (size_in_base, notional_usdt, risk_amount_usdt).
+
+        Treats one contract as one unit of base (size_in_base equals quantity).
+        The exchange-specific contract face value translation belongs in the
+        executor, not here.
+
+        Bug #1 fix — leverage cap on notional:
+
+        Risk-parity sizing alone produces ``notional = risk_amount * entry /
+        stop_distance``. With a tight stop (e.g. 0.05% on a sweep entry) this
+        can balloon to 30-100x equity, blowing through Binance's leverage cap
+        and the operator-configured ``max_leverage_long/short``. The exchange
+        will either reject the order (-> emergency close + 4h cooldown) or
+        worse, accept it on cross margin and quietly oversize the book.
+
+        We now clamp ``notional <= equity * leverage`` and recompute
+        ``risk_amount`` from the clamped size so the returned tuple honestly
+        reflects what was actually committed.
+
+        ``leverage`` is the dynamic leverage produced by ``compute_leverage``;
+        when omitted we default to ``leverage_cfg.max_leverage_long`` (the
+        side-agnostic upper bound) which preserves existing risk-parity
+        behaviour for any caller that hasn't been updated yet.
+        """
+        if entry_price <= 0:
+            return 0.0, 0.0, 0.0
+        stop_distance = abs(entry_price - initial_stop)
+        if stop_distance <= 0:
+            return 0.0, 0.0, 0.0
+        if equity_usdt <= 0:
+            return 0.0, 0.0, 0.0
+
+        if leverage is None:
+            leverage = self.leverage_cfg.max_leverage_long
+        # Clamp leverage into a sane band so a stale or buggy upstream value
+        # cannot inflate the notional past the configured side caps.
+        max_lev_cap = max(
+            self.leverage_cfg.max_leverage_long,
+            self.leverage_cfg.max_leverage_short,
+        )
+        leverage = float(max(0.0, min(max_lev_cap, leverage)))
+        if leverage <= 0:
+            return 0.0, 0.0, 0.0
 
         risk_amount = equity_usdt * self.max_risk_per_trade
-        # how much notional we need so that stop_dist movement equals risk_amount
-        notional = risk_amount * intent.entry_price / stop_dist
-        # leverage caps the EFFECTIVE risk to margin available; we keep the
-        # risk-parity sizing and rely on leverage purely to reduce required
-        # margin, not to scale up risk. We do, however, cap notional to
-        # equity * leverage to respect exchange margin.
-        notional = min(notional, equity_usdt * leverage)
+        notional_risk_parity = risk_amount * entry_price / stop_distance
+        notional_cap = equity_usdt * leverage
+        notional = min(notional_risk_parity, notional_cap)
 
-        size_contracts = notional / intent.entry_price
-        # round DOWN to step
-        if self.contract_step > 0:
-            size_contracts = math.floor(size_contracts / self.contract_step) * self.contract_step
+        if notional < self.min_notional_usdt:
+            return 0.0, 0.0, 0.0
 
-        # final notional after rounding
-        final_notional = size_contracts * intent.entry_price
-
-        if final_notional < self.min_notional_usdt:
-            # rounding would zero us out; reject by returning size 0
-            size_contracts = 0.0
-            final_notional = 0.0
-
-        return SizingResult(
-            leverage=leverage,
-            risk_amount_usdt=risk_amount,
-            notional_usdt=final_notional,
-            size_contracts=size_contracts,
-            stop_distance=stop_dist,
-        )
+        size_in_base = notional / entry_price
+        # When we clamped, the realised dollar risk is smaller than the
+        # configured ``max_risk_per_trade``. Recompute it so the gate's
+        # bookkeeping reflects reality (this is what gets logged & shown on
+        # the dashboard).
+        actual_risk = stop_distance * size_in_base
+        return size_in_base, notional, actual_risk
