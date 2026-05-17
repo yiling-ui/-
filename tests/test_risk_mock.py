@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 import pytest
@@ -88,7 +89,8 @@ class FakeAdapter:
 def _signal(direction: Direction = Direction.LONG, *, score: float = 95.0,
             trigger: float | None = 1.000) -> FusedSignal:
     return FusedSignal(
-        symbol="RAVEUSDT", exchange="binance", ts=1,
+        symbol="RAVEUSDT", exchange="binance",
+        ts=int(time.time() * 1000),
         direction=direction, rule_score=90.0, llm_score=90.0,
         final_score=score, is_high_priority=True, blocked=False,
         block_reason=None, trigger_price=trigger,

@@ -1,6 +1,6 @@
 """gate.py — RiskGate, the single hard wall before any order is placed.
 
-Thirteen fail-closed checks, in order. Any single failure produces a
+Fourteen fail-closed checks, in order. Any single failure produces a
 rejection with a reason. On unexpected exception the result is also a
 rejection (fail-closed).
 
@@ -9,39 +9,42 @@ no boolean ``and``/``or`` short-circuiting fuses two checks into one.
 This is the invariant the architecture depends on so that a single
 defect in one gate cannot silently disable another.
 
-The 13 independent checks (in evaluation order)
+The 14 independent checks (in evaluation order)
 -----------------------------------------------
 Signal-validity (pre-network):
     1. Signal is not blocked upstream (``signal.blocked``).
     2. Signal is high-priority (``signal.is_high_priority``).
     3. Signal direction is not NEUTRAL.
+    4. Signal freshness (TICKET-006): reject when
+       ``now_ms - signal.ts > max_signal_age_sec * 1000``. SR-1
+       freshness invariant: a stale signal is no signal.
 
 Local-memory micro-structure (no network round-trip):
-    4. Anti-chase (price tape): recent move not already too far in our
+    5. Anti-chase (price tape): recent move not already too far in our
        favour to add.
-    5. Vol-kill (price tape): tape not in whipsaw range expansion.
-    6. BTC regime filter (audit #10): block LONG when BTC is dropping
+    6. Vol-kill (price tape): tape not in whipsaw range expansion.
+    7. BTC regime filter (audit #10): block LONG when BTC is dropping
        fast / SHORT when BTC is ripping (cold tape -> fail-open).
-    7. Symbol-cluster cap (audit #11): correlated symbol set
+    8. Symbol-cluster cap (audit #11): correlated symbol set
        (PEPE/WIF/FLOKI ...) effectively counts as one trade.
 
 Account-level circuit breakers:
-    8. Global trading halt (manual or kill-switch).
-    9. Reconciliation must be complete (SR-2).
-    10. Daily drawdown circuit breaker.
-    11. Daily stop-loss hit count cap.
-    12. Per-symbol cooldown active.
-    13. Per-symbol consecutive-loss cooldown.
+    9. Global trading halt (manual or kill-switch).
+    10. Reconciliation must be complete (SR-2).
+    11. Daily drawdown circuit breaker.
+    12. Daily stop-loss hit count cap.
+    13. Per-symbol cooldown active.
+    14. Per-symbol consecutive-loss cooldown.
 
 Capacity and execution feasibility:
-    14. Concurrent-position cap.
-    15. Top-5 orderbook depth (liquidity).
-    16. Slippage cap (SR-1, dynamic by leverage).
+    15. Concurrent-position cap.
+    16. Top-5 orderbook depth (liquidity).
+    17. Slippage cap (SR-1, dynamic by leverage).
 
-(Fifteen ``return RiskDecision(False, ...)`` veto points plus a final
-post-sizing ``size <= 0`` rejection. The "13" headline counts the user-
-facing risk gates; the three signal-validity checks above are mandatory
-preconditions enforced at the same fail-closed level.)
+(Seventeen ``return RiskDecision(False, ...)`` veto points plus a
+final post-sizing ``size <= 0`` rejection. The "14" headline counts
+the user-facing risk gates; the four signal-validity checks above are
+mandatory preconditions enforced at the same fail-closed level.)
 
 Per architect call SR-1, the slippage threshold is asymmetric:
 moves IN OUR FAVOUR are NEVER abort reasons. Only adverse drift counts.
@@ -99,7 +102,15 @@ class RiskGateConfig:
     min_liquidity_usdt: float = 200_000.0    # top-5 depth USDT
     # Slippage (SR-1)
     base_slippage: float = 0.03              # 3% at 5x leverage
-    # Signal age
+    # Signal age (TICKET-006). The freshness gate has been DEAD for two
+    # audits — the value was a configured-but-never-read int. SR-1's
+    # premise is that a high-priority signal expires fast; an 11-second
+    # round-trip from screener to gate is enough for the tape to drift
+    # past the slippage cap, and acting on it is the same defect as
+    # acting on a 30-second-old signal. ``evaluate`` now rejects with
+    # ``signal_stale:..`` when ``now_ms - signal.ts > max_signal_age_sec
+    # * 1000``. Set ``max_signal_age_sec=0`` to disable (back-compat
+    # for tests that intentionally use synthetic timestamps).
     max_signal_age_sec: int = 10
     # Per-symbol cooldown after high_priority emission
     symbol_cooldown_sec: int = 60
@@ -144,7 +155,7 @@ class RiskGate:
         cluster_map: ClusterMap | None = None,
         cluster_cap_cfg: ClusterCapConfig | None = None,
     ) -> RiskDecision:
-        """Run all 9 checks. Returns an approved decision with sizing details
+        """Run all 14 checks. Returns an approved decision with sizing details
         on success, or a rejection with a reason on the first failure.
 
         ``price_tape`` is optional; when provided, two extra checks
@@ -164,6 +175,15 @@ class RiskGate:
         All three optional checks fail-OPEN when their inputs are
         missing or stale, so existing callers and dry-run tests keep
         working unchanged.
+
+        TICKET-006: signal freshness check. When
+        ``cfg.max_signal_age_sec > 0`` and ``signal.ts`` is a real
+        wall-clock millisecond timestamp (>= 1e12, i.e. somewhere
+        after the year 2001), reject with ``signal_stale:..`` when
+        the gate sees the signal more than ``max_signal_age_sec``
+        seconds after it was emitted. Synthetic test timestamps
+        (``ts=1`` etc.) bypass the check so the rest of the gate
+        remains testable without rewriting every fixture.
         """
         if now_ms is None:
             now_ms = int(time.time() * 1000)
@@ -176,6 +196,29 @@ class RiskGate:
                 return RiskDecision(False, "signal_not_high_priority")
             if signal.direction == Direction.NEUTRAL:
                 return RiskDecision(False, "signal_direction_neutral")
+
+            # TICKET-006: signal-age (SR-1 freshness).
+            #
+            # ``signal.ts`` is the screener's wall-clock millisecond
+            # stamp at emission. We refuse to act on anything older
+            # than ``max_signal_age_sec`` because the live mark has
+            # had time to drift past the slippage cap. Synthetic
+            # tests that use ts=0/1 (no wall clock) skip this check
+            # via the lower bound; real signals always carry a
+            # post-2001 timestamp.
+            #
+            # ``max_signal_age_sec=0`` disables the gate entirely.
+            if (
+                self.cfg.max_signal_age_sec > 0
+                and signal.ts >= 1_000_000_000_000  # >= 2001-09-09 UTC
+                and now_ms - signal.ts > self.cfg.max_signal_age_sec * 1000
+            ):
+                age_ms = now_ms - signal.ts
+                return RiskDecision(
+                    False,
+                    f"signal_stale:{age_ms}ms>"
+                    f"{self.cfg.max_signal_age_sec * 1000}ms",
+                )
 
             side = (
                 Side.LONG if signal.direction == Direction.LONG else Side.SHORT
@@ -377,18 +420,95 @@ class RiskGate:
         realized_vol_pct: float,
         trigger_price: float,
         now_ms: int | None = None,
+        price_tape: PriceTape | None = None,
+        regime_filter: RegimeFilter | None = None,
+        cluster_map: ClusterMap | None = None,
+        cluster_cap_cfg: ClusterCapConfig | None = None,
     ) -> RiskDecision:
         """Like ``evaluate``, but for an additional leg on an open position.
 
         Returns a positive RiskDecision when the additional leg can be
         placed; the caller is expected to use ``proposed_size`` /
         ``proposed_stop`` directly (no re-sizing here).
+
+        TICKET-007: the four micro-structure / regime gates that
+        ``evaluate`` runs for an entry are now ALSO run here:
+
+          * anti-chase: refuse to *add* on top of a parabolic ramp
+            (the same physics that says "don't chase a 5% pump in
+            under 500ms" applies to "don't add a leg on top of a
+            5% pump in under 500ms").
+          * vol-kill: refuse to add inside a whipsaw range.
+          * regime: refuse to add against the BTC tape.
+          * cluster cap: defence-in-depth for operators that change
+            ``max_per_cluster`` while a position is open.
+
+        Per-symbol cooldown / consecutive-loss cooldown / concurrency
+        remain DELIBERATELY SKIPPED — see the inline notes in
+        ``evaluate`` for the rationale (a rolling add is the explicit
+        opposite of "fresh entry after a flip").
         """
         if now_ms is None:
             now_ms = int(time.time() * 1000)
 
         try:
             side = parent.side
+            direction_str = side.value  # "long" / "short"
+
+            # 0a) anti-chase / vol-kill — same physics as ``evaluate``.
+            #
+            # On a winning leg the price has by definition moved in our
+            # favour; the ``move`` reported here is measured against
+            # the *recent* tape, not against the original entry. So a
+            # 2.5% rip in the last 30s still trips this even though
+            # we're already 10R ahead. Refusing the leg in that
+            # scenario protects a winning position from a paper-loss
+            # spike on the new leg's stop.
+            if price_tape is not None:
+                breached, move = price_tape.anti_chase_breach(
+                    symbol=parent.symbol, side=side, now_ms=now_ms,
+                )
+                if breached:
+                    return RiskDecision(
+                        False,
+                        f"chase_too_late:{move:+.4f}>"
+                        f"{price_tape.cfg.anti_chase_max_move_pct:+.4f}",
+                    )
+                vol_breached, rng = price_tape.vol_kill_breach(
+                    symbol=parent.symbol, now_ms=now_ms,
+                )
+                if vol_breached:
+                    return RiskDecision(
+                        False,
+                        f"vol_kill_active:{rng:.4f}>"
+                        f"{price_tape.cfg.vol_kill_range_pct:.4f}",
+                    )
+
+            # 0b) BTC market-regime gate — same as entry. Adding a
+            # LONG leg into a BTC drawdown is exactly the cascade
+            # the regime filter exists to prevent.
+            if regime_filter is not None:
+                allowed, reason = regime_filter.allow_direction(
+                    direction=direction_str, now_ms=now_ms,
+                )
+                if not allowed:
+                    return RiskDecision(False, reason)
+
+            # 0c) Symbol-cluster cap — defence-in-depth. The proposed
+            # symbol is already in ``open_positions`` (it's the parent
+            # of the leg we're adding), so ``cap_breached`` does NOT
+            # increment the count. This catches the rare case where
+            # the operator lowered ``max_per_cluster`` while a
+            # multi-symbol cluster was already over the new cap.
+            if cluster_map is not None and cluster_cap_cfg is not None:
+                breached, reason = cap_breached(
+                    proposed_symbol=parent.symbol,
+                    open_symbols=list(account.open_positions.keys()),
+                    cluster_map=cluster_map,
+                    cap_cfg=cluster_cap_cfg,
+                )
+                if breached:
+                    return RiskDecision(False, reason)
 
             # 1) global halt
             if account.global_trading_halted:

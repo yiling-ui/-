@@ -871,6 +871,10 @@ async def test_trailing_emergency_closes_naked_position() -> None:
     tc = TrailingController(
         fsm=_AlwaysTightenFSM(), atr=ATRCalculator(),
         executor=ex, account=a, health=health,
+        # TICKET-009: prove the emergency-close path still fires by
+        # zeroing the grace window. The grace logic is exercised in
+        # ``test_trailing_naked_grace_window_*`` below.
+        naked_grace_sec=0.0,
     )
     tc._by_symbol["PEPE"] = _Tracked(position=pos)
 
