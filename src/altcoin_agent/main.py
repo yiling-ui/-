@@ -110,6 +110,9 @@ from altcoin_agent.risk.threshold_auto_tuner import (
     ThresholdAutoTuner,
     ThresholdAutoTunerConfig,
 )
+from altcoin_agent.training.production_rules_loader import (
+    ProductionRulesLoader,
+)
 from altcoin_agent.screener import (
     FundingSnapshot,
     Kline,
@@ -399,6 +402,28 @@ class AppConfig:
     llm_pre_rate_min_score: float = 70.0
     llm_pre_rate_queue_max: int = 64
 
+    # ------------------------------------------------------------------ #
+    # R3 — production_rules.json hot reload.
+    #
+    # The walk-forward trainer (``scripts/run_walkforward_trainer.py``)
+    # writes ``production_rules.json`` into ``production_rules_dir``
+    # whenever a rule clears the 80% gate. The live daemon polls the
+    # file's mtime every ``production_rules_reload_interval_sec`` and
+    # rebuilds an in-memory snapshot on change. Subscribers (the
+    # fuser / risk gate / dashboard) consult the snapshot through
+    # ``ProductionRulesLoader.lookup_by_features`` — no restart
+    # required.
+    #
+    # Default OFF: a fresh deployment has no production rules yet and
+    # turning the worker on before the first training cycle just
+    # logs "file not found" warnings. Operators flip this on in
+    # ``app.yaml`` after the first ``run_walkforward_trainer.py``
+    # run produces the file.
+    # ------------------------------------------------------------------ #
+    production_rules_enabled: bool = False
+    production_rules_dir: str = ".kiro/state/training"
+    production_rules_reload_interval_sec: float = 600.0  # 10 min
+
     @classmethod
     def from_file(cls, path: str) -> AppConfig:
         try:
@@ -613,6 +638,16 @@ class AppConfig:
             ),
             llm_pre_rate_queue_max=int(
                 d.get("llm_pre_rate_queue_max", 64),
+            ),
+            # R3 — production_rules.json hot reload.
+            production_rules_enabled=bool(
+                d.get("production_rules_enabled", False),
+            ),
+            production_rules_dir=str(
+                d.get("production_rules_dir", ".kiro/state/training"),
+            ),
+            production_rules_reload_interval_sec=float(
+                d.get("production_rules_reload_interval_sec", 600.0),
             ),
         )
 
@@ -1203,6 +1238,14 @@ class App:
     _llm_cache: LLMCache | None = None
     _token_budget_manager: TokenBudgetManager | None = None
     _llm_pre_rater: LLMPreRater | None = None
+    # R3 — production_rules.json hot loader. None = feature off.
+    # Wired in ``run`` when ``cfg.production_rules_enabled`` is True;
+    # the background ``production_rules_reload_worker`` polls it on
+    # ``cfg.production_rules_reload_interval_sec``. Subscribers
+    # (R6: fuser / risk gate quadrant lookups) will read the loader
+    # directly so they always see the latest trainer output without
+    # a daemon restart.
+    _production_rules_loader: ProductionRulesLoader | None = None
 
     async def run(self) -> None:
         self.state.started_at = time.time()
@@ -2076,6 +2119,41 @@ class App:
                     "LLMPreRater start failed (swallowed): %s", e,
                 )
 
+        # R3 — production_rules.json hot reload worker.
+        #
+        # Built only when the operator opts in. We construct the
+        # loader here (just-in-time) so unit tests that bypass
+        # ``run`` don't need the trainer state dir to exist. The
+        # worker runs forever; ``_stop_event`` cancels it during
+        # graceful shutdown.
+        if (
+            self.cfg.production_rules_enabled
+            and self._production_rules_loader is None
+        ):
+            self._production_rules_loader = ProductionRulesLoader(
+                path=os.path.join(
+                    self.cfg.production_rules_dir,
+                    "production_rules.json",
+                ),
+                min_check_interval_sec=(
+                    self.cfg.production_rules_reload_interval_sec
+                ),
+            )
+            # First read at startup so ``rules()`` is non-empty
+            # without waiting one polling interval.
+            with suppress(Exception):
+                self._production_rules_loader.force_reload()
+            logger.info(
+                "ProductionRulesLoader: %s rules at boot from %s",
+                len(self._production_rules_loader),
+                self._production_rules_loader.path,
+            )
+        if self._production_rules_loader is not None:
+            self._tasks.append(asyncio.create_task(
+                self._production_rules_reload_worker(),
+                name="production_rules_reload_worker",
+            ))
+
         await self._stop_event.wait()
         await self._shutdown()
 
@@ -2416,6 +2494,46 @@ class App:
         except asyncio.CancelledError:
             pass
 
+    async def _production_rules_reload_worker(self) -> None:
+        """R3: poll ``production_rules.json`` and refresh the in-memory snapshot.
+
+        Mtime-throttled inside :class:`ProductionRulesLoader`, so this
+        worker can poll on a very tight schedule without re-parsing
+        the file every iteration -- the JSON is only re-read when its
+        mtime advances. We still wait for the configured interval
+        between checks so a busy filesystem doesn't see ~10 stat calls
+        per second.
+
+        Failure modes:
+          * Missing file: loader logs once and clears the snapshot.
+          * Malformed JSON: loader keeps the previous snapshot and
+            warns; subsequent calls retry on each mtime change.
+          * Cancelled: graceful exit on shutdown.
+        """
+        loader = self._production_rules_loader
+        if loader is None:
+            return
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    loader.maybe_reload()
+                except Exception as e:  # pragma: no cover -- defensive
+                    logger.exception(
+                        "production_rules_reload_worker iteration failed: %s",
+                        e,
+                    )
+                    self.state.last_error = (
+                        f"production_rules_reload:{type(e).__name__}"
+                    )
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=self.cfg.production_rules_reload_interval_sec,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            pass
     async def _run_miss_penalty_pass(
         self, *, account: AccountState, now_utc,
     ) -> None:
