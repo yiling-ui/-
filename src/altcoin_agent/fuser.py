@@ -50,6 +50,7 @@ from altcoin_agent.learning_engine import (
     bucket_zscore,
 )
 from altcoin_agent.screener import SignalEvent, SignalKind
+from altcoin_agent.social.historical_analyzer import HistoricalAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,12 @@ class FusedSignal:
     llm_verdict: AIVerdict | None = None
     notes: list[str] = field(default_factory=list)
     trigger_price: float | None = None
+    # Phase B.6 sister deliverable: KOL author handles fed alongside
+    # the LLM verdict. Surfaces here so the post-mortem path can
+    # forward them to the historical analyzer's record_observation
+    # (closing the learning loop). Empty list when no analyzer ran or
+    # no authors were supplied.
+    kol_authors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -390,10 +397,17 @@ class ScoreFuser:
         config: FuserConfig | None = None,
         rule_weights: dict[SignalKind, float] | None = None,
         rule_index: RuleIndex | None = None,
+        historical_analyzer: HistoricalAnalyzer | None = None,
     ):
         self.sink = sink
         self.cfg = config or FuserConfig()
         self.weights = rule_weights or DEFAULT_RULE_WEIGHTS
+        # Phase B.6 sister deliverable: an optional KOL-history adjuster
+        # that tilts the LLM-attributed ``verdict.confidence`` by the
+        # historical hit-rate of the cited authors before the
+        # ``exit_liquidity`` hard-veto / soft-cap branches fire. None ==
+        # legacy behaviour (every author treated identically).
+        self.historical_analyzer = historical_analyzer
 
         # Resolve learned-rules path (env override -> cfg -> default).
         if rule_index is not None:
@@ -413,6 +427,11 @@ class ScoreFuser:
         self._rules: dict[str, deque[SignalEvent]] = {}
         self._llm: dict[str, AIVerdict] = {}
         self._llm_ts: dict[str, int] = {}
+        # Bundle of authors fed alongside the most-recent verdict, so
+        # ``evaluate`` can call ``HistoricalAnalyzer.adjust_kol_confidence``
+        # without re-fetching the social snapshot. Empty list when the
+        # caller didn't supply one — analyzer hook is then a no-op.
+        self._llm_authors: dict[str, list[str]] = {}
         self._last_high_priority_ts: dict[str, int] = {}
 
     # ------------------- ingestion API ------------------- #
@@ -433,11 +452,32 @@ class ScoreFuser:
 
     async def on_llm_verdict(
         self, exchange: str, symbol: str, verdict: AIVerdict, ts: int,
+        kol_authors: list[str] | None = None,
         *, phase: str | None = None,
     ) -> FusedSignal | None:
+        """Cache the LLM verdict and (optionally) the KOL authors that
+        produced it.
+
+        ``kol_authors`` is forwarded by ``LLMConsultor`` from the social
+        snapshot when the historical analyzer is enabled; legacy callers
+        that omit it keep the V1.0 byte-for-byte behaviour because
+        :meth:`evaluate` skips the analyzer when the list is empty or
+        the analyzer slot is None.
+        """
         key = self._key(exchange, symbol)
         self._llm[key] = verdict
         self._llm_ts[key] = ts
+        # Only cache authors when caller supplied a non-empty list. An
+        # empty list overwrites a stale-but-still-fresh non-empty one,
+        # which would silently disable the analyzer for the next
+        # evaluate() within the same window. Legacy on_llm_verdict
+        # callers (no kol_authors arg) leave the previous list intact.
+        if kol_authors:
+            self._llm_authors[key] = list(kol_authors)
+        elif kol_authors is not None:
+            # Caller passed an explicit empty list — clear the cache so
+            # we don't keep stale authors past their relevance window.
+            self._llm_authors.pop(key, None)
         return await self._dispatch(symbol, exchange, ts, phase=phase)
 
     # ------------------- evaluation core ------------------- #
@@ -519,6 +559,58 @@ class ScoreFuser:
                 kol_exit and rule_direction == Direction.SHORT
             )
 
+            # KOL-history adjustment (Phase B.6 sister deliverable).
+            #
+            # Tilts the LLM-attributed confidence by the historical
+            # hit-rate of the cited authors BEFORE the kol_exit
+            # hard-veto / soft-cap branches fire. A known-good
+            # exit_liquidity caller becomes more likely to trigger the
+            # hard veto; a known-unreliable one is downgraded to the
+            # soft cap. When the analyzer is None, no authors are
+            # cached, or the verdict's intent is neutral, the original
+            # confidence flows through unchanged so the V1.0 path is
+            # byte-for-byte preserved.
+            effective_confidence = verdict.confidence
+            authors_for_adjust = self._llm_authors.get(key, [])
+            if (
+                self.historical_analyzer is not None
+                and authors_for_adjust
+                and verdict.kol_intent != "neutral"
+            ):
+                try:
+                    adj = self.historical_analyzer.adjust_kol_confidence(
+                        kol_intent=verdict.kol_intent,
+                        confidence=verdict.confidence,
+                        authors=authors_for_adjust,
+                    )
+                except Exception as e:
+                    # Defensive: a bug in the analyzer must NEVER block
+                    # the trading hot path. Fall back to the original
+                    # confidence, log once.
+                    logger.warning(
+                        "historical_analyzer.adjust_kol_confidence "
+                        "failed (%s); using unadjusted confidence",
+                        e,
+                    )
+                    adj = None
+                if adj is not None and adj.delta != 0.0:
+                    effective_confidence = adj.adjusted_confidence
+                    notes.append(
+                        f"kol_history adjusted confidence: "
+                        f"{adj.original_confidence:.3f} -> "
+                        f"{adj.adjusted_confidence:.3f} ({adj.note})"
+                    )
+                elif adj is not None and adj.delta == 0.0 and adj.note not in (
+                    "no_authors", "neutral_intent_skipped",
+                ):
+                    # Zero-delta still worth surfacing when the analyzer
+                    # actually ran (insufficient_samples / neutral band)
+                    # — operators reviewing why a trade fired want to
+                    # see "we considered it" trail.
+                    notes.append(
+                        f"kol_history evaluated (no change): {adj.note}"
+                    )
+
             # 2) Direction conflict veto.
             if (rule_direction != Direction.NEUTRAL
                     and llm_dir != Direction.NEUTRAL
@@ -539,10 +631,10 @@ class ScoreFuser:
 
             # 3) KOL exit_liquidity HARD VETO (only on LONG with high LLM conf).
             if kol_exit and not kol_exit_aligned_short:
-                if verdict.confidence >= self.cfg.kol_exit_hard_veto_conf:
+                if effective_confidence >= self.cfg.kol_exit_hard_veto_conf:
                     notes.append(
                         f"HARD VETO: kol_intent=exit_liquidity on LONG, "
-                        f"llm.confidence={verdict.confidence:.2f} >= "
+                        f"effective_confidence={effective_confidence:.2f} >= "
                         f"{self.cfg.kol_exit_hard_veto_conf}"
                     )
                     return self._make_signal(
@@ -560,10 +652,13 @@ class ScoreFuser:
             if llm_dir == rule_direction and llm_dir != Direction.NEUTRAL:
                 spread = self.cfg.llm_boost_max - self.cfg.llm_boost_min
                 # Halve boost when shorting alongside KOL distribution.
+                # ``effective_confidence`` carries the history-adjusted
+                # value when the analyzer ran, otherwise falls through
+                # to verdict.confidence verbatim.
                 eff_conf = (
-                    verdict.confidence * 0.5
+                    effective_confidence * 0.5
                     if kol_exit_aligned_short
-                    else verdict.confidence
+                    else effective_confidence
                 )
                 llm_boost = self.cfg.llm_boost_min + spread * eff_conf
 
@@ -588,9 +683,18 @@ class ScoreFuser:
 
         # 6) KOL exit_liquidity SOFT CAP for LONG (low LLM conf path).
         if kol_exit and not kol_exit_aligned_short and verdict is not None:
+            # ``effective_confidence`` may have been adjusted by the
+            # historical analyzer above; we surface the post-adjustment
+            # value here so an operator reading the notes sees the same
+            # number that drove the (non-)veto decision.
+            displayed_conf = (
+                effective_confidence
+                if effective_confidence != verdict.confidence
+                else verdict.confidence
+            )
             notes.append(
                 f"SOFT CAP: kol_intent=exit_liquidity on LONG, "
-                f"llm.confidence={verdict.confidence:.2f} < "
+                f"effective_confidence={displayed_conf:.2f} < "
                 f"{self.cfg.kol_exit_hard_veto_conf}, "
                 f"capping at {self.cfg.kol_exit_soft_cap_score}"
             )
@@ -766,6 +870,15 @@ class ScoreFuser:
         *, phase: str | None = None,
     ) -> FusedSignal | None:
         signal = self.evaluate(symbol, exchange, now_ts, phase=phase)
+        # Phase B.6 sister deliverable: surface the authors that were
+        # fed alongside the latest verdict so downstream consumers (the
+        # delayed post-mortem in particular) can close the learning
+        # loop without re-fetching the social snapshot. Always set so
+        # tests reading sig.kol_authors don't see a stale value from a
+        # previous symbol.
+        signal.kol_authors = list(
+            self._llm_authors.get(self._key(exchange, symbol), [])
+        )
         if signal.is_high_priority:
             self._last_high_priority_ts[self._key(exchange, symbol)] = now_ts
             if self.sink is not None:

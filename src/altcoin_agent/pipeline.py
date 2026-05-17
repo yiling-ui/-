@@ -42,6 +42,7 @@ import os
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -267,61 +268,133 @@ class LLMConsultor:
 
     async def consult(self, ev: SignalEvent) -> AIVerdict | None:
         """Run a single consultation. Returns the verdict on success
-        (also feeds the fuser internally), or None on any failure path."""
-        snapshot = await self._safe_fetch_social(ev.symbol)
-        posts = self._snapshot_to_posts(snapshot)
-        smc = self.cache.build_smc_context(ev.symbol, ev.ts)
-        funding_snap = self.cache.latest_funding(ev.symbol)
-        funding_rate = funding_snap.rate if funding_snap is not None else None
-        funding_z = self.cache.latest_funding_zscore(ev.symbol)
+        (also feeds the fuser internally), or None on any failure path.
 
-        extra: dict[str, Any] = {
-            "primary_status": snapshot.primary_status,
-            "trigger_kind": ev.kind.value,
-            "trigger_payload": ev.payload,
-            "post_count": len(posts),
-        }
-        # When the primary social source is degraded, surface the auxiliary
-        # source highlights so the LLM still has *something*. Per architect
-        # call, aux sources never get to raise confidence on their own;
-        # the system prompt (SR-4) is responsible for clamping.
-        if snapshot.primary_status != "ok":
-            if snapshot.okx is not None:
-                extra["aux_okx"] = snapshot.okx
-            if snapshot.dexscreener is not None:
-                extra["aux_dexscreener"] = snapshot.dexscreener
-            if snapshot.coingecko is not None:
-                extra["aux_coingecko"] = snapshot.coingecko
+        Phase B.6: wraps the consult in a ``llm_consult`` span. Inside
+        we further open ``social.fetch`` and ``llm.judge`` child spans
+        so a slow third-party (Binance Square cookie expired, OTel
+        endpoint unreachable, OpenRouter throttled) is immediately
+        attributable. All spans are no-ops when tracing isn't
+        configured.
+        """
+        from altcoin_agent.observability.tracing import start_span
 
-        try:
-            verdict = await self.engine.judge(
-                symbol=ev.symbol,
-                exchange=ev.exchange,
-                funding_rate=funding_rate,
-                funding_deviation_z=funding_z,
-                smc=smc,
-                posts=posts,
-                extra=extra,
+        with start_span(
+            "llm_consult",
+            attributes={
+                "altcoin_agent.symbol": ev.symbol,
+                "altcoin_agent.exchange": ev.exchange,
+                "altcoin_agent.signal_kind": ev.kind.value,
+            },
+        ) as consult_span:
+            with start_span(
+                "social.fetch",
+                attributes={"altcoin_agent.symbol": ev.symbol},
+                kind="client",
+            ) as social_span:
+                snapshot = await self._safe_fetch_social(ev.symbol)
+                with suppress(Exception):
+                    social_span.set_attribute(
+                        "altcoin_agent.primary_status", snapshot.primary_status,
+                    )
+                    social_span.set_attribute(
+                        "altcoin_agent.post_count",
+                        len(snapshot.binance_square_posts),
+                    )
+            posts = self._snapshot_to_posts(snapshot)
+            smc = self.cache.build_smc_context(ev.symbol, ev.ts)
+            funding_snap = self.cache.latest_funding(ev.symbol)
+            funding_rate = (
+                funding_snap.rate if funding_snap is not None else None
             )
-        except EngineError as e:
-            # No API key, exhausted budget, or similar non-recoverable
-            # config error. Log once at warning, return None.
-            logger.warning("LLM consult skipped for %s: %s", ev.symbol, e)
-            return None
-        except Exception as e:
-            logger.exception("LLM judge unexpectedly failed for %s: %s",
-                             ev.symbol, e)
-            return None
+            funding_z = self.cache.latest_funding_zscore(ev.symbol)
 
-        try:
-            await self.fuser.on_llm_verdict(
-                ev.exchange, ev.symbol, verdict, ev.ts,
-            )
-        except Exception as e:
-            logger.exception("fuser.on_llm_verdict failed for %s: %s",
-                             ev.symbol, e)
+            extra: dict[str, Any] = {
+                "primary_status": snapshot.primary_status,
+                "trigger_kind": ev.kind.value,
+                "trigger_payload": ev.payload,
+                "post_count": len(posts),
+            }
+            # When the primary social source is degraded, surface the
+            # auxiliary highlights so the LLM still has *something*.
+            # Aux sources cannot raise confidence on their own; the
+            # system prompt (SR-4) is responsible for clamping.
+            if snapshot.primary_status != "ok":
+                if snapshot.okx is not None:
+                    extra["aux_okx"] = snapshot.okx
+                if snapshot.dexscreener is not None:
+                    extra["aux_dexscreener"] = snapshot.dexscreener
+                if snapshot.coingecko is not None:
+                    extra["aux_coingecko"] = snapshot.coingecko
 
-        return verdict
+            try:
+                with start_span(
+                    "llm.judge",
+                    attributes={
+                        "altcoin_agent.symbol": ev.symbol,
+                        "altcoin_agent.post_count": len(posts),
+                    },
+                    kind="client",
+                ) as judge_span:
+                    verdict = await self.engine.judge(
+                        symbol=ev.symbol,
+                        exchange=ev.exchange,
+                        funding_rate=funding_rate,
+                        funding_deviation_z=funding_z,
+                        smc=smc,
+                        posts=posts,
+                        extra=extra,
+                    )
+                    with suppress(Exception):
+                        judge_span.set_attribute(
+                            "altcoin_agent.intent", verdict.intent,
+                        )
+                        judge_span.set_attribute(
+                            "altcoin_agent.confidence_score",
+                            int(verdict.confidence_score),
+                        )
+                        judge_span.set_attribute(
+                            "altcoin_agent.kol_intent", verdict.kol_intent,
+                        )
+            except EngineError as e:
+                # No API key, exhausted budget, or similar non-recoverable
+                # config error. Log once at warning, return None.
+                logger.warning("LLM consult skipped for %s: %s", ev.symbol, e)
+                with suppress(Exception):
+                    consult_span.set_attribute(
+                        "altcoin_agent.skip_reason", str(e),
+                    )
+                return None
+            except Exception as e:
+                logger.exception("LLM judge unexpectedly failed for %s: %s",
+                                 ev.symbol, e)
+                return None
+
+            # Phase B.6 sister deliverable: forward the cited KOL authors
+            # to the fuser so its KOL-history adjuster can tilt the
+            # ``verdict.confidence`` before the exit_liquidity hard-veto /
+            # soft-cap branches fire. We only forward when ``snapshot``
+            # actually carried Square posts; otherwise pass an empty list
+            # which the fuser interprets as "clear stale authors" so a
+            # degraded social call doesn't leave the previous symbol's
+            # authors attached to this verdict.
+            kol_authors = [
+                p.author for p in snapshot.binance_square_posts if p.author
+            ]
+            try:
+                await self.fuser.on_llm_verdict(
+                    ev.exchange, ev.symbol, verdict, ev.ts,
+                    kol_authors=kol_authors,
+                )
+            except Exception as e:
+                logger.exception("fuser.on_llm_verdict failed for %s: %s",
+                                 ev.symbol, e)
+
+            with suppress(Exception):
+                consult_span.set_attribute(
+                    "altcoin_agent.kol_authors_count", len(kol_authors),
+                )
+            return verdict
 
     # -------------- internals -------------- #
 
@@ -369,11 +442,18 @@ class DelayedPostMortemScheduler:
 
     All exceptions inside the post-mortem are swallowed — the learning
     loop is best-effort and must never poison the trading loop.
+
+    Phase B.6 sister deliverable: when ``historical_analyzer`` is wired,
+    each post-mortem also records one KOL observation per cited author
+    so the analyzer's hit-rate counters can converge over time. The
+    realised direction + magnitude come straight from the post-mortem
+    report so the same kline data drives both learning loops.
     """
 
     store: RuleStore
     engine: DeepSeekEngine | None = None
     delay_sec: int = 3600
+    historical_analyzer: Any | None = None
     _tasks: set[asyncio.Task] = field(default_factory=set)
 
     def schedule(
@@ -383,6 +463,8 @@ class DelayedPostMortemScheduler:
         target_ts_ms: int,
         entry_ts_ms: int | None = None,
         expected_direction: str | None = None,
+        kol_authors: list[str] | None = None,
+        kol_intent: str | None = None,
     ) -> asyncio.Task:
         """Schedule a delayed post-mortem.
 
@@ -392,12 +474,18 @@ class DelayedPostMortemScheduler:
         ``run_post_mortem`` slices ``[entry - 4h, entry + 1h]``, evaluates
         the move strictly post-entry, and files the rule update under the
         trader's intended direction even when the trade lost.
+
+        Phase B.6: ``kol_authors`` and ``kol_intent`` are the
+        analyzer's record keys. Optional — when omitted, only the rule
+        store is updated, which is the V1.0 behaviour.
         """
         task = asyncio.create_task(
             self._run(
                 symbol=symbol, target_ts_ms=target_ts_ms,
                 entry_ts_ms=entry_ts_ms,
                 expected_direction=expected_direction,
+                kol_authors=list(kol_authors) if kol_authors else None,
+                kol_intent=kol_intent,
             ),
             name=f"post_mortem:{symbol}:{target_ts_ms}",
         )
@@ -412,6 +500,8 @@ class DelayedPostMortemScheduler:
         target_ts_ms: int,
         entry_ts_ms: int | None = None,
         expected_direction: str | None = None,
+        kol_authors: list[str] | None = None,
+        kol_intent: str | None = None,
     ) -> None:
         try:
             await asyncio.sleep(self.delay_sec)
@@ -434,6 +524,50 @@ class DelayedPostMortemScheduler:
                 symbol, report.result.direction, report.result.magnitude_pct,
                 [(p.feature_name, p.bucket) for p in report.picks],
             )
+            # Phase B.6 sister deliverable: feed the same realised
+            # outcome to the KOL history analyzer for every author
+            # that appeared on the social side at entry time.
+            # ``run_post_mortem`` already computed direction +
+            # magnitude over the post-entry window; reusing it keeps
+            # the two learning loops consistent (no chance of one path
+            # seeing a "pump" while the other sees "dump" because they
+            # disagree on the bar selection).
+            if (
+                self.historical_analyzer is not None
+                and kol_authors
+                and kol_intent in ("frontrun_call", "exit_liquidity")
+                and entry_ts_ms is not None
+            ):
+                # Dedupe by NORMALISED author key: the social snapshot
+                # may report the same KOL under multiple surface forms
+                # ("@goat", "$goat", "goat"); without normalising here
+                # a spammy KOL would inflate their own sample count
+                # because :meth:`KOLHistoryStore.record` writes to a
+                # single normalised key but our seen set would treat
+                # each spelling as fresh.
+                from altcoin_agent.social.historical_analyzer import (
+                    normalize_author,
+                )
+                seen: set[str] = set()
+                for author in kol_authors:
+                    norm = normalize_author(author)
+                    if not norm or norm in seen:
+                        continue
+                    seen.add(norm)
+                    try:
+                        self.historical_analyzer.record_observation(
+                            author=author,
+                            symbol=symbol,
+                            intent=kol_intent,
+                            ts_ms=entry_ts_ms,
+                            realised_direction=report.result.direction,
+                            magnitude_pct=report.result.magnitude_pct,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "kol_history record_observation failed for "
+                            "%s/%s: %s", symbol, author, e,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as e:

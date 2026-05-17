@@ -20,8 +20,6 @@ What this pins:
 from __future__ import annotations
 
 import asyncio
-import json
-import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,7 +27,6 @@ from pathlib import Path
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from altcoin_agent.fuser import Direction, FusedSignal
 from altcoin_agent.main import App, AppConfig
 from altcoin_agent.observability import bind_trace_id, current_trace_id
 from altcoin_agent.risk.sqlite_persistence import SQLiteAccountStore

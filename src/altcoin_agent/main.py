@@ -55,6 +55,11 @@ from altcoin_agent.observability.metrics import DefaultMetrics
 from altcoin_agent.observability.structured_log import (
     configure_structured_logging,
 )
+from altcoin_agent.observability.tracing import (
+    configure_tracing,
+    shutdown_tracing,
+    start_span,
+)
 from altcoin_agent.pipeline import (
     CandidateGate,
     DelayedPostMortemScheduler,
@@ -119,6 +124,11 @@ from altcoin_agent.screener import (
     OISnapshot,
     Screener,
     SignalEvent,
+)
+from altcoin_agent.social.historical_analyzer import (
+    HistoricalAnalyzer,
+    HistoricalAnalyzerConfig,
+    KOLHistoryStore,
 )
 
 logger = logging.getLogger(__name__)
@@ -403,6 +413,61 @@ class AppConfig:
     llm_pre_rate_queue_max: int = 64
 
     # ------------------------------------------------------------------ #
+    # Phase B.6 sister deliverable — KOL historical hit-rate analyzer.
+    #
+    # The fuser already routes ``exit_liquidity`` LLM verdicts through a
+    # confidence-graded HARD VETO / SOFT CAP path; without history every
+    # KOL gets the same weight regardless of past accuracy. When
+    # ``kol_history_enabled`` is True the daemon constructs a
+    # :class:`KOLHistoryStore` (atomic JSON) plus a wrapping
+    # :class:`HistoricalAnalyzer`, plumbs it into the fuser, and the
+    # delayed post-mortem scheduler records one observation per cited
+    # author 1h after each entry — same data the rule learner sees, so
+    # the two memories converge consistently.
+    #
+    # Default OFF: the store starts empty, so until the operator
+    # bootstraps it (via ``scripts/rebuild_kol_history.py`` or organic
+    # accumulation) every author would land in the
+    # ``insufficient_samples`` branch and the analyzer would no-op
+    # anyway. Operators flip it on AFTER seeding the file.
+    # ------------------------------------------------------------------ #
+    kol_history_enabled: bool = False
+    kol_history_path: str = ".kiro/state/social/kol_history.json"
+    kol_history_min_samples: int = 10
+    kol_history_strong_bound: float = 0.65
+    kol_history_weak_bound: float = 0.40
+    kol_history_conf_lift_max: float = 0.20
+    kol_history_conf_drop_max: float = 0.20
+
+    # ------------------------------------------------------------------ #
+    # Phase B.6 — OpenTelemetry distributed-trace exporter.
+    #
+    # ``tracing_enabled`` toggles the
+    # :mod:`altcoin_agent.observability.tracing` exporter. When False
+    # (default) every span helper is a cheap no-op, and the daemon's
+    # behaviour is byte-for-byte identical to v1.0. When True the
+    # daemon initialises an OTel TracerProvider with a Resource carrying
+    # ``service.name`` and ``deployment.environment``, attaches a
+    # BatchSpanProcessor backed by an OTLP/gRPC exporter (when
+    # ``tracing_otlp_endpoint`` is set) and/or a synchronous Console
+    # exporter (``tracing_console=true``), and copies each span's
+    # trace-id into the existing ``structured_log`` contextvar so a
+    # ``grep trace_id`` correlates JSON logs with the exporter's
+    # spans without operator guesswork.
+    #
+    # Operators that flip ``tracing_enabled=true`` MUST install the
+    # optional extra ``pip install -e '.[otel]'``; without it the
+    # tracer logs once at WARNING and stays disabled (never crashes).
+    # ------------------------------------------------------------------ #
+    tracing_enabled: bool = False
+    tracing_service_name: str = "altcoin-agent"
+    tracing_otlp_endpoint: str = ""
+    tracing_otlp_insecure: bool = True
+    tracing_console: bool = False
+    tracing_sampler_ratio: float = 1.0
+    tracing_environment: str = "production"
+
+    # ------------------------------------------------------------------ #
     # R3 — production_rules.json hot reload.
     #
     # The walk-forward trainer (``scripts/run_walkforward_trainer.py``)
@@ -638,6 +703,44 @@ class AppConfig:
             ),
             llm_pre_rate_queue_max=int(
                 d.get("llm_pre_rate_queue_max", 64),
+            ),
+            # Phase B.6 sister deliverable — KOL historical analyzer.
+            kol_history_enabled=bool(d.get("kol_history_enabled", False)),
+            kol_history_path=str(
+                d.get("kol_history_path", ".kiro/state/social/kol_history.json"),
+            ),
+            kol_history_min_samples=int(
+                d.get("kol_history_min_samples", 10),
+            ),
+            kol_history_strong_bound=float(
+                d.get("kol_history_strong_bound", 0.65),
+            ),
+            kol_history_weak_bound=float(
+                d.get("kol_history_weak_bound", 0.40),
+            ),
+            kol_history_conf_lift_max=float(
+                d.get("kol_history_conf_lift_max", 0.20),
+            ),
+            kol_history_conf_drop_max=float(
+                d.get("kol_history_conf_drop_max", 0.20),
+            ),
+            # Phase B.6 — OpenTelemetry tracer.
+            tracing_enabled=bool(d.get("tracing_enabled", False)),
+            tracing_service_name=str(
+                d.get("tracing_service_name", "altcoin-agent"),
+            ),
+            tracing_otlp_endpoint=str(
+                d.get("tracing_otlp_endpoint", ""),
+            ),
+            tracing_otlp_insecure=bool(
+                d.get("tracing_otlp_insecure", True),
+            ),
+            tracing_console=bool(d.get("tracing_console", False)),
+            tracing_sampler_ratio=float(
+                d.get("tracing_sampler_ratio", 1.0),
+            ),
+            tracing_environment=str(
+                d.get("tracing_environment", "production"),
             ),
             # R3 — production_rules.json hot reload.
             production_rules_enabled=bool(
@@ -1238,6 +1341,12 @@ class App:
     _llm_cache: LLMCache | None = None
     _token_budget_manager: TokenBudgetManager | None = None
     _llm_pre_rater: LLMPreRater | None = None
+    # Phase B.6 sister deliverable — KOL history slots. Both None when
+    # cfg.kol_history_enabled is False; ``run`` constructs them and
+    # plumbs the analyzer into both ScoreFuser and
+    # DelayedPostMortemScheduler.
+    _kol_history_store: KOLHistoryStore | None = None
+    _kol_analyzer: HistoricalAnalyzer | None = None
     # R3 — production_rules.json hot loader. None = feature off.
     # Wired in ``run`` when ``cfg.production_rules_enabled`` is True;
     # the background ``production_rules_reload_worker`` polls it on
@@ -1271,6 +1380,39 @@ class App:
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning(
                     "structured logging setup failed (swallowed): %s", e,
+                )
+
+        # Phase B.6: OpenTelemetry tracer. Initialised second so the
+        # provider's first span (the structured log "started" line)
+        # already lands on the JSON formatter. configure_tracing
+        # itself does NOT raise when OTel is missing — it logs a
+        # warning and returns a disabled tracer.
+        if self.cfg.tracing_enabled:
+            try:
+                configure_tracing(
+                    service_name=self.cfg.tracing_service_name,
+                    otlp_endpoint=(
+                        self.cfg.tracing_otlp_endpoint or None
+                    ),
+                    otlp_insecure=self.cfg.tracing_otlp_insecure,
+                    console_exporter=self.cfg.tracing_console,
+                    sampler_arg=self.cfg.tracing_sampler_ratio,
+                    extra_resource_attrs={
+                        "deployment.environment": self.cfg.tracing_environment,
+                        "altcoin_agent.mode": mode,
+                    },
+                )
+                logger.info(
+                    "OpenTelemetry tracer enabled (service=%s, "
+                    "endpoint=%s, console=%s, sampler=%.2f)",
+                    self.cfg.tracing_service_name,
+                    self.cfg.tracing_otlp_endpoint or "<none>",
+                    self.cfg.tracing_console,
+                    self.cfg.tracing_sampler_ratio,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "tracing setup failed (swallowed): %s", e,
                 )
 
         if self.cfg.metrics_enabled and self._metrics is None:
@@ -1583,13 +1725,51 @@ class App:
                 trailing=trailing, account=account,
             )
 
+        # Phase B.6 sister deliverable — KOL historical hit-rate analyzer.
+        # Built BEFORE the fuser so the fuser can take a reference to it.
+        # The store is shared with the post-mortem scheduler below so
+        # every closed position feeds back into the same counters.
+        if self.cfg.kol_history_enabled and self._kol_analyzer is None:
+            try:
+                if self._kol_history_store is None:
+                    self._kol_history_store = KOLHistoryStore(
+                        path=Path(self.cfg.kol_history_path),
+                    )
+                self._kol_analyzer = HistoricalAnalyzer(
+                    store=self._kol_history_store,
+                    config=HistoricalAnalyzerConfig(
+                        min_samples=self.cfg.kol_history_min_samples,
+                        strong_bound=self.cfg.kol_history_strong_bound,
+                        weak_bound=self.cfg.kol_history_weak_bound,
+                        conf_lift_max=self.cfg.kol_history_conf_lift_max,
+                        conf_drop_max=self.cfg.kol_history_conf_drop_max,
+                    ),
+                )
+                logger.info(
+                    "KOL history analyzer enabled (path=%s, "
+                    "%d authors loaded, min_samples=%d)",
+                    self.cfg.kol_history_path,
+                    len(self._kol_history_store),
+                    self.cfg.kol_history_min_samples,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "KOL history analyzer setup failed (swallowed): %s", e,
+                )
+                self._kol_history_store = None
+                self._kol_analyzer = None
+
         # Resolve dynamic rules path: cfg override -> env -> fuser default.
         fuser_cfg_kwargs: dict[str, Any] = {}
         if self.cfg.dynamic_rules_path:
             fuser_cfg_kwargs["dynamic_rules_path"] = Path(
                 self.cfg.dynamic_rules_path,
             )
-        fuser = ScoreFuser(sink=fused_sink, config=FuserConfig(**fuser_cfg_kwargs))
+        fuser = ScoreFuser(
+            sink=fused_sink,
+            config=FuserConfig(**fuser_cfg_kwargs),
+            historical_analyzer=self._kol_analyzer,
+        )
 
         # ----- Rolling-positions controller (optional) -----
         # Default OFF: rolling adds same-side exposure to a winning
@@ -1808,6 +1988,7 @@ class App:
             store=rule_store,
             engine=self._llm_engine,
             delay_sec=self.cfg.post_mortem_delay_sec,
+            historical_analyzer=self._kol_analyzer,
         )
 
         if self._llm_engine is not None:
@@ -2675,7 +2856,16 @@ class App:
         account: AccountState,
     ) -> None:
         """Translate a high-priority FusedSignal into an order if Risk Gate
-        approves. Attaches a trailing tracker to the new position."""
+        approves. Attaches a trailing tracker to the new position.
+
+        Phase B.6 wraps the entire decision in a ``decision_pipeline``
+        OpenTelemetry span so an operator browsing Jaeger / Tempo can
+        see every nested operation (live-quote fetch, gate, executor,
+        notifier) under one root. ``start_span`` is a no-op when
+        tracing is disabled, so the cost on the disabled path is one
+        Python context-manager entry per high-priority signal —
+        sub-microsecond.
+        """
         if sig.direction == Direction.NEUTRAL:
             return
         if sig.trigger_price is None or sig.trigger_price <= 0:
@@ -2688,6 +2878,45 @@ class App:
         # every audit row associated with this signal. Bound at the
         # top so the reflection-suspension path also gets it.
         bind_trace_id(str(sig.ts))
+
+        # Phase B.6: open the root span for this decision. We use the
+        # context-manager form so any unhandled exception propagates
+        # back to the queue worker AND lands as an exception event
+        # on the span. Attributes here are the small, bounded set
+        # most useful for span filtering — symbol, direction,
+        # final_score, signal_ts. Per-hop spans (gate, executor)
+        # carry their own attributes so we don't pollute the parent.
+        with start_span(
+            "decision_pipeline",
+            attributes={
+                "altcoin_agent.symbol": sig.symbol,
+                "altcoin_agent.exchange": sig.exchange,
+                "altcoin_agent.direction": sig.direction.value,
+                "altcoin_agent.final_score": float(sig.final_score),
+                "altcoin_agent.rule_score": float(sig.rule_score),
+                "altcoin_agent.signal_ts": int(sig.ts),
+            },
+        ):
+            await self._handle_high_priority_impl(
+                sig=sig, gate=gate, executor=executor,
+                trailing=trailing, account=account,
+            )
+
+    async def _handle_high_priority_impl(
+        self,
+        *,
+        sig: FusedSignal,
+        gate: RiskGate,
+        executor: CCXTExecutor,
+        trailing: TrailingController,
+        account: AccountState,
+    ) -> None:
+        """The actual decision-pipeline body. Split out from
+        ``_handle_high_priority`` so the public entry point can wrap
+        the whole flow in a single OTel span without forcing a
+        100-line indentation change. Behaviour is byte-for-byte
+        identical to the V1.0 inlined code.
+        """
         # Phase B.2.1: count high-priority signals by direction. This
         # is one of the gauges/counters the operator monitors to see
         # "is the screener emitting at all?".
@@ -2874,21 +3103,42 @@ class App:
                     await self.notifier.rejected(rej)
                 return
 
-        decision: RiskDecision = gate.evaluate(
-            signal=sig,
-            account=account,
-            current_price=current_price,
-            top5_depth_usdt=top5_depth_usdt,
-            realized_vol_pct=realized_vol_pct,
-            initial_stop=initial_stop,
-            price_tape=self._price_tape,
-            # Audit (third pass) #1: pass the wired safety gates.
-            # When None (operator opted out via cfg), RiskGate skips
-            # them — same back-compat shape PR #21 already established.
-            regime_filter=self._regime_filter,
-            cluster_map=self._cluster_map,
-            cluster_cap_cfg=self._cluster_cap_cfg,
-        )
+        # Phase B.6: wrap gate.evaluate in its own span so dashboards
+        # can spot a slow gate (e.g. SR-1 falling back to a degraded
+        # quote provider) at a glance.
+        with start_span(
+            "risk_gate.evaluate",
+            attributes={
+                "altcoin_agent.symbol": sig.symbol,
+                "altcoin_agent.current_price": float(current_price),
+                "altcoin_agent.top5_depth_usdt": float(top5_depth_usdt),
+                "altcoin_agent.realized_vol_pct": float(realized_vol_pct),
+            },
+        ) as gate_span:
+            decision: RiskDecision = gate.evaluate(
+                signal=sig,
+                account=account,
+                current_price=current_price,
+                top5_depth_usdt=top5_depth_usdt,
+                realized_vol_pct=realized_vol_pct,
+                initial_stop=initial_stop,
+                price_tape=self._price_tape,
+                # Audit (third pass) #1: pass the wired safety gates.
+                # When None (operator opted out via cfg), RiskGate skips
+                # them — same back-compat shape PR #21 already established.
+                regime_filter=self._regime_filter,
+                cluster_map=self._cluster_map,
+                cluster_cap_cfg=self._cluster_cap_cfg,
+            )
+            # Annotate the span with the outcome so a span filter on
+            # ``approved=false`` returns the population we want.
+            with suppress(Exception):
+                gate_span.set_attribute(
+                    "altcoin_agent.approved", bool(decision.approved),
+                )
+                gate_span.set_attribute(
+                    "altcoin_agent.reject_reason", str(decision.reason),
+                )
 
         # Audit (third pass) #1: every gate decision goes to the audit
         # log (approved or rejected). This is the only place we can
@@ -2932,13 +3182,32 @@ class App:
                 await self.notifier.rejected(rej)
             return
         try:
-            position = await executor.open(
-                symbol=sig.symbol,
-                decision=decision,
-                current_price=current_price,
-                account=account,
-                trace_id=str(sig.ts),
-            )
+            # Phase B.6: per-position-open span. Wrapping just
+            # executor.open keeps the span boundary tight around the
+            # network calls (set_leverage + market_order +
+            # place_stop_order) — operators can correlate slow venue
+            # round-trips here without picking through the parent
+            # decision_pipeline span.
+            with start_span(
+                "executor.open",
+                attributes={
+                    "altcoin_agent.symbol": sig.symbol,
+                    "altcoin_agent.direction": sig.direction.value,
+                    "altcoin_agent.size": float(decision.size or 0.0),
+                    "altcoin_agent.leverage": float(decision.leverage or 0.0),
+                    "altcoin_agent.notional_usdt": float(
+                        decision.notional_usdt or 0.0,
+                    ),
+                },
+                kind="client",
+            ):
+                position = await executor.open(
+                    symbol=sig.symbol,
+                    decision=decision,
+                    current_price=current_price,
+                    account=account,
+                    trace_id=str(sig.ts),
+                )
             self.state.orders_placed += 1
             self.state.open_positions = len(account.open_positions)
             self._record_order_placed(
@@ -2984,11 +3253,24 @@ class App:
                 expected_direction = (
                     "pump" if position.side == Side.LONG else "dump"
                 )
+                # Phase B.6: forward the cited KOL authors + the
+                # verdict's kol_intent so the analyzer can score them
+                # 1h from now using the same realised direction the
+                # rule learner sees. Both fields default to None when
+                # the analyzer is not wired -> scheduler skips the
+                # KOL-history branch automatically.
+                kol_intent_for_pm: str | None = None
+                if sig.llm_verdict is not None and sig.llm_verdict.kol_intent in (
+                    "frontrun_call", "exit_liquidity",
+                ):
+                    kol_intent_for_pm = sig.llm_verdict.kol_intent
                 self._post_mortem.schedule(
                     symbol=sig.symbol,
                     target_ts_ms=target_ts_ms,
                     entry_ts_ms=entry_ts_ms,
                     expected_direction=expected_direction,
+                    kol_authors=sig.kol_authors or None,
+                    kol_intent=kol_intent_for_pm,
                 )
                 self.state.post_mortems_scheduled += 1
         except Exception as e:
@@ -3223,6 +3505,11 @@ class App:
         if self.notifier is not None:
             with suppress(Exception):
                 await self.notifier.aclose()
+        # Phase B.6: flush + drop the OTel TracerProvider so any
+        # pending spans get exported. ``shutdown_tracing`` is a no-op
+        # when tracing was never configured or OTel is missing.
+        with suppress(Exception):
+            shutdown_tracing()
         logger.info("Shutdown complete.")
 
     def request_stop(self) -> None:

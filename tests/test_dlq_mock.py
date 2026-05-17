@@ -141,7 +141,8 @@ def test_dlq_swallows_write_errors_when_path_invalid() -> None:
     # ``/dev/full`` would be ideal but isn't portable; instead we
     # construct a queue rooted at a path that we then turn into a
     # file (so opening as a directory fails).
-    import tempfile, os
+    import os
+    import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         # Create a regular file so the queue's parent.mkdir succeeds
         # but writing to ``./dlq.jsonl`` underneath it fails.
