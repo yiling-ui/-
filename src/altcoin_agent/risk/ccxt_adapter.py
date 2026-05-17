@@ -7,8 +7,18 @@ Wraps a ccxt.pro client (Binance/OKX/Gate.io USDT-M perpetuals) into the
   * sets ``positionSide`` correctly for hedge-mode-enabled accounts,
   * handles testnet via the ``sandbox`` flag,
   * routes STOP_MARKET orders through the right ``params`` per venue,
-  * never silently swallows errors from the exchange — Risk Gate / Executor
-    handle every error explicitly.
+  * **enforces exchange-level idempotency** (audit-fix #E1) by attaching
+    a venue-specific ``clientOrderId`` to every entry, stop, and reduce-
+    only close order. If a network blip / 502 / 504 makes us retry the
+    same logical order, the venue dedupes on the ID instead of creating
+    a phantom second position.
+  * **retries transient failures** (audit-fix #E2) — 502 / 504 / 429 /
+    DDoSProtection / NetworkError / RequestTimeout are full-jitter
+    exponential-backoff retried up to ``transient_retries`` times. Logical
+    errors (``InvalidOrder`` / ``InsufficientFunds`` / ``BadSymbol``) are
+    re-raised immediately. The whole network call is also wrapped in
+    ``asyncio.wait_for(..., total_timeout_sec)`` so a hung TCP socket
+    can't deadlock the executor coroutine.
 
 Usage:
 
@@ -27,13 +37,163 @@ unit-tested without a network connection (we mock ``client`` itself).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
+import re
+import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from altcoin_agent.risk.state import Side
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+
+# --------------------------------------------------------------------- #
+# Transient error classification (audit-fix #E2)
+# --------------------------------------------------------------------- #
+#
+# ccxt is imported lazily so the test suite (which mocks the client) does
+# not require ccxt at import time. We classify exceptions by class name +
+# stringified message rather than ``isinstance`` so test fakes can raise
+# ordinary ``RuntimeError("rate limit ...")`` and still exercise the
+# retry path.
+
+_TRANSIENT_CCXT_NAMES: tuple[str, ...] = (
+    "NetworkError",
+    "ExchangeNotAvailable",
+    "RequestTimeout",
+    "DDoSProtection",
+    "RateLimitExceeded",
+    "OperationFailed",  # ccxt umbrella for 5xx-class venue errors
+)
+
+_LOGICAL_CCXT_NAMES: tuple[str, ...] = (
+    "InvalidOrder",
+    "InsufficientFunds",
+    "BadSymbol",
+    "BadRequest",
+    "AuthenticationError",
+    "PermissionDenied",
+    "AccountSuspended",
+    "MarginModeAlreadySet",
+)
+
+_TRANSIENT_MSG_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE) for p in (
+        # HTTP infrastructure errors (CDN/edge/upstream)
+        r"\b50[234]\b",          # 502 / 503 / 504
+        r"\b429\b",
+        r"bad gateway",
+        r"gateway timeout",
+        r"service unavailable",
+        # Connection & timeout
+        r"connection (reset|aborted|refused)",
+        r"timed? ?out",
+        r"timeout",
+        # Generic rate limit phrasing across venues
+        r"rate.?limit",
+        r"too many requests",
+        r"ddos",
+        r"temporarily unavailable",
+    )
+)
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Return True iff ``exc`` looks like a transient infrastructure failure
+    that is safe to retry idempotently (i.e. with the same clientOrderId)."""
+    name = type(exc).__name__
+    if name in _LOGICAL_CCXT_NAMES:
+        return False
+    if name in _TRANSIENT_CCXT_NAMES:
+        return True
+    msg = str(exc)
+    if not msg:
+        return False
+    for pat in _TRANSIENT_MSG_PATTERNS:
+        if pat.search(msg):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------- #
+# clientOrderId derivation (audit-fix #E1)
+# --------------------------------------------------------------------- #
+#
+# Every venue we ship has a slightly different field name and character-
+# set rule. We standardise on a short, alphanumeric-only string so the
+# same ID round-trips through binance / okx / bybit / gateio without
+# hitting "invalid characters" rejections.
+#
+#   Binance USDT-M futures: ``newClientOrderId``,
+#       ``^[\.A-Z\:/a-z0-9_-]{1,36}$``
+#   OKX:                    ``clOrdId``,
+#       1-32 chars, ``[A-Za-z0-9]``
+#   Gate.io:                ``text``,
+#       must start with ``t-`` and be 28 chars or fewer total
+#   Bybit:                  ``orderLinkId``, 36 chars max alnum
+#   ccxt unified:           ``clientOrderId``
+#
+# Our derivation produces 18-char base IDs (prefix ``e``/``s``/``c`` +
+# 16 hex chars from secrets.token_hex). The Gate "t-" prefix adds 2 more
+# chars (20 total), well under all venue limits.
+
+_COID_ALNUM_RE = re.compile(r"[^A-Za-z0-9]")
+
+
+def _sanitize_for_coid(raw: str | None) -> str:
+    if not raw:
+        return ""
+    return _COID_ALNUM_RE.sub("", raw)[:16]
+
+
+def _derive_client_oid(
+    *,
+    prefix: str,
+    trace_id: str | None,
+    suffix: str | None = None,
+) -> str:
+    """Build a deterministic, venue-safe clientOrderId.
+
+    The same ``trace_id`` always yields the same ``base`` portion, which
+    is what makes retries idempotent. ``suffix`` lets ``add_leg`` /
+    stop-replacement emit unique-but-related IDs (the venue rejects two
+    orders with the same ID in the same 24h window on most exchanges,
+    so legs and stop-resets must each get their own).
+    """
+    base = _sanitize_for_coid(trace_id)
+    if not base:
+        base = secrets.token_hex(8)  # 16 alnum chars
+    if suffix:
+        base = f"{base}{_sanitize_for_coid(suffix)}"
+    # Final shape: <prefix-1ch><base-up-to-16ch>[<suffix-up-to-Nch>]
+    return f"{prefix}{base}"[:30]
+
+
+def _inject_client_oid(
+    params: dict[str, Any],
+    exchange_name: str,
+    coid: str,
+) -> None:
+    """Set the venue-specific clientOrderId field IN-PLACE on ``params``."""
+    name = (exchange_name or "").lower()
+    if name == "binance":
+        params["newClientOrderId"] = coid
+    elif name == "okx":
+        params["clOrdId"] = coid
+    elif name == "gateio":
+        # Gate.io requires a 't-' prefix and 28-char total cap.
+        params["text"] = f"t-{coid}"[:28]
+    elif name == "bybit":
+        params["orderLinkId"] = coid
+    else:
+        # ccxt unified field — supported by every modern venue ccxt knows.
+        params["clientOrderId"] = coid
 
 
 @runtime_checkable
@@ -77,17 +237,31 @@ class CCXTExchangeAdapter:
 
     Args:
         client: a constructed ccxt.pro client.
-        exchange_name: "binance" / "okx" / "gateio".
+        exchange_name: "binance" / "okx" / "gateio" / "bybit".
         hedge_mode: when True, sets ``positionSide`` on each order so the
             two directions don't share a single net position. Required for
             the SHORT path on Binance USDT-M futures unless the account is
             in one-way mode.
+        transient_retries: max retry attempts for transient errors
+            (502/504/429/NetworkError). 3 by default. Idempotency is
+            guaranteed by the venue-attached ``clientOrderId``.
+        retry_base_delay_sec: full-jitter exponential backoff base; the
+            actual sleep is ``random.uniform(0, base * 2**attempt)``,
+            capped at ``retry_max_delay_sec``.
+        retry_max_delay_sec: ceiling on each retry sleep.
+        total_timeout_sec: hard ceiling per network call (including all
+            retries). Above this we give up and re-raise the last
+            transient error so the executor can fail-closed.
     """
 
     client: _CCXTLike
     exchange_name: str = "binance"
     hedge_mode: bool = False
     extra_params: dict[str, Any] = field(default_factory=dict)
+    transient_retries: int = 3
+    retry_base_delay_sec: float = 0.4
+    retry_max_delay_sec: float = 4.0
+    total_timeout_sec: float = 12.0
 
     # ---------------- helpers ---------------- #
 
@@ -129,7 +303,98 @@ class CCXTExchangeAdapter:
             "status": (o.get("status") or "").lower(),
             "reduce_only": bool(o.get("reduceOnly") or
                                  (o.get("info") or {}).get("reduceOnly") or False),
+            "filled": float(o.get("filled") or 0.0),
+            "amount": float(o.get("amount") or 0.0),
+            # Surface the clientOrderId we (or the venue) attached so the
+            # executor can log it and reconcile against retried calls.
+            "client_order_id": str(
+                o.get("clientOrderId")
+                or (o.get("info") or {}).get("clientOrderId")
+                or (o.get("info") or {}).get("clOrdId")
+                or (o.get("info") or {}).get("orderLinkId")
+                or "",
+            ),
         }
+
+    # ---------------- transient retry wrapper ---------------- #
+
+    async def _with_retry(
+        self,
+        op_name: str,
+        coro_factory: Callable[[], Awaitable[_T]],
+    ) -> _T:
+        """Run ``coro_factory()`` with full-jitter exponential backoff on
+        transient failures, bounded by ``total_timeout_sec``.
+
+        The contract this provides:
+
+          * Logical errors (InvalidOrder, InsufficientFunds, BadSymbol,
+            AuthenticationError, MarginModeAlreadySet) are re-raised
+            immediately — retrying them won't help and would just delay
+            failure visibility.
+          * Transient errors (NetworkError, RateLimitExceeded, 502/504,
+            connection reset, timed out) are retried up to
+            ``transient_retries`` times with full-jitter backoff in
+            ``[0, retry_base_delay_sec * 2**attempt]``.
+          * After the per-call ``total_timeout_sec`` deadline, the last
+            transient error is re-raised. Hot path catches it and goes
+            through the SR-2 fail-closed branch (orders_rejected += 1
+            on entry; emergency-close on stop placement).
+          * The whole sequence runs inside ``asyncio.wait_for`` so a
+            hung TCP socket inside ccxt cannot deadlock the executor.
+        """
+        deadline = asyncio.get_event_loop().time() + self.total_timeout_sec
+
+        async def _runner() -> _T:
+            attempt = 0
+            last_exc: BaseException | None = None
+            while True:
+                try:
+                    return await coro_factory()
+                except BaseException as e:  # noqa: BLE001 — narrowed below
+                    if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt,
+                                       SystemExit)):
+                        raise
+                    if not _is_transient_error(e):
+                        raise
+                    last_exc = e
+                    attempt += 1
+                    if attempt > self.transient_retries:
+                        logger.error(
+                            "%s exhausted %d retries — last error: %s",
+                            op_name, self.transient_retries, e,
+                        )
+                        raise
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        logger.error(
+                            "%s deadline reached before retry %d — last: %s",
+                            op_name, attempt, e,
+                        )
+                        raise
+                    cap = min(
+                        self.retry_max_delay_sec,
+                        self.retry_base_delay_sec * (2 ** (attempt - 1)),
+                    )
+                    sleep_s = min(remaining, random.uniform(0.0, cap))
+                    logger.warning(
+                        "%s transient %s (attempt %d/%d) — sleeping %.3fs",
+                        op_name, type(e).__name__, attempt,
+                        self.transient_retries, sleep_s,
+                    )
+                    await asyncio.sleep(sleep_s)
+            # Unreachable — exists for type-checkers.
+            assert last_exc is not None
+            raise last_exc
+
+        try:
+            return await asyncio.wait_for(_runner(), timeout=self.total_timeout_sec)
+        except asyncio.TimeoutError as e:
+            logger.error("%s exceeded total_timeout_sec=%.2f", op_name,
+                         self.total_timeout_sec)
+            raise RuntimeError(
+                f"{op_name} total_timeout_exceeded:{self.total_timeout_sec}",
+            ) from e
 
     # ---------------- ExchangeAdapter Protocol ---------------- #
 
@@ -141,15 +406,35 @@ class CCXTExchangeAdapter:
         *,
         price: float | None = None,
         reduce_only: bool = False,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]:
         params = self._entry_params(side, reduce_only)
-        resp = await self.client.create_market_order(
-            symbol, side.value, size, params=params,
+        # Audit-fix #E1: every market order — entry, reduce-only close,
+        # emergency close — gets a clientOrderId. Caller-supplied IDs win
+        # so the executor can derive deterministic IDs from trace_id.
+        coid = client_order_id or _derive_client_oid(
+            prefix="r" if reduce_only else "e", trace_id=None,
         )
-        logger.info("market %s %s %s ccxt_id=%s avg=%s",
+        _inject_client_oid(params, self.exchange_name, coid)
+
+        async def _call() -> dict[str, Any]:
+            return await self.client.create_market_order(
+                symbol, side.value, size, params=params,
+            )
+
+        op = f"market_order({symbol},{side.value},{size},reduce={reduce_only})"
+        resp = await self._with_retry(op, _call)
+        normalized = self._normalize_order(resp)
+        # Surface the *requested* coid even if the venue stripped it from
+        # the response so the executor can log it.
+        normalized["client_order_id"] = (
+            normalized.get("client_order_id") or coid
+        )
+        logger.info("market %s %s %s ccxt_id=%s coid=%s avg=%s",
                     side.value, size, symbol,
-                    resp.get("id"), resp.get("average") or resp.get("price"))
-        return self._normalize_order(resp)
+                    resp.get("id"), coid,
+                    resp.get("average") or resp.get("price"))
+        return normalized
 
     async def place_stop_order(
         self,
@@ -158,21 +443,41 @@ class CCXTExchangeAdapter:
         size: float,
         stop_price: float,
         reduce_only: bool = True,
+        *,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]:
         params = self._stop_params(side, stop_price, reduce_only)
+        coid = client_order_id or _derive_client_oid(
+            prefix="s", trace_id=None,
+        )
+        _inject_client_oid(params, self.exchange_name, coid)
         # Order type "stop_market" is unified across most ccxt venues, but
         # binance accepts "STOP_MARKET" via params; we prefer the unified
         # form when the venue supports it.
         order_type = "stop_market" if self.exchange_name != "binance" else "STOP_MARKET"
-        resp = await self.client.create_order(
-            symbol, order_type, side.value, size, price=None, params=params,
+
+        async def _call() -> dict[str, Any]:
+            return await self.client.create_order(
+                symbol, order_type, side.value, size, price=None, params=params,
+            )
+
+        op = f"place_stop_order({symbol},{side.value},{size},@{stop_price})"
+        resp = await self._with_retry(op, _call)
+        normalized = self._normalize_order(resp)
+        normalized["client_order_id"] = (
+            normalized.get("client_order_id") or coid
         )
-        logger.info("stop %s %s %s @ %s ccxt_id=%s",
-                    side.value, size, symbol, stop_price, resp.get("id"))
-        return self._normalize_order(resp)
+        logger.info("stop %s %s %s @ %s ccxt_id=%s coid=%s",
+                    side.value, size, symbol, stop_price,
+                    resp.get("id"), coid)
+        return normalized
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
-        resp = await self.client.cancel_order(order_id, symbol)
+        async def _call() -> dict[str, Any]:
+            return await self.client.cancel_order(order_id, symbol)
+
+        op = f"cancel_order({order_id},{symbol})"
+        resp = await self._with_retry(op, _call)
         return self._normalize_order(resp)
 
     async def set_leverage(self, symbol: str, leverage: float) -> dict[str, Any]:

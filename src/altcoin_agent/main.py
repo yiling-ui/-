@@ -534,11 +534,14 @@ class DryRunExchangeAdapter:
         self._n += 1
         return f"dryrun-{self._n}"
 
-    async def market_order(self, symbol, side, size, *, price=None, reduce_only=False):  # noqa: ANN001
+    async def market_order(self, symbol, side, size, *, price=None,
+                            reduce_only=False,
+                            client_order_id=None):  # noqa: ANN001
         oid = self._id()
         rec = {"id": oid, "symbol": symbol, "side": side.value, "size": size,
                "price": price, "reduce_only": reduce_only,
-               "average": price or 0.0}
+               "average": price or 0.0,
+               "client_order_id": client_order_id}
         self.market_orders.append(rec)
         # Maintain a fake position book so PositionWatcher sees consistent
         # state. An entry is the order whose side matches the position's
@@ -556,10 +559,13 @@ class DryRunExchangeAdapter:
                     side.value.upper(), size, symbol, price, reduce_only)
         return rec
 
-    async def place_stop_order(self, symbol, side, size, stop_price, reduce_only=True):  # noqa: ANN001
+    async def place_stop_order(self, symbol, side, size, stop_price,
+                                reduce_only=True,
+                                *, client_order_id=None):  # noqa: ANN001
         oid = self._id()
         rec = {"id": oid, "symbol": symbol, "side": side.value, "size": size,
-               "stop_price": stop_price, "reduce_only": reduce_only}
+               "stop_price": stop_price, "reduce_only": reduce_only,
+               "client_order_id": client_order_id}
         self.stop_orders.append(rec)
         logger.info("[DRY-RUN] STOP-MARKET %s %s %s @ %s",
                     side.value.upper(), size, symbol, stop_price)
