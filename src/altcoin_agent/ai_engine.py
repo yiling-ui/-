@@ -100,6 +100,30 @@ class SMCContext:
     oi_event: dict[str, Any] | None = None
 
 
+@dataclass
+class BatchJudgeItem:
+    """One symbol's worth of context for :meth:`LLMEngine.judge_batch`.
+
+    Acts as a per-symbol bundle of everything ``judge`` would have
+    received as kwargs. The batch entrypoint then merges all items into
+    one prompt + one HTTP call. Per-item phase / quadrant / score are
+    threaded through to the cache + budget gate so the batch path
+    enforces the same policy as a sequence of single calls would.
+    """
+
+    symbol: str
+    exchange: str
+    funding_rate: float | None
+    funding_deviation_z: float | None
+    smc: "SMCContext"
+    posts: list["SocialPost"] = field(default_factory=list)
+    extra: dict[str, Any] | None = None
+    # Phase 5 routing context (all optional)
+    quadrant: str | None = None
+    signal_score: float | None = None
+    phase: str | None = None
+
+
 class AIVerdict(BaseModel):
     """Strict response contract for any LLM provider."""
 
@@ -222,6 +246,93 @@ def build_user_prompt(
         "CONTEXT (JSON):\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         + "\n\nReturn the JSON verdict now."
+    )
+
+
+# --------------------------------------------------------------------- #
+# Batch prompt — R5: combine multiple symbols into one HTTP call.
+# --------------------------------------------------------------------- #
+
+
+BATCH_SYSTEM_PROMPT = """You are a senior cryptocurrency derivatives analyst.
+You will receive a JSON CONTEXT containing a list of items, one per symbol.
+For EACH item, judge whether the next 15-60 minutes is more likely a genuine
+pump, a genuine dump, or noise/neutral, applying the same hard rules as the
+single-symbol analyst (funding extremes, KOL exit_liquidity penalty, SR-4
+bot-spam defense). Items are independent — judge each on its own merits;
+do not let a strong signal on one symbol bleed into another.
+
+You MUST respond with ONE single JSON object of EXACTLY the form:
+
+{
+  "verdicts": {
+    "<symbol_1>": {
+      "intent": "pump" | "dump" | "neutral",
+      "confidence_score": <integer 0..100>,
+      "reason": "<concise english explanation, <= 400 chars>",
+      "kol_intent": "frontrun_call" | "exit_liquidity" | "neutral",
+      "key_evidence": ["<short bullet>", ...]
+    },
+    "<symbol_2>": { ... },
+    ...
+  }
+}
+
+Hard rules:
+  - The keys of ``verdicts`` MUST match the ``symbol`` of each item.
+  - confidence_score MUST be an integer.
+  - If unsure on a particular item, output intent=neutral and confidence_score <= 40.
+  - The same KOL exit-liquidity / wash-trading / bot-spam rules apply per-item.
+  - DO NOT output markdown, code fences, or any text outside the JSON.
+"""
+
+
+def build_batch_user_prompt(items: list["BatchJudgeItem"]) -> str:
+    """Encode a list of :class:`BatchJudgeItem` as one CONTEXT JSON.
+
+    Mirrors :func:`build_user_prompt` for shape so the model sees the
+    same fields it learned from in single-symbol calls; each per-item
+    payload becomes one entry of an ``items`` array.
+    """
+    payload_items: list[dict[str, Any]] = []
+    for it in items:
+        item_payload: dict[str, Any] = {
+            "symbol": it.symbol,
+            "exchange": it.exchange,
+            "funding": {
+                "current_rate": it.funding_rate,
+                "short_window_zscore": it.funding_deviation_z,
+            },
+            "smc": {
+                "liquidity_sweeps": it.smc.liquidity_sweeps,
+                "liquidity_pools": it.smc.liquidity_pools,
+                "volume_spike": it.smc.volume_spike,
+                "oi_event": it.smc.oi_event,
+            },
+            "social_posts": [
+                {
+                    "author": p.author,
+                    "followers": p.follower_count,
+                    "ts": p.ts,
+                    "source": p.source,
+                    "text": p.truncated(),
+                }
+                for p in it.posts[:20]
+            ],
+        }
+        if it.extra:
+            item_payload["extra"] = it.extra
+        if it.phase is not None:
+            item_payload["phase"] = it.phase
+        if it.quadrant is not None:
+            item_payload["quadrant"] = it.quadrant
+        payload_items.append(item_payload)
+
+    return (
+        "CONTEXT (JSON):\n"
+        + json.dumps({"items": payload_items},
+                     ensure_ascii=False, separators=(",", ":"))
+        + "\n\nReturn the batch verdicts JSON now."
     )
 
 
@@ -453,6 +564,231 @@ class LLMEngine:
             reason=f"degraded: {last_err}",
             kol_intent="neutral", key_evidence=[],
         )
+
+    # ------------------------------------------------------------------ #
+    # R5 — batch judge: combine multiple symbols into a single LLM call.
+    # ------------------------------------------------------------------ #
+
+    async def judge_batch(
+        self, items: list[BatchJudgeItem],
+    ) -> dict[str, AIVerdict]:
+        """Score a batch of items with one HTTP call (with cache + budget).
+
+        Returns a dict ``{symbol: AIVerdict}`` covering EVERY input
+        item — items that miss the cache + fail the budget gate get
+        a synthetic neutral verdict; items that fail individual JSON
+        parsing also degrade to neutral but never mask successful
+        siblings.
+
+        Three-layer hierarchy (matches single-symbol ``judge``):
+
+          1. Cache lookup per item — items whose ``(symbol, phase,
+             social_hash)`` is already cached get the previous
+             verdict in 0ms with zero tokens consumed.
+          2. Budget gate per item — pre-rejects items whose
+             quadrant + score wouldn't survive the
+             ``TokenBudgetManager``. The budget gate is consulted
+             once per item so callers see the same accounting they
+             would get from N sequential ``judge`` calls.
+          3. Single HTTP call covering only the cache-miss /
+             budget-allowed items. Each parsed verdict is written
+             back to the cache. Items missing from the model's
+             response degrade to neutral with a "missing_in_batch"
+             reason rather than raising.
+
+        Empty input is a no-op returning ``{}``. A batch of 1 still
+        works — useful for callers that want a uniform interface.
+        """
+        if not items:
+            return {}
+
+        if self.provider is None:
+            raise EngineError(
+                "No LLM provider configured. Set LLM_PROVIDER and the matching "
+                "<BACKEND>_API_KEY env var."
+            )
+
+        out: dict[str, AIVerdict] = {}
+        # Per-item cache key (None for legacy / no-phase items).
+        cache_keys: dict[str, str | None] = {}
+        social_hashes: dict[str, str] = {}
+        # Items that need a network call.
+        pending: list[BatchJudgeItem] = []
+
+        # ---- Layer 1 + 2: cache + budget gate per item ----
+        for it in items:
+            cache_key: str | None = None
+            social_hash = _hash_posts(it.posts)
+            social_hashes[it.symbol] = social_hash
+            if self.cache is not None and it.phase is not None:
+                cache_key = LLMCache.make_key(
+                    it.symbol, it.phase, social_hash,
+                )
+                cached = self.cache.get(cache_key)
+                if cached is not None:
+                    try:
+                        out[it.symbol] = AIVerdict.model_validate(cached)
+                        continue
+                    except ValidationError as e:
+                        logger.warning(
+                            "LLMCache returned malformed verdict for %s; "
+                            "ignoring. Err=%s", cache_key, e.errors()[:2],
+                        )
+            cache_keys[it.symbol] = cache_key
+
+            # Budget gate per item.
+            if self.budget_manager is not None:
+                quadrant_for_gate = it.quadrant or "D"
+                score_for_gate = (
+                    float(it.signal_score) if it.signal_score is not None
+                    else 0.0
+                )
+                allowed, reason = self.budget_manager.can_call_llm(
+                    quadrant=quadrant_for_gate, signal_score=score_for_gate,
+                )
+                if not allowed:
+                    logger.info(
+                        "TokenBudgetManager rejected batch item %s "
+                        "(quadrant=%s score=%.1f reason=%s); neutral.",
+                        it.symbol, quadrant_for_gate,
+                        score_for_gate, reason,
+                    )
+                    out[it.symbol] = AIVerdict(
+                        intent="neutral", confidence_score=0,
+                        reason=f"budget_gate:{reason}",
+                        kol_intent="neutral", key_evidence=[],
+                    )
+                    continue
+
+            pending.append(it)
+
+        # No network call needed (everything cached or rejected).
+        if not pending:
+            return out
+
+        # Legacy budget exhaustion gate (defensive, same as judge()).
+        try:
+            self.budget.assert_available()
+        except EngineError:
+            for it in pending:
+                out[it.symbol] = AIVerdict(
+                    intent="neutral", confidence_score=0,
+                    reason="budget_exhausted",
+                    kol_intent="neutral", key_evidence=[],
+                )
+            return out
+
+        # ---- Layer 3: one HTTP call ----
+        user_prompt = build_batch_user_prompt(pending)
+        messages = [
+            {"role": "system", "content": BATCH_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        last_err = ""
+        raw = ""
+        parsed_obj: dict[str, Any] | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                raw, used_tokens = await self.provider.chat_json(
+                    messages, timeout=self.timeout,
+                )
+                self.budget.add(used_tokens)
+                if self.budget_manager is not None:
+                    self.budget_manager.record_usage(used_tokens)
+                parsed_obj = parse_chat_json(raw)
+                break
+            except (ValidationError, json.JSONDecodeError) as e:
+                last_err = f"json error: {e}"
+                logger.warning(
+                    "Batch LLM JSON error (attempt %s): %s",
+                    attempt + 1, last_err,
+                )
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Re-emit ONE valid JSON object exactly matching the "
+                        "batch schema. No prose, no markdown."
+                    ),
+                })
+            except (httpx.TimeoutException, httpx.HTTPError) as e:
+                last_err = f"http error: {type(e).__name__}: {e}"
+                logger.warning(
+                    "Batch LLM HTTP error (attempt %s): %s",
+                    attempt + 1, last_err,
+                )
+                if attempt < self.max_retries:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+
+        if parsed_obj is None:
+            logger.error(
+                "Batch LLM call failed after %s attempts: %s",
+                self.max_retries + 1, last_err,
+            )
+            for it in pending:
+                out[it.symbol] = AIVerdict(
+                    intent="neutral", confidence_score=0,
+                    reason=f"degraded: {last_err}",
+                    kol_intent="neutral", key_evidence=[],
+                )
+            return out
+
+        verdicts_raw = parsed_obj.get("verdicts")
+        if not isinstance(verdicts_raw, dict):
+            logger.warning(
+                "Batch response missing 'verdicts' object; got keys=%s",
+                list(parsed_obj.keys())[:5],
+            )
+            verdicts_raw = {}
+
+        for it in pending:
+            obj = verdicts_raw.get(it.symbol)
+            if obj is None:
+                out[it.symbol] = AIVerdict(
+                    intent="neutral", confidence_score=0,
+                    reason="missing_in_batch_response",
+                    kol_intent="neutral", key_evidence=[],
+                )
+                continue
+            try:
+                # Normalize same as judge().
+                if isinstance(obj.get("confidence_score"), str) \
+                        and obj["confidence_score"].isdigit():
+                    obj["confidence_score"] = int(obj["confidence_score"])
+                if isinstance(obj.get("intent"), str):
+                    obj["intent"] = obj["intent"].lower()
+                if isinstance(obj.get("kol_intent"), str):
+                    obj["kol_intent"] = obj["kol_intent"].lower()
+                verdict = AIVerdict.model_validate(obj)
+            except ValidationError as e:
+                logger.warning(
+                    "Batch verdict for %s failed validation: %s",
+                    it.symbol, e.errors()[:2],
+                )
+                out[it.symbol] = AIVerdict(
+                    intent="neutral", confidence_score=0,
+                    reason=f"item_invalid: {e.errors()[:1]}",
+                    kol_intent="neutral", key_evidence=[],
+                )
+                continue
+            out[it.symbol] = verdict
+            # Write-back cache (per-item) so the next single ``judge``
+            # for the same context returns instantly.
+            cache_key = cache_keys.get(it.symbol)
+            if (
+                self.cache is not None
+                and cache_key is not None
+                and it.phase is not None
+            ):
+                self.cache.put(
+                    symbol=it.symbol,
+                    phase=it.phase,
+                    social_hash=social_hashes.get(it.symbol, ""),
+                    verdict=verdict.model_dump(),
+                    tokens_estimate=used_tokens // max(len(pending), 1),
+                )
+
+        return out
 
 
 # --------------------------------------------------------------------- #
