@@ -364,6 +364,24 @@ class FuserConfig:
 
     dynamic_rules_path: Path | None = None
 
+    # ------------------------------------------------------------------ #
+    # R6 — per-pump-phase high-priority threshold overrides.
+    #
+    # The default threshold (85) suits ACCUMULATION / RAMP. Late
+    # phases get a *higher* bar so we don't promote a noisy signal
+    # to high_priority once the symbol is already parabolic /
+    # blowing-off. Empty dict (default) preserves v1.0 behaviour:
+    # any phase falls back to ``high_priority_threshold``.
+    #
+    # Recommended (operators set in app.yaml -> fuser.phase_threshold_overrides):
+    #   accumulation : 80     (let early signals through)
+    #   ramp         : 85     (default)
+    #   parabolic    : 92     (extra evidence required late in run)
+    #   blowoff_top  : 95     (only the strongest reversal signals)
+    #   crash/bleed  : 95     (counter-trend only)
+    # ------------------------------------------------------------------ #
+    phase_threshold_overrides: dict[str, float] = field(default_factory=dict)
+
 
 class ScoreFuser:
     def __init__(
@@ -399,23 +417,48 @@ class ScoreFuser:
 
     # ------------------- ingestion API ------------------- #
 
-    async def on_rule_signal(self, ev: SignalEvent) -> FusedSignal | None:
+    async def on_rule_signal(
+        self, ev: SignalEvent, *, phase: str | None = None,
+    ) -> FusedSignal | None:
+        """Ingest a rule signal and (re)dispatch a fused signal.
+
+        ``phase`` (R6, optional): forwarded to ``evaluate``; lets
+        callers feed the live PumpPhaseFSM state into the high-
+        priority threshold decision. Default None preserves v1.0.
+        """
         key = self._key(ev.exchange, ev.symbol)
         bucket = self._rules.setdefault(key, deque(maxlen=64))
         bucket.append(ev)
-        return await self._dispatch(ev.symbol, ev.exchange, ev.ts)
+        return await self._dispatch(ev.symbol, ev.exchange, ev.ts, phase=phase)
 
     async def on_llm_verdict(
         self, exchange: str, symbol: str, verdict: AIVerdict, ts: int,
+        *, phase: str | None = None,
     ) -> FusedSignal | None:
         key = self._key(exchange, symbol)
         self._llm[key] = verdict
         self._llm_ts[key] = ts
-        return await self._dispatch(symbol, exchange, ts)
+        return await self._dispatch(symbol, exchange, ts, phase=phase)
 
     # ------------------- evaluation core ------------------- #
 
-    def evaluate(self, symbol: str, exchange: str, now_ts: int) -> FusedSignal:
+    def evaluate(
+        self,
+        symbol: str,
+        exchange: str,
+        now_ts: int,
+        *,
+        phase: str | None = None,
+    ) -> FusedSignal:
+        """Score the most recent rule + LLM evidence for ``symbol``.
+
+        ``phase`` (R6, optional): when supplied, the high-priority
+        threshold is taken from
+        :attr:`FuserConfig.phase_threshold_overrides`; missing /
+        unknown phase falls back to
+        :attr:`FuserConfig.high_priority_threshold`. Omitting
+        ``phase`` reproduces v1.0 behaviour exactly.
+        """
         # 0) Hot-load learned rules (mtime-throttled, IO-safe).
         self.rule_index.maybe_reload()
 
@@ -561,8 +604,21 @@ class ScoreFuser:
             )
 
         # 8) High-priority gate.
+        # R6: ``phase`` (optional) lets callers pick a stricter or
+        # looser threshold per phase. Missing key falls back to the
+        # default ``high_priority_threshold`` so legacy callers see
+        # identical behaviour.
+        threshold = self.cfg.high_priority_threshold
+        if phase is not None:
+            override = self.cfg.phase_threshold_overrides.get(phase)
+            if override is not None:
+                threshold = float(override)
+                notes.append(
+                    f"phase={phase}: high_priority_threshold "
+                    f"-> {threshold:.1f} (override)"
+                )
         is_high = (
-            final >= self.cfg.high_priority_threshold
+            final >= threshold
             and rule_score >= self.cfg.require_min_rule_score
             and direction != Direction.NEUTRAL
         )
@@ -707,8 +763,9 @@ class ScoreFuser:
 
     async def _dispatch(
         self, symbol: str, exchange: str, now_ts: int,
+        *, phase: str | None = None,
     ) -> FusedSignal | None:
-        signal = self.evaluate(symbol, exchange, now_ts)
+        signal = self.evaluate(symbol, exchange, now_ts, phase=phase)
         if signal.is_high_priority:
             self._last_high_priority_ts[self._key(exchange, symbol)] = now_ts
             if self.sink is not None:
