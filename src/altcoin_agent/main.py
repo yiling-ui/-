@@ -402,6 +402,16 @@ class HealthState:
     llm_consults_skipped: int = 0
     post_mortems_recorded: int = 0
     last_error: str | None = None
+    # Audit P-2.2 fix: surface AccountPersistor health on /healthz +
+    # /metrics so a clogged disk or revoked write permission becomes
+    # a visible alert. ``persistor_save_errors`` and
+    # ``persistor_save_count`` are pulled from the persistor on every
+    # request (see ``make_health_app``); ``persistor_last_save_error``
+    # is the most recent failure message (str or None).
+    persistor_save_count: int = 0
+    persistor_save_errors: int = 0
+    persistor_last_save_error: str | None = None
+    persistor_last_saved_ts: float = 0.0
 
 
 async def make_health_app(state: HealthState) -> web.Application:
@@ -429,6 +439,10 @@ async def make_health_app(state: HealthState) -> web.Application:
             "post_mortems_recorded": state.post_mortems_recorded,
             "last_signal_ts": state.last_signal_ts,
             "last_error": state.last_error,
+            "persistor_save_count": state.persistor_save_count,
+            "persistor_save_errors": state.persistor_save_errors,
+            "persistor_last_save_error": state.persistor_last_save_error,
+            "persistor_last_saved_ts": state.persistor_last_saved_ts,
         }
         return web.json_response(body, status=200 if ok else 503)
 
@@ -482,6 +496,17 @@ async def make_health_app(state: HealthState) -> web.Application:
               "Total post-mortem learning passes recorded after a real close")
         gauge("last_signal_ts", state.last_signal_ts,
               "Wall-clock ts of most-recent screener event")
+        # Audit P-2.2 fix: AccountPersistor durability. A spike in
+        # persistor_save_errors or a stale persistor_last_saved_ts is a
+        # leading indicator that the daily-DD circuit breaker would not
+        # survive a process restart. Operators should alert on any
+        # increase in persistor_save_errors_total.
+        gauge("persistor_save_count", state.persistor_save_count,
+              "Total successful AccountState saves since boot")
+        gauge("persistor_save_errors", state.persistor_save_errors,
+              "Total AccountState save attempts that swallowed an exception")
+        gauge("persistor_last_saved_ts", state.persistor_last_saved_ts,
+              "Wall-clock ts of most-recent successful AccountState save")
         return web.Response(
             text="\n".join(lines) + "\n",
             content_type="text/plain",
@@ -1000,6 +1025,7 @@ class App:
         # later crash before any trade still recovers correctly.
         if self._persistor is not None:
             self._persistor.save(account)
+            self._sync_persistor_health()
 
         self.dashboard.health = self.state
         self.dashboard.account = account
@@ -1505,6 +1531,7 @@ class App:
                             if self._persistor is not None:
                                 with suppress(Exception):
                                     self._persistor.save(account)
+                                self._sync_persistor_health()
                             with suppress(Exception):
                                 await self.notifier.error(
                                     "daily rollover applied",
@@ -1974,6 +2001,7 @@ class App:
         if self._persistor is not None:
             with suppress(Exception):
                 self._persistor.save(account)
+            self._sync_persistor_health()
 
         # Note: ``account.open_positions.pop`` and ``position.closed=True``
         # are already done by PositionWatcher before this callback runs;
@@ -2041,6 +2069,28 @@ class App:
         if self.cfg.paper_trade:
             return "PAPER-TRADE (testnet)"
         return "LIVE"
+
+    def _sync_persistor_health(self) -> None:
+        """Audit P-2.2: copy AccountPersistor counters into HealthState
+        so /healthz + /metrics expose them. Called after every save
+        site and during shutdown. Cheap and safe to call when no
+        persistor is configured (no-op).
+        """
+        if self._persistor is None:
+            return
+        self.state.persistor_save_count = self._persistor.save_count
+        self.state.persistor_save_errors = self._persistor.save_errors
+        self.state.persistor_last_save_error = (
+            self._persistor.last_save_error
+        )
+        self.state.persistor_last_saved_ts = self._persistor.last_saved_ts
+        # Surface the most-recent failure reason via last_error too so
+        # the /healthz JSON consumers (dashboard) flag it without
+        # special-casing the field.
+        if self._persistor.save_errors > 0 and self._persistor.last_save_error:
+            self.state.last_error = (
+                f"persistor:{self._persistor.last_save_error}"
+            )
 
     async def _shutdown(self) -> None:
         logger.info(
@@ -2169,6 +2219,49 @@ def enforce_live_mode_confirmation(cfg: AppConfig) -> None:
     raise SystemExit(3)
 
 
+# Audit P-2.1 fix: LIVE / paper-trade modes MUST run with AccountState
+# persistence enabled. Without it, an afternoon process restart resets
+# ``realized_pnl_today_usdt = 0``, ``daily_stoploss_hits = 0`` and
+# ``consecutive_losses = {}``, which means the 6% daily-drawdown hard
+# circuit breaker — and the 3-strike rule — silently become one-way
+# latches that release on every restart. Worst case: the operator
+# accidentally sets ``account_persistence_enabled: false`` in
+# ``app.yaml``, hits a -5% morning, restarts (OOM, k8s reschedule,
+# deploy), and the now-fresh account is allowed to lose another 6%
+# before the breaker fires. End-of-day realised drawdown therefore
+# reaches 11%+ even though the operator configured a 6% cap.
+#
+# We refuse to start when persistence is disabled in any mode that
+# places real orders (live OR paper-trade). Dry-run is exempt because
+# no money is at stake; tests that flip the flag off run with
+# ``dry_run=True`` (the default) and are unaffected.
+def enforce_persistence_enabled_for_real_orders(cfg: AppConfig) -> None:
+    """Refuse to start with persistence off in LIVE / paper-trade modes.
+
+    Raises ``SystemExit`` (exit code 4) when ``cfg.dry_run`` is False
+    AND ``cfg.account_persistence_enabled`` is False. Returns silently
+    in dry-run.
+
+    The error log spells out what the operator must change so the
+    fix is obvious without grepping the codebase.
+    """
+    if cfg.dry_run:
+        return
+    if cfg.account_persistence_enabled:
+        return
+    logger.critical(
+        "Refusing to start in %s mode with account_persistence_enabled=False. "
+        "Without persistence, every process restart resets "
+        "realized_pnl_today_usdt / daily_stoploss_hits / consecutive_losses "
+        "and the 6%% daily-drawdown circuit breaker becomes a one-way "
+        "latch that releases on every restart. Set "
+        "account_persistence_enabled: true in app.yaml (this is the "
+        "default) or flip the daemon to dry-run.",
+        "PAPER-TRADE" if cfg.paper_trade else "LIVE",
+    )
+    raise SystemExit(4)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Altcoin Agent V1.0 daemon")
     parser.add_argument("--config", default="config/app.yaml",
@@ -2202,6 +2295,13 @@ def main() -> None:
     # enforce it here, BEFORE the event loop is constructed, so an
     # accidental ``DRY_RUN=0`` in a CI shell can't reach the venue.
     enforce_live_mode_confirmation(cfg)
+
+    # Audit P-2.1 fix: persistence is mandatory in any mode that
+    # places real orders. See the docstring of
+    # ``enforce_persistence_enabled_for_real_orders`` for the
+    # full rationale (TL;DR: without it, daily-DD breakers silently
+    # latch off on every restart).
+    enforce_persistence_enabled_for_real_orders(cfg)
 
     # uvloop: 30–60% throughput improvement on the asyncio hot path.
     # Optional dependency; fall back to the stdlib loop if not

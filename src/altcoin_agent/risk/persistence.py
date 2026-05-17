@@ -58,11 +58,28 @@ class AccountPersistor:
         persistor.restore_into(account)   # at boot, after AccountState is built
         ...
         persistor.save(account)            # after every PnL update
+
+    Audit P-2.2 observability hooks:
+        ``save_count``         — total successful saves since boot.
+        ``save_errors``        — total saves that swallowed an exception.
+        ``last_save_error``    — short string describing the most recent
+                                 save failure (used by /metrics + dashboard).
+        ``last_save_error_ts`` — wall-clock ts of the most recent failure.
+
+    These are read by the Prometheus exporter (``/metrics``) so a
+    clogged disk or revoked write permission becomes a visible alert
+    instead of a silent log line that nobody reads. The trading loop
+    stays unaffected: ``save`` still swallows every exception, so disk
+    failures cannot cascade into the order pipeline.
     """
 
     path: Path
     last_saved_ts: float = 0.0
     last_loaded_ts: float = 0.0
+    save_count: int = 0
+    save_errors: int = 0
+    last_save_error: str | None = None
+    last_save_error_ts: float = 0.0
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -124,8 +141,12 @@ class AccountPersistor:
                     with _suppress_errors():
                         os.remove(tmp_path)
             self.last_saved_ts = time.time()
+            self.save_count += 1
             return True
         except Exception as e:
+            self.save_errors += 1
+            self.last_save_error = f"{type(e).__name__}: {e}"
+            self.last_save_error_ts = time.time()
             logger.warning(
                 "AccountPersistor.save failed (swallowed): %s", e,
             )

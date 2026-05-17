@@ -244,12 +244,37 @@ class LLMEngine:
     By default (no provider passed), build one from env vars (LLM_PROVIDER,
     <backend>_API_KEY). For tests, inject a fake provider that satisfies
     ``LLMProvider``.
+
+    Audit P-3.1: ``total_budget_sec`` puts a hard upper bound on the
+    end-to-end wall-clock cost of a single ``judge()`` call.
+
+    Without it, the worst case is roughly:
+
+        ``timeout`` + ``0.5 * 2^attempt`` backoff * (max_retries) +
+        ``timeout`` (retry attempt)
+
+    With the defaults (timeout=8.0, max_retries=1, exponential backoff
+    0.5s for attempt #0) that's ~16.5s per consult. The trading hot
+    path doesn't await ``judge()`` directly (the LLM lives on a
+    separate ``llm_q`` worker), so a slow LLM never deadlocks the
+    venue path — but a slow LLM DOES cause queue backpressure that
+    can drop legitimate consults.
+
+    With ``total_budget_sec`` we wrap the entire judge() body in
+    ``asyncio.wait_for``: when the deadline is exceeded the call
+    returns the same neutral degraded ``AIVerdict`` we already return
+    on parse / HTTP errors, so the rest of the system (ScoreFuser,
+    CandidateGate, post-mortem) sees a uniform contract for "LLM
+    didn't help this time". The default of 12.0s was chosen to allow
+    one full timeout + one short retry but never the worst-case
+    16.5s the back-off math allows.
     """
 
     provider: LLMProvider | None = None
     timeout: float = 8.0
     max_retries: int = 1
     budget: TokenBudget = field(default_factory=TokenBudget)
+    total_budget_sec: float = 12.0
 
     def __post_init__(self) -> None:
         if self.provider is None:
@@ -291,6 +316,58 @@ class LLMEngine:
             )
         self.budget.assert_available()
 
+        # Audit P-3.1 fix: total deadline. Wrap the inner judge body
+        # with ``asyncio.wait_for`` so a slow provider can't blow past
+        # the architectural budget for a single consult. On
+        # ``TimeoutError`` we return the same neutral verdict the
+        # other failure paths return so the contract for "the LLM
+        # didn't help this time" stays uniform across error types.
+        if self.total_budget_sec is not None and self.total_budget_sec > 0:
+            try:
+                return await asyncio.wait_for(
+                    self._judge_inner(
+                        symbol=symbol, exchange=exchange,
+                        funding_rate=funding_rate,
+                        funding_deviation_z=funding_deviation_z,
+                        smc=smc, posts=posts, extra=extra,
+                    ),
+                    timeout=self.total_budget_sec,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "LLM judge() exceeded total_budget_sec=%.1fs for %s; "
+                    "degrading to neutral verdict",
+                    self.total_budget_sec, symbol,
+                )
+                return AIVerdict(
+                    intent="neutral", confidence_score=0,
+                    reason=(
+                        f"degraded: total_budget_exceeded:"
+                        f"{self.total_budget_sec:.1f}s"
+                    ),
+                    kol_intent="neutral", key_evidence=[],
+                )
+        return await self._judge_inner(
+            symbol=symbol, exchange=exchange,
+            funding_rate=funding_rate,
+            funding_deviation_z=funding_deviation_z,
+            smc=smc, posts=posts, extra=extra,
+        )
+
+    async def _judge_inner(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        funding_rate: float | None,
+        funding_deviation_z: float | None,
+        smc: SMCContext,
+        posts: list[SocialPost],
+        extra: dict[str, Any] | None = None,
+    ) -> AIVerdict:
+        """The original judge() body, kept as an inner method so the
+        outer ``asyncio.wait_for`` can enforce ``total_budget_sec``."""
+        assert self.provider is not None  # outer judge() validates this
         user_prompt = build_user_prompt(
             symbol=symbol, exchange=exchange,
             funding_rate=funding_rate,
